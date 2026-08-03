@@ -14,6 +14,10 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 
 Completed and failed resources close automatically after 30 seconds; focusing or interacting with one cancels pending cleanup. Blocked, interrupted, and cancelled resources stay open and can be closed explicitly through `/ps close <id>` or `/subagents close <id>`. Guarded Treehouse return never uses `--force`; dirty leases remain visible in the registry and `treehouse status`.
 
+## Calm tool output
+
+Pi's normal collapsed view hides successful `read` and `bg_status` rows and reduces `bash`, `edit`, `write`, `bg_start`, `bg_list`, and `bg_kill` to their call line. Failures remain visible. Press Ctrl+O to reveal full calls and results; Pi's existing Working presentation is unchanged.
+
 ## Development
 
 ```sh

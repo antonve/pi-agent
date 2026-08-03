@@ -9,6 +9,7 @@
   "pi": {
     "extensions": [
       "extensions/ask-user",
+      "extensions/calm-tool-output",
       "extensions/copy-all",
       "extensions/file-search",
       "extensions/git-info",
@@ -29,7 +30,7 @@
     "format": "prettier --write \"extensions/**/*.{ts,cjs}\" \"*.json\" \"themes/*.json\"",
     "format:check": "prettier --check \"extensions/**/*.{ts,cjs}\" \"*.json\" \"themes/*.json\"",
     "test": "node --test --experimental-strip-types extensions/**/*.test.ts && vitest run extensions/file-search/index.spec.ts",
-    "smoke": "pi --offline --no-session --print --no-tools --extension ./extensions/ask-user/index.ts --extension ./extensions/copy-all/index.ts --extension ./extensions/file-search/index.ts --extension ./extensions/git-info/index.ts --extension ./extensions/model-info/index.ts --extension ./extensions/summaries/index.ts --extension ./extensions/ui-customization/index.ts --extension ./extensions/orchestration/index.ts 'reply ok'"
+    "smoke": "pi --offline --no-session --print --no-tools --no-extensions --extension ./extensions/ask-user/index.ts --extension ./extensions/calm-tool-output/index.ts --extension ./extensions/copy-all/index.ts --extension ./extensions/file-search/index.ts --extension ./extensions/git-info/index.ts --extension ./extensions/model-info/index.ts --extension ./extensions/summaries/index.ts --extension ./extensions/ui-customization/index.ts --extension ./extensions/orchestration/index.ts 'reply ok'"
   },
   "dependencies": {
     "@effect/platform-node": "4.0.0-beta.99",

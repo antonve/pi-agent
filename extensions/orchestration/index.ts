@@ -1,10 +1,12 @@
 import { resolve as resolvePath } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
+  AgentToolResult,
   ExtensionAPI,
   ExtensionContext,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { nodeCliRunner } from "./cli.ts";
 import {
@@ -21,6 +23,16 @@ import { OrchestrationManager } from "./manager.ts";
 import { TaskRegistry } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
 import { registerWorkflow } from "./workflows/index.ts";
+import { shouldRenderToolPart } from "../shared/calm-tool-output.ts";
+
+function renderResultText(result: AgentToolResult<unknown>, theme: Theme) {
+  const content = result.content.find((block) => block.type === "text");
+  return new Text(
+    content?.type === "text" ? theme.fg("toolOutput", content.text) : "",
+    0,
+    0,
+  );
+}
 
 function describe(task: TaskRecord) {
   const lease = task.lease
@@ -216,6 +228,27 @@ export default function orchestration(pi: ExtensionAPI) {
         details: task,
       };
     },
+    renderShell: "self",
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ps start ")) +
+          theme.fg("accent", args.title),
+        0,
+        0,
+      );
+    },
+    renderResult(result, options, theme, context) {
+      if (
+        shouldRenderToolPart(
+          "compact",
+          "result",
+          options.expanded,
+          context.isError,
+        )
+      )
+        return renderResultText(result, theme);
+      return new Container();
+    },
   });
 
   pi.registerTool({
@@ -237,6 +270,36 @@ export default function orchestration(pi: ExtensionAPI) {
         ],
         details: task,
       };
+    },
+    renderShell: "self",
+    renderCall(args, theme, context) {
+      if (
+        !shouldRenderToolPart(
+          "hidden",
+          "call",
+          context.expanded,
+          context.isError,
+        )
+      )
+        return new Container();
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ps status ")) +
+          theme.fg("accent", args.id),
+        0,
+        0,
+      );
+    },
+    renderResult(result, options, theme, context) {
+      if (
+        !shouldRenderToolPart(
+          "hidden",
+          "result",
+          options.expanded,
+          context.isError,
+        )
+      )
+        return new Container();
+      return renderResultText(result, theme);
     },
   });
   pi.registerTool({
@@ -260,6 +323,22 @@ export default function orchestration(pi: ExtensionAPI) {
         ],
         details: { tasks },
       };
+    },
+    renderShell: "self",
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("ps")), 0, 0);
+    },
+    renderResult(result, options, theme, context) {
+      if (
+        shouldRenderToolPart(
+          "compact",
+          "result",
+          options.expanded,
+          context.isError,
+        )
+      )
+        return renderResultText(result, theme);
+      return new Container();
     },
   });
   pi.registerTool({
@@ -288,6 +367,27 @@ export default function orchestration(pi: ExtensionAPI) {
         ],
         details: { tasks },
       };
+    },
+    renderShell: "self",
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ps interrupt ")) +
+          theme.fg("accent", args.ids.join(", ")),
+        0,
+        0,
+      );
+    },
+    renderResult(result, options, theme, context) {
+      if (
+        shouldRenderToolPart(
+          "compact",
+          "result",
+          options.expanded,
+          context.isError,
+        )
+      )
+        return renderResultText(result, theme);
+      return new Container();
     },
   });
 
