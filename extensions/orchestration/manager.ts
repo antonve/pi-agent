@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
   formatSize,
@@ -44,6 +44,14 @@ function id(prefix: string) {
 }
 function cleanLabel(label: string) {
   return label.replace(/\s+/g, " ").trim().slice(0, 80) || "task";
+}
+export function buildAgentName(taskId: string, label: string) {
+  const suffix = label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, Math.max(0, 31 - taskId.length));
+  return suffix ? `${taskId}-${suffix}` : taskId.slice(0, 32);
 }
 function sleep(ms: number, signal?: AbortSignal) {
   return new Promise<void>((resolvePromise, reject) => {
@@ -270,10 +278,7 @@ export class OrchestrationManager {
         reasoning: launch.reasoning,
         lease,
       });
-      const agentName = `${taskId}-${label
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .slice(0, 28)}`;
+      const agentName = buildAgentName(taskId, label);
       await this.herdr.startAgent(
         agentName,
         options.harness,
@@ -481,6 +486,15 @@ export class OrchestrationManager {
 
   async output(idValue: string) {
     const task = await this.require(idValue);
+    if (task.completionResultPath) {
+      try {
+        const output = await readFile(task.completionResultPath, "utf8");
+        return (await this.boundedOutput(task.id, output)).text;
+      } catch {
+        // The live Herdr resource may still provide output if durable state was pruned.
+      }
+    }
+    if (task.error) return task.error;
     const output = task.agentName
       ? await this.herdr.readAgent(task.agentName)
       : await this.herdr.readPane(task.paneId);
