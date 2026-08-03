@@ -75,6 +75,16 @@ export interface TaskRecord {
   sentinel?: string;
 }
 
+export function needsInspection(task: TaskRecord, now = Date.now()) {
+  if (task.status === "blocked" || task.status === "interrupted") return true;
+  if (task.status !== "failed") return false;
+  return (
+    task.autoCloseCancelled === true ||
+    task.autoCloseAt === undefined ||
+    task.autoCloseAt > now
+  );
+}
+
 export interface ParentLocation {
   workspaceId: string;
   tabId: string;

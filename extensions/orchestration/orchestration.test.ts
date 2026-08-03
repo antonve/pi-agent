@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { CliRunner } from "./cli.ts";
 import { findString } from "./cli.ts";
-import { isAutoCloseStatus } from "./domain.ts";
+import { isAutoCloseStatus, needsInspection } from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import { buildAgentName, OrchestrationManager } from "./manager.ts";
@@ -187,6 +187,35 @@ test("completed and failed tasks are eligible for auto-close", () => {
   assert.equal(isAutoCloseStatus("cancelled"), false);
 });
 
+test("auto-closed failures no longer require inspection", () => {
+  const now = Date.now();
+  const task = {
+    id: "sa-failed",
+    label: "review",
+    kind: "subagent" as const,
+    parentWorkspaceId: "w",
+    parentTabId: "w:t1",
+    parentPaneId: "w:p1",
+    tabId: "w:t2",
+    paneId: "w:p2",
+    createdTab: true,
+    createdPane: true,
+    cwd: "/tmp",
+    placement: "tab" as const,
+    status: "failed" as const,
+    createdAt: now - 40_000,
+    updatedAt: now - 40_000,
+    settledAt: now - 40_000,
+    autoCloseAt: now - 10_000,
+  };
+  assert.equal(needsInspection(task, now), false);
+  assert.equal(
+    needsInspection({ ...task, autoCloseCancelled: true }, now),
+    true,
+  );
+  assert.equal(needsInspection({ ...task, status: "blocked" }, now), true);
+});
+
 test("settled task output survives after its Herdr agent exits", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-herdr-output-"));
   const resultPath = join(directory, "child-result.txt");
@@ -248,11 +277,12 @@ test("reconciliation closes failed tasks whose deadline passed", async () => {
       return { stdout: "{}", stderr: "", code: 0 };
     },
   };
+  let changes = 0;
   const manager = new OrchestrationManager(
     new HerdrClient(runner),
     new TreehouseClient(runner),
     registry,
-    { onComplete() {} },
+    { onComplete() {}, onChange: () => changes++ },
   );
   const now = Date.now();
   await registry.put({
@@ -305,6 +335,7 @@ test("reconciliation closes failed tasks whose deadline passed", async () => {
         call.args[2] === "w:t2",
     ),
   );
+  assert.equal(changes, 1);
 });
 
 test("structured workflow output takes the final schema-matching JSON", () => {
