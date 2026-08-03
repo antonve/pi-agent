@@ -7,6 +7,7 @@ import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
 } from "@earendil-works/pi-coding-agent";
+import { AUTO_CLOSE_MS, isAutoCloseStatus } from "./domain.ts";
 import type {
   CreatedResource,
   Placement,
@@ -19,7 +20,6 @@ import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry, stateDirectory } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
 
-const AUTO_CLOSE_MS = 30_000;
 const POLL_MS = 1_000;
 const VALID_KEYS = new Set([
   "enter",
@@ -173,11 +173,7 @@ export class OrchestrationManager {
       this.monitorBackground(task.id, sentinel);
       return (await this.registry.get(task.id))!;
     } catch (error) {
-      await this.registry.update(task.id, {
-        status: "failed",
-        error: error instanceof Error ? error.message : String(error),
-        settledAt: Date.now(),
-      });
+      await this.markFailed(task.id, error);
       throw error;
     }
   }
@@ -290,12 +286,7 @@ export class OrchestrationManager {
       this.monitorAgent(task.id);
       return (await this.registry.get(task.id))!;
     } catch (error) {
-      if (task)
-        await this.registry.update(task.id, {
-          status: "failed",
-          error: error instanceof Error ? error.message : String(error),
-          settledAt: Date.now(),
-        });
+      if (task) await this.markFailed(task.id, error);
       else if (lease) await this.treehouse.returnLease(lease);
       throw error;
     }
@@ -381,12 +372,13 @@ export class OrchestrationManager {
     const result = await this.boundedOutput(taskId, output);
     const settledAt = Date.now();
     const successful = status === "done";
+    const autoClosable = isAutoCloseStatus(status);
     const task = await this.registry.update(taskId, {
       ...patch,
       status,
       settledAt,
       completionResultPath: result.fullPath,
-      ...(successful ? { autoCloseAt: settledAt + AUTO_CLOSE_MS } : {}),
+      ...(autoClosable ? { autoCloseAt: settledAt + AUTO_CLOSE_MS } : {}),
     });
     this.callbacks.onComplete(task, result.text);
     this.callbacks.onChange?.();
@@ -397,8 +389,32 @@ export class OrchestrationManager {
         successful ? "done" : "request",
       )
       .catch(() => undefined);
-    if (successful) this.scheduleClose(task.id, AUTO_CLOSE_MS);
+    if (autoClosable) this.scheduleClose(task.id, AUTO_CLOSE_MS);
     return task;
+  }
+
+  private async markFailed(taskId: string, error: unknown) {
+    const settledAt = Date.now();
+    const task = await this.registry.update(taskId, {
+      status: "failed",
+      error: error instanceof Error ? error.message : String(error),
+      settledAt,
+      autoCloseAt: settledAt + AUTO_CLOSE_MS,
+    });
+    this.callbacks.onChange?.();
+    this.scheduleClose(task.id, AUTO_CLOSE_MS);
+    return task;
+  }
+
+  async enableAutoClose(taskId: string) {
+    const task = await this.require(taskId);
+    if (!isAutoCloseStatus(task.status)) return task;
+    const updated = await this.registry.update(task.id, {
+      autoCloseCancelled: false,
+      autoCloseAt: Date.now() + AUTO_CLOSE_MS,
+    });
+    this.scheduleClose(updated.id, AUTO_CLOSE_MS);
+    return updated;
   }
 
   private scheduleClose(taskId: string, delay: number) {
@@ -416,7 +432,7 @@ export class OrchestrationManager {
     const task = await this.registry.get(taskId);
     if (
       !task ||
-      task.status !== "done" ||
+      !isAutoCloseStatus(task.status) ||
       task.autoCloseCancelled ||
       !task.autoCloseAt ||
       task.autoCloseAt > Date.now()
@@ -445,12 +461,13 @@ export class OrchestrationManager {
         if (task.kind === "background" && task.sentinel)
           this.monitorBackground(task.id, task.sentinel);
         else if (task.agentName) this.monitorAgent(task.id);
-      } else if (
-        task.status === "done" &&
-        task.autoCloseAt &&
-        !task.autoCloseCancelled
-      ) {
-        this.scheduleClose(task.id, Math.max(0, task.autoCloseAt - Date.now()));
+      } else if (isAutoCloseStatus(task.status) && !task.autoCloseCancelled) {
+        const autoCloseAt =
+          task.autoCloseAt ??
+          (task.settledAt ?? task.updatedAt) + AUTO_CLOSE_MS;
+        if (!task.autoCloseAt)
+          await this.registry.update(task.id, { autoCloseAt });
+        this.scheduleClose(task.id, Math.max(0, autoCloseAt - Date.now()));
       }
     }
   }

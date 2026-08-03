@@ -5,7 +5,10 @@ import { join } from "node:path";
 import test from "node:test";
 import type { CliRunner } from "./cli.ts";
 import { findString } from "./cli.ts";
+import { isAutoCloseStatus } from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
+import { HerdrClient } from "./herdr-client.ts";
+import { OrchestrationManager } from "./manager.ts";
 import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
@@ -113,6 +116,82 @@ test("registry writes private durable JSON atomically", async () => {
   await registry.update("bg-1", { status: "done" });
   assert.equal((await registry.get("bg-1"))?.status, "done");
   assert.match(await readFile(path, "utf8"), /"bg-1"/);
+});
+
+test("completed and failed tasks are eligible for auto-close", () => {
+  assert.equal(isAutoCloseStatus("done"), true);
+  assert.equal(isAutoCloseStatus("failed"), true);
+  assert.equal(isAutoCloseStatus("blocked"), false);
+  assert.equal(isAutoCloseStatus("cancelled"), false);
+});
+
+test("reconciliation closes failed tasks whose deadline passed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-autoclose-"));
+  const registry = new TaskRegistry(join(directory, "registry.json"));
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  const runner: CliRunner = {
+    async run(command, args) {
+      calls.push({ command, args });
+      return { stdout: "{}", stderr: "", code: 0 };
+    },
+  };
+  const manager = new OrchestrationManager(
+    new HerdrClient(runner),
+    new TreehouseClient(runner),
+    registry,
+    { onComplete() {} },
+  );
+  const now = Date.now();
+  await registry.put({
+    id: "bg-failed",
+    label: "failed command",
+    kind: "background",
+    parentWorkspaceId: "w",
+    parentTabId: "w:t1",
+    parentPaneId: "w:p1",
+    tabId: "w:t2",
+    paneId: "w:p2",
+    createdTab: true,
+    createdPane: true,
+    cwd: "/tmp",
+    placement: "tab",
+    status: "failed",
+    createdAt: now - 32_000,
+    updatedAt: now - 31_000,
+    settledAt: now - 31_000,
+  });
+
+  const previousHerdrEnv = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  try {
+    await manager.reconcile();
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if (
+        calls.some(
+          (call) =>
+            call.command === "herdr" &&
+            call.args[0] === "tab" &&
+            call.args[1] === "close" &&
+            call.args[2] === "w:t2",
+        )
+      )
+        break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  } finally {
+    if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previousHerdrEnv;
+  }
+
+  assert.ok(
+    calls.some(
+      (call) =>
+        call.command === "herdr" &&
+        call.args[0] === "tab" &&
+        call.args[1] === "close" &&
+        call.args[2] === "w:t2",
+    ),
+  );
 });
 
 test("structured workflow output takes the final schema-matching JSON", () => {

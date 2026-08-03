@@ -20,6 +20,8 @@ export const REASONING_LEVELS = [
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
 export type TaskKind = "background" | "subagent" | "workflow-child";
+export const AUTO_CLOSE_MS = 30_000;
+
 export type TaskStatus =
   | "starting"
   | "running"
@@ -28,6 +30,10 @@ export type TaskStatus =
   | "blocked"
   | "cancelled"
   | "interrupted";
+
+export function isAutoCloseStatus(status: TaskStatus) {
+  return status === "done" || status === "failed";
+}
 
 export interface LeaseRecord {
   leaseId: string;

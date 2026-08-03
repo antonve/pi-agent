@@ -12,7 +12,7 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 - `systemctl --user status pi-herdr-janitor.timer` — inspect durable cleanup.
 - `journalctl --user -u pi-herdr-janitor.service` — inspect cleanup errors.
 
-Failed, blocked, interrupted, and cancelled resources stay open. Close one explicitly through `/ps close <id>` or `/subagents close <id>`. Guarded Treehouse return never uses `--force`; dirty leases remain visible in the registry and `treehouse status`.
+Completed and failed resources close automatically after 30 seconds; focusing or interacting with one cancels pending cleanup. Blocked, interrupted, and cancelled resources stay open and can be closed explicitly through `/ps close <id>` or `/subagents close <id>`. Guarded Treehouse return never uses `--force`; dirty leases remain visible in the registry and `treehouse status`.
 
 ## Development
 

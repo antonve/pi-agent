@@ -323,23 +323,14 @@ export function registerWorkflow(
               )
             ).filter((task): task is TaskRecord => task !== undefined);
             const owner = sharedTasks[0];
-            const allSucceeded =
-              run.status === "completed" &&
-              sharedTasks.length === run.sharedChildren.length &&
-              sharedTasks.every((task) => task.status === "done");
             for (const task of sharedTasks) {
               await manager.registry.update(task.id, {
                 lease: {
                   ...run.sharedLease,
                   returnState: task.id === owner?.id ? "held" : "shared",
                 },
-                ...(allSucceeded
-                  ? {
-                      autoCloseCancelled: false,
-                      autoCloseAt: Date.now() + 30_000,
-                    }
-                  : {}),
               });
+              await manager.enableAutoClose(task.id);
             }
           }
 
