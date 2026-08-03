@@ -1,5 +1,5 @@
 import type { CliRunner } from "./cli.ts";
-import { decodeJson, findObjects, findString } from "./cli.ts";
+import { decodeJson, findString } from "./cli.ts";
 import type {
   CreatedResource,
   Harness,
@@ -7,8 +7,32 @@ import type {
   ResolvedPlacement,
 } from "./domain.ts";
 
+const AGENT_START_BUSY_RETRIES = 100;
+const AGENT_START_RETRY_MS = 100;
+
 function shellQuote(value: string) {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+}
+
+function delay(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    const complete = () => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    };
+    const timer = setTimeout(complete, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(signal?.reason ?? new Error("cancelled"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+  });
+}
+
+function isAgentPaneBusy(output: string) {
+  return output.includes('"code":"agent_pane_busy"');
 }
 
 export class HerdrClient {
@@ -79,18 +103,8 @@ export class HerdrClient {
       const tabId = findString(created, ["tab_id"]);
       if (!tabId)
         throw new Error("Herdr created a tab but returned no tab ID.");
-      const panes = await this.json(
-        ["pane", "list", "--workspace", parent.workspaceId],
-        { signal },
-      );
-      const pane = findObjects(
-        panes,
-        (item) => item.tab_id === tabId && typeof item.pane_id === "string",
-      )[0];
-      const paneId =
-        typeof pane?.pane_id === "string" ? pane.pane_id : undefined;
-      if (!paneId)
-        throw new Error(`Herdr tab ${tabId} has no discoverable pane.`);
+      const paneId = findString(created, ["pane_id"]);
+      if (!paneId) throw new Error(`Herdr tab ${tabId} returned no root pane.`);
       return {
         placement,
         workspaceId: parent.workspaceId,
@@ -205,28 +219,37 @@ export class HerdrClient {
     return this.exec(["pane", "send-keys", paneId, ...keys]);
   }
 
-  startAgent(
+  async startAgent(
     name: string,
     harness: Harness,
     paneId: string,
     args: string[],
     signal?: AbortSignal,
   ) {
-    return this.json(
-      [
-        "agent",
-        "start",
-        name,
-        "--kind",
-        harness,
-        "--pane",
-        paneId,
-        "--timeout",
-        "60000",
-        ...(args.length ? ["--", ...args] : []),
-      ],
-      { signal, timeoutMs: 70_000 },
-    );
+    const commandArgs = [
+      "agent",
+      "start",
+      name,
+      "--kind",
+      harness,
+      "--pane",
+      paneId,
+      "--timeout",
+      "60000",
+      ...(args.length ? ["--", ...args] : []),
+    ];
+    for (let attempt = 0; ; attempt++) {
+      const result = await this.runner.run("herdr", commandArgs, {
+        signal,
+        timeoutMs: 70_000,
+      });
+      if (result.code === 0)
+        return decodeJson(result.stdout, `herdr ${commandArgs.join(" ")}`);
+      const output = result.stderr || result.stdout;
+      if (attempt >= AGENT_START_BUSY_RETRIES || !isAgentPaneBusy(output))
+        throw new Error(`herdr ${commandArgs.join(" ")} failed: ${output}`);
+      await delay(AGENT_START_RETRY_MS, signal);
+    }
   }
   promptAgent(name: string, prompt: string, signal?: AbortSignal) {
     return this.json(["agent", "prompt", name, prompt], {

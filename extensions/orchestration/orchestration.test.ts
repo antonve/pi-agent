@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { findString } from "./cli.ts";
 import { isAutoCloseStatus } from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
 import { HerdrClient } from "./herdr-client.ts";
-import { OrchestrationManager } from "./manager.ts";
+import { buildAgentName, OrchestrationManager } from "./manager.ts";
 import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
@@ -60,6 +60,68 @@ test("Herdr JSON IDs are decoded through response envelopes", () => {
   assert.equal(
     findString({ result: { pane: { pane_id: "w1:p2" } } }, ["pane_id"]),
     "w1:p2",
+  );
+});
+
+test("Herdr agent names stay valid and within the 32-character limit", () => {
+  const name = buildAgentName(
+    "sa-1d20b2438e",
+    "Admin Workflow Review With A Long Name",
+  );
+  assert.match(name, /^[a-z][a-z0-9_-]{0,31}$/);
+  assert.ok(name.startsWith("sa-1d20b2438e-admin-"));
+  assert.equal(buildAgentName("sa-1d20b2438e", "!!!"), "sa-1d20b2438e");
+});
+
+test("Herdr uses the returned root pane and retries while its shell starts", async () => {
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  let starts = 0;
+  const runner: CliRunner = {
+    async run(command, args) {
+      calls.push({ command, args });
+      if (args[0] === "tab" && args[1] === "create")
+        return {
+          stdout: JSON.stringify({
+            result: {
+              tab: { tab_id: "w1:t2" },
+              root_pane: { pane_id: "w1:p2" },
+            },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      if (args[0] === "agent" && args[1] === "start") {
+        starts++;
+        if (starts < 3)
+          return {
+            stdout: "",
+            stderr:
+              '{"error":{"code":"agent_pane_busy","message":"not ready"}}',
+            code: 1,
+          };
+        return {
+          stdout: JSON.stringify({ result: { agent_status: "idle" } }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+    },
+  };
+  const client = new HerdrClient(runner);
+  const resource = await client.createResource(
+    { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1" },
+    "tab",
+    "/tmp",
+    "review",
+  );
+  await client.startAgent("sa-123-review", "codex", resource.paneId, []);
+
+  assert.equal(resource.paneId, "w1:p2");
+  assert.equal(starts, 3);
+  assert.equal(
+    calls.some((call) => call.args[0] === "pane" && call.args[1] === "list"),
+    false,
   );
 });
 
@@ -123,6 +185,57 @@ test("completed and failed tasks are eligible for auto-close", () => {
   assert.equal(isAutoCloseStatus("failed"), true);
   assert.equal(isAutoCloseStatus("blocked"), false);
   assert.equal(isAutoCloseStatus("cancelled"), false);
+});
+
+test("settled task output survives after its Herdr agent exits", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-output-"));
+  const resultPath = join(directory, "child-result.txt");
+  await writeFile(resultPath, "complete child review\n");
+  const registry = new TaskRegistry(join(directory, "registry.json"));
+  const now = Date.now();
+  await registry.put({
+    id: "sa-done",
+    label: "review",
+    kind: "subagent",
+    parentWorkspaceId: "w",
+    parentTabId: "w:t1",
+    parentPaneId: "w:p1",
+    tabId: "w:t2",
+    paneId: "w:p2",
+    createdTab: true,
+    createdPane: true,
+    agentName: "sa-done-review",
+    cwd: "/tmp",
+    placement: "tab",
+    status: "done",
+    createdAt: now,
+    updatedAt: now,
+    settledAt: now,
+    completionResultPath: resultPath,
+  });
+  const calls: Array<readonly string[]> = [];
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push(args);
+      return { stdout: "", stderr: "agent not found", code: 1 };
+    },
+  };
+  const manager = new OrchestrationManager(
+    new HerdrClient(runner),
+    new TreehouseClient(runner),
+    registry,
+    { onComplete() {} },
+  );
+  const previousStateDirectory = process.env.PI_HERDR_STATE_DIR;
+  process.env.PI_HERDR_STATE_DIR = directory;
+  try {
+    assert.equal(await manager.output("sa-done"), "complete child review\n");
+  } finally {
+    if (previousStateDirectory === undefined)
+      delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousStateDirectory;
+  }
+  assert.deepEqual(calls, []);
 });
 
 test("reconciliation closes failed tasks whose deadline passed", async () => {
