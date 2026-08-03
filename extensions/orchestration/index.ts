@@ -12,6 +12,7 @@ import { nodeCliRunner } from "./cli.ts";
 import {
   HARNESSES,
   ISOLATIONS,
+  needsInspection,
   PLACEMENTS,
   REASONING_LEVELS,
   type Harness,
@@ -128,9 +129,7 @@ export default function orchestration(pi: ExtensionAPI) {
     const running = tasks.filter(
       (task) => task.status === "running" || task.status === "starting",
     ).length;
-    const failed = tasks.filter((task) =>
-      ["failed", "blocked", "interrupted"].includes(task.status),
-    ).length;
+    const failed = tasks.filter((task) => needsInspection(task)).length;
     context.ui.setStatus(
       "herdr-orchestration",
       running || failed

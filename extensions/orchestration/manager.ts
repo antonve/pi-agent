@@ -456,6 +456,7 @@ export class OrchestrationManager {
           )
           .catch(() => undefined);
     }
+    this.callbacks.onChange?.();
   }
 
   async reconcile() {
