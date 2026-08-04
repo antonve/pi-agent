@@ -1,5 +1,5 @@
 import type { CliRunner } from "./cli.ts";
-import { decodeJson, findString } from "./cli.ts";
+import { decodeJson, findNumber, findString } from "./cli.ts";
 import type {
   CreatedResource,
   Harness,
@@ -9,6 +9,9 @@ import type {
 
 const AGENT_START_BUSY_RETRIES = 100;
 const AGENT_START_RETRY_MS = 100;
+const AGENT_PROMPT_READY_POLL_MS = 200;
+const AGENT_PROMPT_READY_STABLE_MS = 1_000;
+const AGENT_PROMPT_READY_TIMEOUT_MS = 15_000;
 
 function shellQuote(value: string) {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
@@ -251,11 +254,38 @@ export class HerdrClient {
       await delay(AGENT_START_RETRY_MS, signal);
     }
   }
-  promptAgent(name: string, prompt: string, signal?: AbortSignal) {
-    return this.json(["agent", "prompt", name, prompt], {
+  async waitForAgentPromptReady(name: string, signal?: AbortSignal) {
+    const deadline = Date.now() + AGENT_PROMPT_READY_TIMEOUT_MS;
+    let stableKey: string | undefined;
+    let stableSince = 0;
+    while (Date.now() < deadline) {
+      const agent = await this.getAgent(name);
+      if (agent.status === "idle" || agent.status === "done") {
+        const key = `${agent.status}:${agent.stateChangeSeq ?? "missing"}`;
+        if (key !== stableKey) {
+          stableKey = key;
+          stableSince = Date.now();
+        } else if (Date.now() - stableSince >= AGENT_PROMPT_READY_STABLE_MS) {
+          return agent;
+        }
+      } else {
+        stableKey = undefined;
+        stableSince = 0;
+      }
+      await delay(AGENT_PROMPT_READY_POLL_MS, signal);
+    }
+    throw new Error(`Herdr agent ${name} did not reach a stable prompt`);
+  }
+
+  async promptAgent(name: string, prompt: string, signal?: AbortSignal) {
+    const value = await this.json(["agent", "prompt", name, prompt], {
       signal,
       timeoutMs: 20_000,
     });
+    const stateChangeSeq = findNumber(value, ["state_change_seq"]);
+    if (stateChangeSeq === undefined)
+      throw new Error("herdr agent prompt returned no state_change_seq");
+    return { stateChangeSeq };
   }
   async getAgent(name: string) {
     const value = await this.json(["agent", "get", name], {
@@ -264,6 +294,7 @@ export class HerdrClient {
     return {
       status: findString(value, ["agent_status"]) ?? "unknown",
       paneId: findString(value, ["pane_id"]),
+      stateChangeSeq: findNumber(value, ["state_change_seq"]),
     };
   }
   async readAgent(name: string, lines = 600) {

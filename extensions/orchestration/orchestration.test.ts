@@ -6,12 +6,16 @@ import test from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import type { CliRunner } from "./cli.ts";
-import { findString } from "./cli.ts";
+import { findNumber, findString } from "./cli.ts";
 import { isAutoCloseStatus, needsInspection } from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import { renderHerdrTaskResult } from "./index.ts";
-import { buildAgentName, OrchestrationManager } from "./manager.ts";
+import {
+  advanceAgentLifecycle,
+  buildAgentName,
+  OrchestrationManager,
+} from "./manager.ts";
 import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
@@ -103,11 +107,93 @@ test("harness defaults and native arguments", () => {
   assert.ok(pi.args.includes("--exclude-tools"));
 });
 
-test("Herdr JSON IDs are decoded through response envelopes", () => {
-  assert.equal(
-    findString({ result: { pane: { pane_id: "w1:p2" } } }, ["pane_id"]),
-    "w1:p2",
+test("Herdr response fields are decoded through envelopes", () => {
+  const response = {
+    result: { agent: { pane_id: "w1:p2", state_change_seq: 42 } },
+  };
+  assert.equal(findString(response, ["pane_id"]), "w1:p2");
+  assert.equal(findNumber(response, ["state_change_seq"]), 42);
+});
+
+test("stale settled status cannot complete a newly prompted agent", () => {
+  const stale = advanceAgentLifecycle(
+    { status: "done", stateChangeSeq: 42 },
+    42,
+    false,
   );
+  assert.deepEqual(stale, { activityObserved: false, settled: false });
+
+  const working = advanceAgentLifecycle(
+    { status: "working", stateChangeSeq: 42 },
+    42,
+    false,
+  );
+  assert.deepEqual(working, { activityObserved: true, settled: false });
+  assert.deepEqual(
+    advanceAgentLifecycle(
+      { status: "done", stateChangeSeq: undefined },
+      undefined,
+      working.activityObserved,
+    ),
+    { activityObserved: true, settled: true },
+  );
+
+  const fastCompletion = advanceAgentLifecycle(
+    { status: "done", stateChangeSeq: 43 },
+    42,
+    false,
+  );
+  assert.deepEqual(fastCompletion, {
+    activityObserved: true,
+    settled: true,
+  });
+});
+
+test("Herdr prompt returns the lifecycle sequence used by monitoring", async () => {
+  const runner: CliRunner = {
+    async run(_command, args) {
+      assert.deepEqual(args.slice(0, 2), ["agent", "prompt"]);
+      return {
+        stdout: JSON.stringify({
+          result: { agent: { state_change_seq: 73 } },
+        }),
+        stderr: "",
+        code: 0,
+      };
+    },
+  };
+
+  const prompted = await new HerdrClient(runner).promptAgent(
+    "sa-review",
+    "Review the change",
+  );
+  assert.deepEqual(prompted, { stateChangeSeq: 73 });
+});
+
+test("new agents must expose a stable prompt before orchestration submits work", async () => {
+  let reads = 0;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      assert.deepEqual(args.slice(0, 2), ["agent", "get"]);
+      reads += 1;
+      return {
+        stdout: JSON.stringify({
+          result: {
+            agent: {
+              agent_status: "done",
+              state_change_seq: 91,
+              pane_id: "w1:p2",
+            },
+          },
+        }),
+        stderr: "",
+        code: 0,
+      };
+    },
+  };
+
+  await new HerdrClient(runner).waitForAgentPromptReady("sa-review");
+  assert.ok(reads >= 5);
 });
 
 test("Herdr agent names stay valid and within the 32-character limit", () => {
