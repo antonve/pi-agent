@@ -53,6 +53,28 @@ export function buildAgentName(taskId: string, label: string) {
     .slice(0, Math.max(0, 31 - taskId.length));
   return suffix ? `${taskId}-${suffix}` : taskId.slice(0, 32);
 }
+
+export function advanceAgentLifecycle(
+  agent: { status: string; stateChangeSeq?: number },
+  promptStateChangeSeq: number | undefined,
+  activityObserved: boolean,
+) {
+  const observed =
+    activityObserved ||
+    agent.status === "working" ||
+    (promptStateChangeSeq !== undefined &&
+      agent.stateChangeSeq !== undefined &&
+      agent.stateChangeSeq > promptStateChangeSeq);
+  return {
+    activityObserved: observed,
+    settled:
+      observed &&
+      (agent.status === "idle" ||
+        agent.status === "done" ||
+        agent.status === "blocked"),
+  };
+}
+
 function sleep(ms: number, signal?: AbortSignal) {
   return new Promise<void>((resolvePromise, reject) => {
     const timer = setTimeout(resolvePromise, ms);
@@ -285,10 +307,14 @@ export class OrchestrationManager {
         task.paneId,
         launch.args,
       );
+      await this.herdr.waitForAgentPromptReady(agentName);
       await this.registry.update(task.id, { agentName, status: "running" });
       const childPrompt = `${options.prompt.trim()}\n\nOrchestration constraints:\n- Do not spawn subagents or workflows.\n- Work only in ${cwd}.\n${lease ? `- This is Treehouse lease ${lease.leaseId} held by ${lease.holder}; do not return or force-clean it.` : "- This task intentionally uses the supplied shared checkout."}\n- End with a concise report for the parent agent.`;
-      await this.herdr.promptAgent(agentName, childPrompt);
-      this.monitorAgent(task.id);
+      const prompted = await this.herdr.promptAgent(agentName, childPrompt);
+      await this.registry.update(task.id, {
+        promptStateChangeSeq: prompted.stateChangeSeq,
+      });
+      this.monitorAgent(task.id, prompted.stateChangeSeq);
       return (await this.registry.get(task.id))!;
     } catch (error) {
       if (task) await this.markFailed(task.id, error);
@@ -297,32 +323,26 @@ export class OrchestrationManager {
     }
   }
 
-  private monitorAgent(taskId: string) {
+  private monitorAgent(taskId: string, promptStateChangeSeq?: number) {
     const controller = new AbortController();
     this.monitors.set(taskId, controller);
     void (async () => {
       try {
-        let polls = 0;
+        let activityObserved = false;
         while (!controller.signal.aborted) {
           const task = await this.registry.get(taskId);
           if (!task || task.status !== "running" || !task.agentName) return;
           const agent = await this.herdr.getAgent(task.agentName);
-          polls++;
-          if (agent.status === "blocked") {
+          const lifecycle = advanceAgentLifecycle(
+            agent,
+            promptStateChangeSeq,
+            activityObserved,
+          );
+          activityObserved = lifecycle.activityObserved;
+          if (lifecycle.settled) {
             await this.settle(
               task.id,
-              "blocked",
-              await this.herdr.readAgent(task.agentName),
-            );
-            return;
-          }
-          if (
-            agent.status === "done" ||
-            (agent.status === "idle" && polls > 1)
-          ) {
-            await this.settle(
-              task.id,
-              "done",
+              agent.status === "blocked" ? "blocked" : "done",
               await this.herdr.readAgent(task.agentName),
             );
             return;
@@ -466,7 +486,8 @@ export class OrchestrationManager {
       if (task.status === "running") {
         if (task.kind === "background" && task.sentinel)
           this.monitorBackground(task.id, task.sentinel);
-        else if (task.agentName) this.monitorAgent(task.id);
+        else if (task.agentName)
+          this.monitorAgent(task.id, task.promptStateChangeSeq);
       } else if (isAutoCloseStatus(task.status) && !task.autoCloseCancelled) {
         const autoCloseAt =
           task.autoCloseAt ??
@@ -512,13 +533,14 @@ export class OrchestrationManager {
   async send(idValue: string, text: string) {
     const task = await this.interact(idValue);
     if (task.agentName) {
+      const prompted = await this.herdr.promptAgent(task.agentName, text);
       await this.registry.update(task.id, {
         status: "running",
         settledAt: undefined,
         autoCloseAt: undefined,
+        promptStateChangeSeq: prompted.stateChangeSeq,
       });
-      await this.herdr.promptAgent(task.agentName, text);
-      this.monitorAgent(task.id);
+      this.monitorAgent(task.id, prompted.stateChangeSeq);
     } else await this.herdr.sendText(task.paneId, text);
     return task;
   }

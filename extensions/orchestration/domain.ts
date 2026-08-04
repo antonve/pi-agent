@@ -57,6 +57,7 @@ export interface TaskRecord {
   createdTab: boolean;
   createdPane: boolean;
   agentName?: string;
+  promptStateChangeSeq?: number;
   harness?: Harness;
   model?: string;
   reasoning?: ReasoningLevel;

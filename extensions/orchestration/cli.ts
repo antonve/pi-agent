@@ -73,6 +73,28 @@ export function findString(
   return undefined;
 }
 
+export function findNumber(
+  value: unknown,
+  keys: readonly string[],
+): number | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of keys)
+    if (typeof record[key] === "number") return record[key];
+  for (const child of Object.values(record)) {
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        const found = findNumber(item, keys);
+        if (found !== undefined) return found;
+      }
+    } else {
+      const found = findNumber(child, keys);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+
 export function findObjects(
   value: unknown,
   predicate: (record: Record<string, unknown>) => boolean,
