@@ -6,6 +6,7 @@ import type {
   ExtensionContext,
   MessageRenderer,
   Theme,
+  ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -34,6 +35,40 @@ function renderResultText(result: AgentToolResult<unknown>, theme: Theme) {
     0,
     0,
   );
+}
+
+function compactSubagentRendering<TArgs>(summary: (args: TArgs) => string) {
+  return {
+    renderShell: "self" as const,
+    renderCall(
+      args: TArgs,
+      theme: Theme,
+      context: { expanded: boolean; isError: boolean },
+    ) {
+      const title = theme.fg("toolTitle", theme.bold(summary(args)));
+      if (!context.expanded && !context.isError) return new Text(title, 0, 0);
+      return new Text(
+        `${title}\n${theme.fg("muted", JSON.stringify(args, null, 2))}`,
+        0,
+        0,
+      );
+    },
+    renderResult(
+      result: AgentToolResult<unknown>,
+      options: ToolRenderResultOptions,
+      theme: Theme,
+      context: { isError: boolean },
+    ) {
+      return shouldRenderToolPart(
+        "compact",
+        "result",
+        options.expanded,
+        context.isError,
+      )
+        ? renderResultText(result, theme)
+        : new Container();
+    },
+  };
 }
 
 function describe(task: TaskRecord) {
@@ -449,6 +484,9 @@ export default function orchestration(pi: ExtensionAPI) {
         details: task,
       };
     },
+    ...compactSubagentRendering(
+      (args: { name: string }) => `subagent spawn ${args.name}`,
+    ),
   });
 
   pi.registerTool({
@@ -471,6 +509,9 @@ export default function orchestration(pi: ExtensionAPI) {
         details: { tasks },
       };
     },
+    ...compactSubagentRendering(
+      (args: { ids: string[] }) => `subagent wait ${args.ids.join(", ")}`,
+    ),
   });
   pi.registerTool({
     name: "subagent_check",
@@ -492,6 +533,9 @@ export default function orchestration(pi: ExtensionAPI) {
         details: task,
       };
     },
+    ...compactSubagentRendering(
+      (args: { id: string }) => `subagent check ${args.id}`,
+    ),
   });
   pi.registerTool({
     name: "subagent_list",
@@ -515,6 +559,7 @@ export default function orchestration(pi: ExtensionAPI) {
         details: { tasks },
       };
     },
+    ...compactSubagentRendering(() => "subagents"),
   });
   pi.registerTool({
     name: "subagent_cancel",
@@ -543,6 +588,9 @@ export default function orchestration(pi: ExtensionAPI) {
         details: { tasks },
       };
     },
+    ...compactSubagentRendering(
+      (args: { ids: string[] }) => `subagent cancel ${args.ids.join(", ")}`,
+    ),
   });
   pi.registerTool({
     name: "subagent_send",
@@ -557,6 +605,9 @@ export default function orchestration(pi: ExtensionAPI) {
         details: task,
       };
     },
+    ...compactSubagentRendering(
+      (args: { id: string }) => `subagent send ${args.id}`,
+    ),
   });
 
   async function dashboard(
