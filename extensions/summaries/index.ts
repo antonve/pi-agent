@@ -8,6 +8,7 @@ import {
   buildFallbackRecap,
   createRunBoundary,
   getRunEntries,
+  hasMultipleUserTurns,
   serializeRunTranscript,
 } from "./src/transcript.ts";
 import {
@@ -75,10 +76,10 @@ export default function (pi: ExtensionAPI) {
     const run = runBoundary.settle();
     if (!run || ctx.mode !== "tui" || !sessionActive) return;
 
-    const entries = getRunEntries(
-      ctx.sessionManager.getBranch(),
-      run.baselineLeafId,
-    );
+    const branch = ctx.sessionManager.getBranch();
+    if (!hasMultipleUserTurns(branch)) return;
+
+    const entries = getRunEntries(branch, run.baselineLeafId);
     if (entries.length === 0) return;
 
     const config = loadSummaryConfig();

@@ -4,6 +4,7 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   createRunBoundary,
   getRunEntries,
+  hasMultipleUserTurns,
   serializeRunTranscript,
   TRANSCRIPT_MAX_BYTES,
 } from "./src/transcript.ts";
@@ -39,6 +40,23 @@ test("run boundaries replace stale starts and settle exactly once", () => {
     baselineLeafId: "new-top-level-run",
   });
   assert.equal(boundary.settle(), undefined);
+});
+
+test("recaps require more than one user turn on the branch", () => {
+  const first = entry("first", {
+    role: "user",
+    content: "first request",
+    timestamp: 0,
+  });
+  const second = entry("second", {
+    role: "user",
+    content: "follow-up request",
+    timestamp: 1,
+  });
+
+  assert.equal(hasMultipleUserTurns([]), false);
+  assert.equal(hasMultipleUserTurns([first]), false);
+  assert.equal(hasMultipleUserTurns([first, second]), true);
 });
 
 test("run slicing starts after the before_agent_start leaf", () => {
