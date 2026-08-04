@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -23,6 +26,7 @@ interface LinearRequest {
   operationName?: string;
   signal?: AbortSignal;
   apiKey?: string;
+  secretsPath?: string | false;
   endpoint?: string;
   fetchImpl?: typeof fetch;
 }
@@ -31,6 +35,21 @@ function record(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+async function readConfiguredApiKey(path: string) {
+  try {
+    const contents = await readFile(path, "utf8");
+    const line = contents
+      .split(/\r?\n/)
+      .find((candidate) => candidate.startsWith("LINEAR_API_KEY="));
+    if (!line) return undefined;
+    const value = line.slice("LINEAR_API_KEY=".length).trim();
+    const quoted = /^(?:"([^"]*)"|'([^']*)')$/.exec(value);
+    return (quoted?.[1] ?? quoted?.[2] ?? value).trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function boundedErrorBody(body: string) {
@@ -51,14 +70,19 @@ export async function requestLinearGraphql({
   variables = {},
   operationName,
   signal,
-  apiKey = process.env.LINEAR_API_KEY,
+  apiKey,
+  secretsPath = join(homedir(), ".config", "agentbox", "secrets.env"),
   endpoint = DEFAULT_ENDPOINT,
   fetchImpl = fetch,
 }: LinearRequest) {
-  const token = apiKey?.trim();
+  const directToken =
+    apiKey === undefined ? process.env.LINEAR_API_KEY : apiKey;
+  const token =
+    directToken?.trim() ||
+    (secretsPath ? await readConfiguredApiKey(secretsPath) : undefined);
   if (!token)
     throw new Error(
-      "Linear is not configured. Add LINEAR_API_KEY to ~/.config/agentbox/secrets.env and restart Herdr when no agents are running.",
+      "Linear is not configured. Add LINEAR_API_KEY to ~/.config/agentbox/secrets.env.",
     );
   if (!query.trim()) throw new Error("Linear GraphQL query must not be empty.");
 

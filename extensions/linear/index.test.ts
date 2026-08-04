@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -99,6 +102,28 @@ test("sends the personal API key and GraphQL variables without interpolation", a
   });
 });
 
+test("reads the API key from the private agent-box secrets file", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-linear-secrets-"));
+  const secretsPath = join(directory, "secrets.env");
+  await writeFile(secretsPath, 'LINEAR_API_KEY="lin_from_file"\n', {
+    mode: 0o600,
+  });
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    assert.equal(
+      new Headers(init?.headers).get("Authorization"),
+      "lin_from_file",
+    );
+    return new Response(JSON.stringify({ data: { viewer: { id: "user-1" } } }));
+  };
+
+  await requestLinearGraphql({
+    query: "query Viewer { viewer { id } }",
+    apiKey: "",
+    secretsPath,
+    fetchImpl,
+  });
+});
+
 test("reports GraphQL errors as failed tool execution", async () => {
   const fetchImpl: typeof fetch = async () =>
     new Response(
@@ -118,6 +143,7 @@ test("reports GraphQL errors as failed tool execution", async () => {
     requestLinearGraphql({
       query: "query Viewer { viewer { id } }",
       apiKey: "",
+      secretsPath: false,
     }),
     /LINEAR_API_KEY/,
   );
