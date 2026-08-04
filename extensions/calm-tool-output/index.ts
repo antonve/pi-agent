@@ -8,7 +8,7 @@ import {
   createReadToolDefinition,
   createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Container, type Component } from "@earendil-works/pi-tui";
+import { Container, Text, type Component } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
 import {
   shouldRenderToolPart,
@@ -27,10 +27,28 @@ type RenderResult<TParams extends TSchema, TDetails, TState> = NonNullable<
   ToolDefinition<TParams, TDetails, TState>["renderResult"]
 >;
 
+type CompactRenderCall<TParams extends TSchema, TDetails, TState> = RenderCall<
+  TParams,
+  TDetails,
+  TState
+>;
+
+function sanitizeCalmLine(value: unknown) {
+  return String(value ?? "")
+    .replace(
+      /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?]*[ -/]*[@-~])/g,
+      "",
+    )
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function registerCalmBuiltIn<TParams extends TSchema, TDetails, TState>(
   pi: ExtensionAPI,
   factory: DefinitionFactory<TParams, TDetails, TState>,
   mode: CalmToolOutputMode,
+  compactRenderCall?: CompactRenderCall<TParams, TDetails, TState>,
 ) {
   const definitions = new Map<
     string,
@@ -92,6 +110,10 @@ function registerCalmBuiltIn<TParams extends TSchema, TDetails, TState>(
       )
         return new Container();
       const components = componentsFor(context.state);
+      if (!context.expanded && !context.isError && compactRenderCall) {
+        components.call = compactRenderCall(args, theme, context);
+        return components.call;
+      }
       components.call = (definitionFor(context.cwd).renderCall ?? renderCall)(
         args,
         theme,
@@ -124,6 +146,17 @@ function registerCalmBuiltIn<TParams extends TSchema, TDetails, TState>(
 export default function calmToolOutput(pi: ExtensionAPI) {
   registerCalmBuiltIn(pi, createReadToolDefinition, "hidden");
   registerCalmBuiltIn(pi, createBashToolDefinition, "compact");
-  registerCalmBuiltIn(pi, createEditToolDefinition, "compact");
+  registerCalmBuiltIn(
+    pi,
+    createEditToolDefinition,
+    "compact",
+    (args, theme) =>
+      new Text(
+        theme.fg("toolTitle", theme.bold("edit")) +
+          theme.fg("muted", ` ${sanitizeCalmLine(args.path)}`),
+        0,
+        0,
+      ),
+  );
   registerCalmBuiltIn(pi, createWriteToolDefinition, "compact");
 }

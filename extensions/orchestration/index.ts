@@ -4,6 +4,7 @@ import type {
   AgentToolResult,
   ExtensionAPI,
   ExtensionContext,
+  MessageRenderer,
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
@@ -44,6 +45,33 @@ function describe(task: TaskRecord) {
     : "";
   return `${task.id} [${task.status}] ${task.label}${agent} · ${task.placement} · ${task.cwd}${lease}`;
 }
+
+export const renderHerdrTaskResult: MessageRenderer = (
+  message,
+  options,
+  theme,
+) => {
+  const details = (message.details ?? {}) as {
+    status?: string;
+    label?: string;
+    id?: string;
+    kind?: string;
+  };
+  const color = details.status === "done" ? "success" : "warning";
+  const summary =
+    theme.fg(color, `${details.id ?? "task"} ${details.status ?? "settled"}`) +
+    theme.fg("muted", ` · ${details.label ?? ""}`);
+  if (
+    !options.expanded &&
+    details.kind === "background" &&
+    details.status === "done"
+  )
+    return new Text(summary, 0, 0);
+
+  const content = typeof message.content === "string" ? message.content : "";
+  const output = content.split("\n").slice(1).join("\n").trim();
+  return new Text(`${summary}${output ? `\n${output}` : ""}`, 0, 0);
+};
 
 async function resolvePiModel(
   ctx: ExtensionContext,
@@ -168,29 +196,7 @@ export default function orchestration(pi: ExtensionAPI) {
     if (ctx.hasUI) ctx.ui.setStatus("herdr-orchestration", undefined);
   });
 
-  pi.registerMessageRenderer(
-    "herdr-task-result",
-    (message, _options, theme) => {
-      const details = (message.details ?? {}) as {
-        status?: string;
-        label?: string;
-        id?: string;
-      };
-      const color = details.status === "done" ? "success" : "warning";
-      const content =
-        typeof message.content === "string" ? message.content : "";
-      return new Text(
-        theme.fg(
-          color,
-          `${details.id ?? "task"} ${details.status ?? "settled"}`,
-        ) +
-          theme.fg("muted", ` · ${details.label ?? ""}`) +
-          `\n${content.split("\n").slice(1).join("\n").trim()}`,
-        0,
-        0,
-      );
-    },
-  );
+  pi.registerMessageRenderer("herdr-task-result", renderHerdrTaskResult);
 
   pi.registerTool({
     name: "bg_start",
