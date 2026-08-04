@@ -1,6 +1,6 @@
 # Managed Pi setup
 
-This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. It includes the upstream-inspired dashboard, ask-user, copy-all, system `fd`/`rg`, Git/model state, automatic summaries, and Herdr/Treehouse orchestration. Firecrawl is intentionally excluded.
+This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. It includes the upstream-inspired dashboard, ask-user, copy-all, system `fd`/`rg`, Git/model state, automatic summaries for multi-turn conversations, and Herdr/Treehouse orchestration. Firecrawl is intentionally excluded.
 
 ## Operations
 

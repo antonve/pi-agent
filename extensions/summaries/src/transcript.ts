@@ -29,6 +29,16 @@ export function createRunBoundary() {
   };
 }
 
+export function hasMultipleUserTurns(entries: readonly SessionEntry[]) {
+  let userTurns = 0;
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.message.role !== "user") continue;
+    userTurns += 1;
+    if (userTurns >= 2) return true;
+  }
+  return false;
+}
+
 export function getRunEntries(
   branch: readonly SessionEntry[],
   baselineLeafId: string | null,
