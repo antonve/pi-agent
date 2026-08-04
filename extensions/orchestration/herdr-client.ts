@@ -1,5 +1,5 @@
 import type { CliRunner } from "./cli.ts";
-import { decodeJson, findNumber, findString } from "./cli.ts";
+import { decodeJson, findNumber, findObjects, findString } from "./cli.ts";
 import type {
   CreatedResource,
   Harness,
@@ -7,11 +7,64 @@ import type {
   ResolvedPlacement,
 } from "./domain.ts";
 
-const AGENT_START_BUSY_RETRIES = 100;
-const AGENT_START_RETRY_MS = 100;
-const AGENT_PROMPT_READY_POLL_MS = 200;
-const AGENT_PROMPT_READY_STABLE_MS = 1_000;
-const AGENT_PROMPT_READY_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMING = {
+  agentStartBusyRetries: 100,
+  agentStartRetryMs: 100,
+  promptReadyPollMs: 200,
+  promptReadyConsecutiveReads: 2,
+  promptReadyTimeoutMs: 15_000,
+  promptActivityTimeoutMs: 10_000,
+  promptLateActivityMs: 5_000,
+  promptDeliveryAttempts: 3,
+} as const;
+
+export interface HerdrTiming {
+  agentStartBusyRetries: number;
+  agentStartRetryMs: number;
+  promptReadyPollMs: number;
+  promptReadyConsecutiveReads: number;
+  promptReadyTimeoutMs: number;
+  promptActivityTimeoutMs: number;
+  promptLateActivityMs: number;
+  promptDeliveryAttempts: number;
+}
+
+export interface HerdrAgent {
+  status: string;
+  harness?: string;
+  name?: string;
+  paneId?: string;
+  sessionKey?: string;
+  stateChangeSeq?: number;
+  interactiveReady?: boolean;
+  launchPending?: boolean;
+}
+
+export class HerdrCommandError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = "HerdrCommandError";
+    this.code = code;
+  }
+}
+
+const RETRYABLE_AGENT_CODES = new Set([
+  "agent_not_found",
+  "agent_not_ready",
+  "agent_not_running",
+  "agent_pane_busy",
+  "agent_pane_unavailable",
+  "agent_launch_pending",
+  "agent_prompt_stalled",
+]);
+const RETRYABLE_AGENT_START_CODES = new Set([
+  "agent_not_ready",
+  "agent_pane_busy",
+  "agent_pane_unavailable",
+  "agent_launch_pending",
+]);
 
 function shellQuote(value: string) {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
@@ -34,15 +87,102 @@ function delay(ms: number, signal?: AbortSignal) {
   });
 }
 
-function isAgentPaneBusy(output: string) {
-  return output.includes('"code":"agent_pane_busy"');
+function herdrErrorCode(output: string) {
+  try {
+    return findString(JSON.parse(output), ["code"]);
+  } catch {
+    return undefined;
+  }
+}
+
+function commandLabel(args: readonly string[]) {
+  if (args[0] === "agent" && args[1] === "prompt" && args.length >= 4)
+    return [...args.slice(0, 3), "<prompt>", ...args.slice(4)].join(" ");
+  return args.join(" ");
+}
+
+function commandError(args: readonly string[], output: string) {
+  return new HerdrCommandError(
+    `herdr ${commandLabel(args)} failed: ${output}`,
+    herdrErrorCode(output),
+  );
+}
+
+function isRetryableAgentError(error: unknown) {
+  return (
+    error instanceof HerdrCommandError &&
+    error.code !== undefined &&
+    RETRYABLE_AGENT_CODES.has(error.code)
+  );
+}
+
+function decodeAgent(value: unknown): HerdrAgent {
+  const record = findObjects(
+    value,
+    (candidate) =>
+      typeof candidate.pane_id === "string" &&
+      typeof candidate.agent_status === "string",
+  )[0];
+  if (!record) throw new Error("Herdr returned no agent state.");
+  const session =
+    record.agent_session && typeof record.agent_session === "object"
+      ? (record.agent_session as Record<string, unknown>)
+      : undefined;
+  return {
+    status: String(record.agent_status),
+    harness: typeof record.agent === "string" ? record.agent : undefined,
+    name: typeof record.name === "string" ? record.name : undefined,
+    paneId: String(record.pane_id),
+    sessionKey:
+      session && typeof session.value === "string" ? session.value : undefined,
+    stateChangeSeq:
+      typeof record.state_change_seq === "number"
+        ? record.state_change_seq
+        : undefined,
+    interactiveReady:
+      typeof record.interactive_ready === "boolean"
+        ? record.interactive_ready
+        : undefined,
+    launchPending:
+      typeof record.launch_pending === "boolean"
+        ? record.launch_pending
+        : undefined,
+  };
+}
+
+function isPromptReady(
+  agent: HerdrAgent,
+  expected?: { paneId: string; harness: Harness },
+) {
+  return (
+    (!expected ||
+      (agent.paneId === expected.paneId &&
+        agent.harness === expected.harness)) &&
+    (agent.status === "idle" || agent.status === "done") &&
+    agent.stateChangeSeq !== undefined &&
+    agent.launchPending !== true &&
+    (!expected || agent.interactiveReady === true)
+  );
+}
+
+function acknowledgedActivity(agent: HerdrAgent, baseline: HerdrAgent) {
+  if (agent.paneId !== baseline.paneId || agent.harness !== baseline.harness)
+    return false;
+  if (agent.status !== "working" && agent.status !== "blocked") return false;
+  return (
+    agent.stateChangeSeq !== undefined &&
+    baseline.stateChangeSeq !== undefined &&
+    agent.stateChangeSeq > baseline.stateChangeSeq
+  );
 }
 
 export class HerdrClient {
   private readonly runner: CliRunner;
+  private readonly timing: HerdrTiming;
 
-  constructor(runner: CliRunner) {
+  constructor(runner: CliRunner, timing: Partial<HerdrTiming> = {}) {
     this.runner = runner;
+    this.timing = { ...DEFAULT_TIMING, ...timing };
   }
 
   private async json(
@@ -51,10 +191,8 @@ export class HerdrClient {
   ) {
     const result = await this.runner.run("herdr", args, options);
     if (result.code !== 0)
-      throw new Error(
-        `herdr ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
-      );
-    return decodeJson(result.stdout, `herdr ${args.join(" ")}`);
+      throw commandError(args, result.stderr || result.stdout);
+    return decodeJson(result.stdout, `herdr ${commandLabel(args)}`);
   }
 
   private async exec(
@@ -63,9 +201,7 @@ export class HerdrClient {
   ) {
     const result = await this.runner.run("herdr", args, options);
     if (result.code !== 0)
-      throw new Error(
-        `herdr ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
-      );
+      throw commandError(args, result.stderr || result.stdout);
     return result.stdout;
   }
 
@@ -249,32 +385,207 @@ export class HerdrClient {
       if (result.code === 0)
         return decodeJson(result.stdout, `herdr ${commandArgs.join(" ")}`);
       const output = result.stderr || result.stdout;
-      if (attempt >= AGENT_START_BUSY_RETRIES || !isAgentPaneBusy(output))
-        throw new Error(`herdr ${commandArgs.join(" ")} failed: ${output}`);
-      await delay(AGENT_START_RETRY_MS, signal);
+      if (
+        attempt >= this.timing.agentStartBusyRetries ||
+        !RETRYABLE_AGENT_START_CODES.has(herdrErrorCode(output) ?? "")
+      )
+        throw commandError(commandArgs, output);
+      await delay(this.timing.agentStartRetryMs, signal);
     }
   }
-  async waitForAgentPromptReady(name: string, signal?: AbortSignal) {
-    const deadline = Date.now() + AGENT_PROMPT_READY_TIMEOUT_MS;
-    let stableKey: string | undefined;
-    let stableSince = 0;
-    while (Date.now() < deadline) {
-      const agent = await this.getAgent(name);
-      if (agent.status === "idle" || agent.status === "done") {
-        const key = `${agent.status}:${agent.stateChangeSeq ?? "missing"}`;
-        if (key !== stableKey) {
-          stableKey = key;
-          stableSince = Date.now();
-        } else if (Date.now() - stableSince >= AGENT_PROMPT_READY_STABLE_MS) {
-          return agent;
+  private async resolveAgent(
+    name: string,
+    expected?: { paneId: string; harness: Harness },
+  ) {
+    try {
+      return await this.getAgent(name);
+    } catch (error) {
+      if (!expected || !isRetryableAgentError(error)) throw error;
+      try {
+        const replacement = await this.getAgent(expected.paneId);
+        if (
+          replacement.paneId !== expected.paneId ||
+          replacement.harness !== expected.harness
+        )
+          throw error;
+        if (replacement.name !== name) {
+          await this.json(["agent", "rename", expected.paneId, name]);
+          replacement.name = name;
         }
-      } else {
-        stableKey = undefined;
-        stableSince = 0;
+        return replacement;
+      } catch (paneError) {
+        if (!isRetryableAgentError(paneError)) throw paneError;
+        throw error;
       }
-      await delay(AGENT_PROMPT_READY_POLL_MS, signal);
     }
-    throw new Error(`Herdr agent ${name} did not reach a stable prompt`);
+  }
+
+  async waitForAgentPromptReady(
+    name: string,
+    expected?: { paneId: string; harness: Harness },
+    signal?: AbortSignal,
+  ) {
+    const deadline = Date.now() + this.timing.promptReadyTimeoutMs;
+    let stableKey: string | undefined;
+    let consecutiveReads = 0;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      try {
+        const agent = await this.resolveAgent(name, expected);
+        if (isPromptReady(agent, expected)) {
+          const key = `${agent.paneId}:${agent.harness}:${agent.sessionKey ?? "missing"}:${agent.stateChangeSeq ?? "missing"}`;
+          consecutiveReads = key === stableKey ? consecutiveReads + 1 : 1;
+          stableKey = key;
+          if (consecutiveReads >= this.timing.promptReadyConsecutiveReads)
+            return agent;
+        } else {
+          stableKey = undefined;
+          consecutiveReads = 0;
+        }
+      } catch (error) {
+        if (!isRetryableAgentError(error)) throw error;
+        lastError = error;
+        stableKey = undefined;
+        consecutiveReads = 0;
+      }
+      await delay(this.timing.promptReadyPollMs, signal);
+    }
+    const detail = lastError instanceof Error ? `: ${lastError.message}` : "";
+    throw new Error(
+      `Herdr agent ${name} did not reach an interactive prompt${detail}`,
+    );
+  }
+
+  private async promptAgentForActivity(
+    name: string,
+    prompt: string,
+    signal?: AbortSignal,
+  ) {
+    // Herdr prompt without --wait acknowledges only terminal input. Waiting for
+    // working/blocked makes child lifecycle activity the delivery receipt.
+    const args = [
+      "agent",
+      "prompt",
+      name,
+      prompt,
+      "--wait",
+      "--until",
+      "working",
+      "--until",
+      "blocked",
+      "--timeout",
+      String(this.timing.promptActivityTimeoutMs),
+    ];
+    const value = await this.json(args, {
+      signal,
+      timeoutMs: this.timing.promptActivityTimeoutMs + 5_000,
+    });
+    return decodeAgent(value);
+  }
+
+  private async observeLatePromptActivity(
+    name: string,
+    baseline: HerdrAgent,
+    expected: { paneId: string; harness: Harness },
+    signal?: AbortSignal,
+  ) {
+    const deadline = Date.now() + this.timing.promptLateActivityMs;
+    while (Date.now() < deadline) {
+      try {
+        const agent = await this.resolveAgent(name, expected);
+        if (acknowledgedActivity(agent, baseline)) return agent;
+      } catch (error) {
+        if (!isRetryableAgentError(error)) throw error;
+      }
+      await delay(this.timing.promptReadyPollMs, signal);
+    }
+    return undefined;
+  }
+
+  async deliverInitialPrompt(options: {
+    name: string;
+    harness: Harness;
+    paneId: string;
+    launchArgs: string[];
+    prompt: string;
+    signal?: AbortSignal;
+  }) {
+    let lastError: unknown;
+    for (
+      let attempt = 1;
+      attempt <= this.timing.promptDeliveryAttempts;
+      attempt++
+    ) {
+      let baseline: HerdrAgent;
+      try {
+        baseline = await this.waitForAgentPromptReady(
+          options.name,
+          { paneId: options.paneId, harness: options.harness },
+          options.signal,
+        );
+      } catch (error) {
+        lastError = error;
+        if (attempt >= this.timing.promptDeliveryAttempts) break;
+        try {
+          await this.startAgent(
+            options.name,
+            options.harness,
+            options.paneId,
+            options.launchArgs,
+            options.signal,
+          );
+        } catch (startError) {
+          lastError = startError;
+          if (
+            startError instanceof HerdrCommandError &&
+            !isRetryableAgentError(startError)
+          )
+            break;
+        }
+        continue;
+      }
+
+      try {
+        const acknowledged = await this.promptAgentForActivity(
+          options.name,
+          options.prompt,
+          options.signal,
+        );
+        if (!acknowledgedActivity(acknowledged, baseline))
+          throw new Error(
+            `Herdr agent ${options.name} returned without post-submission activity`,
+          );
+        return {
+          stateChangeSeq: acknowledged.stateChangeSeq,
+          baselineStateChangeSeq: baseline.stateChangeSeq,
+          attempts: attempt,
+        };
+      } catch (error) {
+        lastError = error;
+        const late = await this.observeLatePromptActivity(
+          options.name,
+          baseline,
+          { paneId: options.paneId, harness: options.harness },
+          options.signal,
+        );
+        if (late)
+          return {
+            stateChangeSeq: late.stateChangeSeq,
+            baselineStateChangeSeq: baseline.stateChangeSeq,
+            attempts: attempt,
+          };
+        if (
+          attempt >= this.timing.promptDeliveryAttempts ||
+          (error instanceof HerdrCommandError && !isRetryableAgentError(error))
+        )
+          break;
+      }
+    }
+    const detail =
+      lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(
+      `Initial prompt delivery to ${options.harness} agent ${options.name} in pane ${options.paneId} was not acknowledged after ${this.timing.promptDeliveryAttempts} attempts: ${detail}`,
+    );
   }
 
   async promptAgent(name: string, prompt: string, signal?: AbortSignal) {
@@ -287,15 +598,11 @@ export class HerdrClient {
       throw new Error("herdr agent prompt returned no state_change_seq");
     return { stateChangeSeq };
   }
-  async getAgent(name: string) {
+  async getAgent(name: string): Promise<HerdrAgent> {
     const value = await this.json(["agent", "get", name], {
       timeoutMs: 10_000,
     });
-    return {
-      status: findString(value, ["agent_status"]) ?? "unknown",
-      paneId: findString(value, ["pane_id"]),
-      stateChangeSeq: findNumber(value, ["state_change_seq"]),
-    };
+    return decodeAgent(value);
   }
   async readAgent(name: string, lines = 600) {
     const result = await this.runner.run(
