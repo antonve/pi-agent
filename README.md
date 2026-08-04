@@ -9,6 +9,7 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 - `/workflows` — list workflow run artifacts.
 - `/summary-model` — store a private summary-model override under `~/.config/pi-herdr`.
 - Linear tools cover routine issue search/read/create/update/comment workflows, with unrestricted GraphQL as a fallback. Set `LINEAR_API_KEY` in `~/.config/agentbox/secrets.env`.
+- `github-dark-default` and warm yellow-orange `gruvbox-dark` themes are included.
 - State, results, workflow artifacts, and lease ownership live under `~/.local/state/pi-herdr`.
 - `systemctl --user status pi-herdr-janitor.timer` — inspect durable cleanup.
 - `journalctl --user -u pi-herdr-janitor.service` — inspect cleanup errors.
