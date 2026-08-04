@@ -3,16 +3,63 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 import type { CliRunner } from "./cli.ts";
 import { findString } from "./cli.ts";
 import { isAutoCloseStatus, needsInspection } from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
 import { HerdrClient } from "./herdr-client.ts";
+import { renderHerdrTaskResult } from "./index.ts";
 import { buildAgentName, OrchestrationManager } from "./manager.ts";
 import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
 import { extractFinalJson } from "./workflows/index.ts";
+
+function renderedLines(component: Component) {
+  return component
+    .render(120)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+test("completed background notifications collapse to one line", () => {
+  const message = {
+    role: "custom" as const,
+    customType: "herdr-task-result",
+    content:
+      "background bg-123 “Validate” done.\n\ncommand output\nmore output",
+    display: true,
+    timestamp: Date.now(),
+    details: {
+      id: "bg-123",
+      kind: "background",
+      status: "done",
+      label: "Validate",
+    },
+  };
+  const theme = {
+    fg: (_color: string, text: string) => text,
+  } as Theme;
+
+  const collapsed = renderHerdrTaskResult(
+    message,
+    { expanded: false, outputPad: 0 },
+    theme,
+  );
+  assert.ok(collapsed);
+  assert.deepEqual(renderedLines(collapsed), ["bg-123 done · Validate"]);
+
+  const expanded = renderHerdrTaskResult(
+    message,
+    { expanded: true, outputPad: 0 },
+    theme,
+  );
+  assert.ok(expanded);
+  assert.ok(renderedLines(expanded).includes("command output"));
+  assert.ok(renderedLines(expanded).includes("more output"));
+});
 
 test("auto isolation is conservative", () => {
   assert.equal(

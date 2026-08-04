@@ -76,6 +76,32 @@ test("compact built-ins retain the call and reveal results with Ctrl+O", () => {
   assert.ok(visibleLines(bash).some((line) => line === "ok"));
 });
 
+test("collapsed edit calls stay on one line while Ctrl+O restores the diff", () => {
+  const edit = component(registeredTools(), "edit", {
+    path: "/tmp/example.ts",
+    edits: [{ oldText: "old", newText: "new" }],
+  });
+  edit.updateResult({
+    content: [
+      {
+        type: "text",
+        text: "Successfully replaced 1 block(s) in /tmp/example.ts.",
+      },
+    ],
+    details: {
+      diff: "@@ -1 +1 @@\n-old\n+new",
+      firstChangedLine: 1,
+    },
+    isError: false,
+  });
+
+  assert.deepEqual(visibleLines(edit), ["edit /tmp/example.ts"]);
+
+  edit.setExpanded(true);
+  assert.ok(visibleLines(edit).some((line) => line.includes("-old")));
+  assert.ok(visibleLines(edit).some((line) => line.includes("+new")));
+});
+
 test("collapsed failures remain visible", () => {
   const read = component(registeredTools(), "read", { path: "/missing" });
   read.updateResult({
