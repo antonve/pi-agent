@@ -5,6 +5,7 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 ## Operations
 
 - `/clear` — start a new session; alias for `/new`.
+- `/pull` — pull the current Git repository once; failures are reported for manual resolution.
 - `/ps` — list and interact with tracked background commands.
 - `/subagents` — list, inspect, focus, prompt, interrupt, close, or attach to children.
 - `/workflows` — list workflow run artifacts.

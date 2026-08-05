@@ -7,4 +7,11 @@ export default function (pi: ExtensionAPI) {
       await ctx.newSession();
     },
   });
+
+  pi.registerCommand("pull", {
+    description: "Pull the current Git repository",
+    handler: async () => {
+      pi.sendUserMessage("/skill:pull");
+    },
+  });
 }
