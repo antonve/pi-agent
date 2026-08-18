@@ -3,14 +3,18 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  Theme,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import type { CliRunner } from "./cli.ts";
 import { findNumber, findString } from "./cli.ts";
 import { isAutoCloseStatus, needsInspection } from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
 import { HerdrClient } from "./herdr-client.ts";
-import { renderHerdrTaskResult } from "./index.ts";
+import orchestration, { renderHerdrTaskResult } from "./index.ts";
 import {
   advanceAgentLifecycle,
   buildAgentName,
@@ -67,6 +71,20 @@ const FAST_HERDR_TIMING = {
   promptDeliveryAttempts: 3,
 };
 
+function registeredOrchestrationTools() {
+  const tools = new Map<string, ToolDefinition>();
+  const pi = {
+    registerTool(definition: ToolDefinition) {
+      tools.set(definition.name, definition);
+    },
+    registerMessageRenderer() {},
+    registerCommand() {},
+    on() {},
+  } as unknown as ExtensionAPI;
+  orchestration(pi);
+  return tools;
+}
+
 test("completed background notifications collapse to one line", () => {
   const message = {
     role: "custom" as const,
@@ -102,6 +120,95 @@ test("completed background notifications collapse to one line", () => {
   assert.ok(expanded);
   assert.ok(renderedLines(expanded).includes("command output"));
   assert.ok(renderedLines(expanded).includes("more output"));
+});
+
+test("collapsed subagent tools occupy one line and expand on demand", () => {
+  const tools = registeredOrchestrationTools();
+  const theme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  } as Theme;
+  const cases: Array<[string, object, string]> = [
+    [
+      "subagent_spawn",
+      { prompt: "Review the code", name: "review", harness: "pi" },
+      "subagent spawn review",
+    ],
+    [
+      "subagent_wait",
+      { ids: ["sa-one", "sa-two"] },
+      "subagent wait sa-one, sa-two",
+    ],
+    ["subagent_check", { id: "sa-one" }, "subagent check sa-one"],
+    ["subagent_list", {}, "subagents"],
+    ["subagent_cancel", { ids: ["sa-one"] }, "subagent cancel sa-one"],
+    [
+      "subagent_send",
+      { id: "sa-one", prompt: "Please continue" },
+      "subagent send sa-one",
+    ],
+  ];
+  const context = {
+    expanded: false,
+    isError: false,
+  } as never;
+  const result = {
+    content: [{ type: "text" as const, text: "Detailed tool result" }],
+    details: undefined,
+  };
+
+  for (const [name, args, expected] of cases) {
+    const tool = tools.get(name);
+    assert.ok(tool?.renderCall, `${name} should render its call`);
+    assert.ok(tool.renderResult, `${name} should render its result`);
+    assert.equal(tool.renderShell, "self");
+    assert.deepEqual(
+      renderedLines(tool.renderCall(args as never, theme, context)),
+      [expected],
+    );
+    assert.deepEqual(
+      renderedLines(
+        tool.renderResult(
+          result,
+          { expanded: false, isPartial: false },
+          theme,
+          context,
+        ),
+      ),
+      [],
+    );
+  }
+
+  const spawn = tools.get("subagent_spawn")!;
+  const expanded = { expanded: true, isError: false } as never;
+  assert.ok(
+    renderedLines(
+      spawn.renderCall!(cases[0]![1] as never, theme, expanded),
+    ).some((line) => line.includes('"prompt"')),
+  );
+  assert.deepEqual(
+    renderedLines(
+      spawn.renderResult!(
+        result,
+        { expanded: true, isPartial: false },
+        theme,
+        expanded,
+      ),
+    ),
+    ["Detailed tool result"],
+  );
+
+  const failed = { expanded: false, isError: true } as never;
+  assert.ok(
+    renderedLines(
+      spawn.renderResult!(
+        result,
+        { expanded: false, isPartial: false },
+        theme,
+        failed,
+      ),
+    ).includes("Detailed tool result"),
+  );
 });
 
 test("auto isolation is conservative", () => {
