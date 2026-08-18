@@ -32,6 +32,45 @@ function renderedLines(component: Component) {
     .filter(Boolean);
 }
 
+function agentResponse(options: {
+  status: string;
+  seq: number;
+  ready?: boolean;
+  pending?: boolean;
+  harness?: string;
+  paneId?: string;
+  session?: string;
+  name?: string;
+}) {
+  return JSON.stringify({
+    result: {
+      agent: {
+        agent: options.harness ?? "opencode",
+        agent_status: options.status,
+        pane_id: options.paneId ?? "w1:p2",
+        state_change_seq: options.seq,
+        interactive_ready: options.ready ?? true,
+        launch_pending: options.pending ?? false,
+        name: options.name,
+        agent_session: {
+          value: options.session ?? "session-1",
+        },
+      },
+    },
+  });
+}
+
+const FAST_HERDR_TIMING = {
+  agentStartBusyRetries: 3,
+  agentStartRetryMs: 1,
+  promptReadyPollMs: 1,
+  promptReadyConsecutiveReads: 2,
+  promptReadyTimeoutMs: 500,
+  promptActivityTimeoutMs: 20,
+  promptLateActivityMs: 30,
+  promptDeliveryAttempts: 3,
+};
+
 function registeredOrchestrationTools() {
   const tools = new Map<string, ToolDefinition>();
   const pi = {
@@ -277,21 +316,17 @@ test("Herdr prompt returns the lifecycle sequence used by monitoring", async () 
   assert.deepEqual(prompted, { stateChangeSeq: 73 });
 });
 
-test("new agents must expose a stable prompt before orchestration submits work", async () => {
+test("stable idle status is not prompt-ready until Herdr reports interactive readiness", async () => {
   let reads = 0;
   const runner: CliRunner = {
     async run(_command, args) {
       assert.deepEqual(args.slice(0, 2), ["agent", "get"]);
       reads += 1;
       return {
-        stdout: JSON.stringify({
-          result: {
-            agent: {
-              agent_status: "done",
-              state_change_seq: 91,
-              pane_id: "w1:p2",
-            },
-          },
+        stdout: agentResponse({
+          status: "done",
+          seq: 91,
+          ready: reads >= 4,
         }),
         stderr: "",
         code: 0,
@@ -299,8 +334,298 @@ test("new agents must expose a stable prompt before orchestration submits work",
     },
   };
 
-  await new HerdrClient(runner).waitForAgentPromptReady("sa-review");
+  await new HerdrClient(runner, FAST_HERDR_TIMING).waitForAgentPromptReady(
+    "sa-review",
+    { paneId: "w1:p2", harness: "opencode" },
+  );
   assert.ok(reads >= 5);
+});
+
+test("a prompt response without activity is retried and acknowledged", async () => {
+  let prompts = 0;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "agent" && args[1] === "get")
+        return {
+          stdout: agentResponse({ status: "idle", seq: 10 }),
+          stderr: "",
+          code: 0,
+        };
+      if (args[0] === "agent" && args[1] === "prompt") {
+        prompts += 1;
+        assert.ok(args.includes("--wait"));
+        assert.ok(args.includes("working"));
+        assert.ok(args.includes("blocked"));
+        return {
+          stdout: agentResponse({
+            status: prompts === 1 ? "idle" : "working",
+            seq: prompts === 1 ? 10 : 11,
+          }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+    },
+  };
+
+  const delivered = await new HerdrClient(
+    runner,
+    FAST_HERDR_TIMING,
+  ).deliverInitialPrompt({
+    name: "sa-review",
+    harness: "opencode",
+    paneId: "w1:p2",
+    launchArgs: [],
+    prompt: "Review the change",
+  });
+
+  assert.equal(prompts, 2);
+  assert.deepEqual(delivered, {
+    stateChangeSeq: 11,
+    baselineStateChangeSeq: 10,
+    attempts: 2,
+  });
+});
+
+test("activity acknowledgement is harness-agnostic", async (t) => {
+  for (const harness of ["pi", "claude", "codex", "opencode"] as const) {
+    await t.test(harness, async () => {
+      const runner: CliRunner = {
+        async run(_command, args) {
+          if (args[0] === "agent" && args[1] === "get")
+            return {
+              stdout: agentResponse({ status: "idle", seq: 15, harness }),
+              stderr: "",
+              code: 0,
+            };
+          if (args[0] === "agent" && args[1] === "prompt")
+            return {
+              stdout: agentResponse({ status: "working", seq: 16, harness }),
+              stderr: "",
+              code: 0,
+            };
+          throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+        },
+      };
+
+      await new HerdrClient(runner, FAST_HERDR_TIMING).deliverInitialPrompt({
+        name: `sa-${harness}`,
+        harness,
+        paneId: "w1:p2",
+        launchArgs: [],
+        prompt: "Review the change",
+      });
+    });
+  }
+});
+
+test("delivery retries after the harness becomes interactive", async () => {
+  let prompts = 0;
+  let readinessReads = 0;
+  let ready = true;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "agent" && args[1] === "get") {
+        readinessReads += 1;
+        if (!ready && readinessReads >= 7) ready = true;
+        return {
+          stdout: agentResponse({ status: "idle", seq: 20, ready }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        prompts += 1;
+        if (prompts === 1) {
+          ready = false;
+          return {
+            stdout: "",
+            stderr: JSON.stringify({
+              error: { code: "agent_not_ready", message: "replacing" },
+            }),
+            code: 1,
+          };
+        }
+        return {
+          stdout: agentResponse({ status: "working", seq: 21 }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+    },
+  };
+
+  await new HerdrClient(runner, FAST_HERDR_TIMING).deliverInitialPrompt({
+    name: "sa-review",
+    harness: "opencode",
+    paneId: "w1:p2",
+    launchArgs: [],
+    prompt: "Review the change",
+  });
+
+  assert.equal(prompts, 2);
+});
+
+test("delayed activity acknowledges the first prompt without a duplicate", async () => {
+  let prompts = 0;
+  let postPromptReads = 0;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "agent" && args[1] === "get") {
+        if (prompts > 0) postPromptReads += 1;
+        return {
+          stdout: agentResponse({
+            status: postPromptReads >= 2 ? "working" : "idle",
+            seq: postPromptReads >= 2 ? 31 : 30,
+          }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        prompts += 1;
+        return {
+          stdout: "",
+          stderr: JSON.stringify({
+            error: {
+              code: "agent_prompt_stalled",
+              message: "no lifecycle activity",
+            },
+          }),
+          code: 1,
+        };
+      }
+      throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+    },
+  };
+
+  const delivered = await new HerdrClient(
+    runner,
+    FAST_HERDR_TIMING,
+  ).deliverInitialPrompt({
+    name: "sa-review",
+    harness: "opencode",
+    paneId: "w1:p2",
+    launchArgs: [],
+    prompt: "Review the change",
+  });
+
+  assert.equal(prompts, 1);
+  assert.equal(delivered.stateChangeSeq, 31);
+});
+
+test("permanent prompt failure has a bounded actionable error", async () => {
+  let prompts = 0;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "agent" && args[1] === "get")
+        return {
+          stdout: agentResponse({ status: "done", seq: 40 }),
+          stderr: "",
+          code: 0,
+        };
+      if (args[0] === "agent" && args[1] === "prompt") {
+        prompts += 1;
+        return {
+          stdout: agentResponse({ status: "done", seq: 40 }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+    },
+  };
+
+  await assert.rejects(
+    new HerdrClient(runner, FAST_HERDR_TIMING).deliverInitialPrompt({
+      name: "sa-review",
+      harness: "opencode",
+      paneId: "w1:p2",
+      launchArgs: [],
+      prompt: "Review the change",
+    }),
+    /Initial prompt delivery to opencode agent sa-review in pane w1:p2 was not acknowledged after 3 attempts/,
+  );
+  assert.equal(prompts, 3);
+});
+
+test("foreground replacement is rebound to the expected pane before retry", async () => {
+  let prompts = 0;
+  let starts = 0;
+  let renames = 0;
+  let replaced = false;
+  let rebound = false;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "agent" && args[1] === "get") {
+        if (replaced && !rebound && args[2] === "sa-review")
+          return {
+            stdout: "",
+            stderr: JSON.stringify({
+              error: {
+                code: "agent_not_ready",
+                message: "no longer the pane foreground process",
+              },
+            }),
+            code: 1,
+          };
+        return {
+          stdout: agentResponse({
+            status: "idle",
+            seq: replaced ? 51 : 50,
+            name: rebound ? "sa-review" : undefined,
+          }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        prompts += 1;
+        if (prompts === 1) {
+          replaced = true;
+          return {
+            stdout: "",
+            stderr: JSON.stringify({
+              error: {
+                code: "agent_not_ready",
+                message: "no longer the pane foreground process",
+              },
+            }),
+            code: 1,
+          };
+        }
+        return {
+          stdout: agentResponse({ status: "working", seq: 52 }),
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[0] === "agent" && args[1] === "rename") {
+        renames += 1;
+        rebound = true;
+        return { stdout: "{}", stderr: "", code: 0 };
+      }
+      if (args[0] === "agent" && args[1] === "start") {
+        starts += 1;
+        return { stdout: "{}", stderr: "", code: 0 };
+      }
+      throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+    },
+  };
+
+  await new HerdrClient(runner, FAST_HERDR_TIMING).deliverInitialPrompt({
+    name: "sa-review",
+    harness: "opencode",
+    paneId: "w1:p2",
+    launchArgs: ["--model", "test/model"],
+    prompt: "Review the change",
+  });
+
+  assert.equal(starts, 0);
+  assert.equal(renames, 1);
+  assert.equal(prompts, 2);
 });
 
 test("Herdr agent names stay valid and within the 32-character limit", () => {
@@ -335,8 +660,12 @@ test("Herdr uses the returned root pane and retries while its shell starts", asy
         if (starts < 3)
           return {
             stdout: "",
-            stderr:
-              '{"error":{"code":"agent_pane_busy","message":"not ready"}}',
+            stderr: JSON.stringify({
+              error: {
+                code: starts === 1 ? "agent_not_ready" : "agent_pane_busy",
+                message: "not ready",
+              },
+            }),
             code: 1,
           };
         return {
@@ -361,6 +690,99 @@ test("Herdr uses the returned root pane and retries while its shell starts", asy
   assert.equal(starts, 3);
   assert.equal(
     calls.some((call) => call.args[0] === "pane" && call.args[1] === "list"),
+    false,
+  );
+});
+
+test("spawn records failed delivery without releasing its held Treehouse lease", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-delivery-fail-"));
+  const registry = new TaskRegistry(join(directory, "registry.json"));
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  const runner: CliRunner = {
+    async run(command, args) {
+      calls.push({ command, args });
+      if (command === "git") return { stdout: "/repo\n", stderr: "", code: 0 };
+      if (command === "treehouse" && args[0] === "get")
+        return {
+          stdout: JSON.stringify({ path: "/lease", lease_id: "lease-1" }),
+          stderr: "",
+          code: 0,
+        };
+      if (args[0] === "pane" && args[1] === "current")
+        return {
+          stdout: JSON.stringify({
+            result: {
+              pane: {
+                workspace_id: "w1",
+                tab_id: "w1:t1",
+                pane_id: "w1:p1",
+              },
+            },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      if (args[0] === "tab" && args[1] === "create")
+        return {
+          stdout: JSON.stringify({
+            result: {
+              tab: { tab_id: "w1:t2" },
+              root_pane: { pane_id: "w1:p2" },
+            },
+          }),
+          stderr: "",
+          code: 0,
+        };
+      if (args[0] === "agent" && args[1] === "start")
+        return { stdout: "{}", stderr: "", code: 0 };
+      if (args[0] === "agent" && args[1] === "get")
+        return {
+          stdout: agentResponse({ status: "idle", seq: 60 }),
+          stderr: "",
+          code: 0,
+        };
+      if (args[0] === "agent" && args[1] === "prompt")
+        return {
+          stdout: agentResponse({ status: "idle", seq: 60 }),
+          stderr: "",
+          code: 0,
+        };
+      throw new Error(`unexpected call: ${command} ${args.join(" ")}`);
+    },
+  };
+  const manager = new OrchestrationManager(
+    new HerdrClient(runner, FAST_HERDR_TIMING),
+    new TreehouseClient(runner),
+    registry,
+    { onComplete() {} },
+  );
+  const previousHerdrEnv = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  try {
+    await assert.rejects(
+      manager.spawnAgent({
+        prompt: "Review the change",
+        label: "delivery failure",
+        harness: "opencode",
+        cwd: "/repo",
+        isolation: "treehouse",
+        placement: "tab",
+      }),
+      /Initial prompt delivery.*was not acknowledged/,
+    );
+  } finally {
+    if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previousHerdrEnv;
+  }
+
+  const [task] = await registry.list();
+  assert.equal(task?.status, "failed");
+  assert.match(task?.error ?? "", /was not acknowledged after 3 attempts/);
+  assert.equal(task?.lease?.returnState, "held");
+  assert.equal(
+    calls.some(
+      (call) => call.command === "treehouse" && call.args[0] === "return",
+    ),
     false,
   );
 });

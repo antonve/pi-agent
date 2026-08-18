@@ -307,14 +307,22 @@ export class OrchestrationManager {
         task.paneId,
         launch.args,
       );
-      await this.herdr.waitForAgentPromptReady(agentName);
-      await this.registry.update(task.id, { agentName, status: "running" });
+      await this.registry.update(task.id, { agentName });
       const childPrompt = `${options.prompt.trim()}\n\nOrchestration constraints:\n- Do not spawn subagents or workflows.\n- Work only in ${cwd}.\n${lease ? `- This is Treehouse lease ${lease.leaseId} held by ${lease.holder}; do not return or force-clean it.` : "- This task intentionally uses the supplied shared checkout."}\n- End with a concise report for the parent agent.`;
-      const prompted = await this.herdr.promptAgent(agentName, childPrompt);
-      await this.registry.update(task.id, {
-        promptStateChangeSeq: prompted.stateChangeSeq,
+      const prompted = await this.herdr.deliverInitialPrompt({
+        name: agentName,
+        harness: options.harness,
+        paneId: task.paneId,
+        launchArgs: launch.args,
+        prompt: childPrompt,
       });
-      this.monitorAgent(task.id, prompted.stateChangeSeq);
+      const promptBaseline =
+        prompted.baselineStateChangeSeq ?? prompted.stateChangeSeq;
+      await this.registry.update(task.id, {
+        status: "running",
+        promptStateChangeSeq: promptBaseline,
+      });
+      this.monitorAgent(task.id, promptBaseline);
       return (await this.registry.get(task.id))!;
     } catch (error) {
       if (task) await this.markFailed(task.id, error);

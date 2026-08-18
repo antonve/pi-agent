@@ -13,5 +13,6 @@ All child lifecycle, prompts, communication, inspection, and takeover go through
 - Give a complete standalone prompt with relevant paths, constraints, expected output, and Treehouse context.
 - Mutation-capable tasks use `isolation: auto` or `treehouse`; read-only review may use `shared`. When uncertain, isolate.
 - Durable agents and Treehouse leases use tabs. Panes are only for brief, directly relevant work.
+- A successful spawn means Herdr observed child activity after submitting the initial prompt; startup or delivery exhaustion is reported as a failed spawn instead of an empty running child.
 - Continue parent work after spawning. Wait only when blocked. Use `subagent_send` for follow-ups.
 - `/subagents` and the subagent tools inspect, focus, attach/take over, cancel, and report lease cleanup state.
