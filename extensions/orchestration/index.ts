@@ -150,8 +150,163 @@ function commandHelp(kind: "ps" | "subagents") {
   return `${kind}: list | output <id> | focus <id> | send <id> <text> | keys <id> <key...> | interrupt <id> | close <id>${kind === "subagents" ? " | attach <id>" : ""}\nActions only affect tracked ${noun} resources.`;
 }
 
+export class CompletionSuppression {
+  private readonly counts = new Map<string, number>();
+
+  acquire(ids: string[]) {
+    for (const id of ids) this.counts.set(id, (this.counts.get(id) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      for (const id of ids) {
+        const count = this.counts.get(id) ?? 0;
+        if (count <= 1) this.counts.delete(id);
+        else this.counts.set(id, count - 1);
+      }
+    };
+  }
+
+  has(id: string) {
+    return this.counts.has(id);
+  }
+}
+
+type WaitManager = Pick<OrchestrationManager, "wait" | "output">;
+type WaitRegistry = Pick<TaskRegistry, "get">;
+
+function sendTaskResult(
+  pi: ExtensionAPI,
+  message: {
+    content: string;
+    id: string;
+    kind: string;
+    status: string;
+    label: string;
+  },
+) {
+  try {
+    pi.sendMessage(
+      {
+        customType: "herdr-task-result",
+        content: message.content,
+        display: true,
+        details: {
+          id: message.id,
+          kind: message.kind,
+          status: message.status,
+          label: message.label,
+        },
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+  } catch {
+    /* Task results remain available in the registry and result files. */
+  }
+}
+
+export function deliverTaskCompletion(
+  pi: ExtensionAPI,
+  suppression: CompletionSuppression,
+  task: TaskRecord,
+  output: string,
+) {
+  if (suppression.has(task.id)) return false;
+  sendTaskResult(pi, {
+    content: `${task.kind} ${task.id} “${task.label}” ${task.status}.\n\n${output}`,
+    id: task.id,
+    kind: task.kind,
+    status: task.status,
+    label: task.label,
+  });
+  return true;
+}
+
+export function registerSubagentWait(
+  pi: ExtensionAPI,
+  manager: WaitManager,
+  registry: WaitRegistry,
+  suppression: CompletionSuppression,
+) {
+  pi.registerTool({
+    name: "subagent_wait",
+    label: "Wait for Herdr Subagents",
+    description:
+      "Yield the current turn while waiting in the background for one or more child results. A combined result automatically starts a new turn when all requested children settle.",
+    parameters: Type.Object({
+      ids: Type.Array(Type.String(), { minItems: 1 }),
+    }),
+    async execute(_call, params, signal) {
+      if (signal?.aborted) throw new Error("Subagent wait cancelled.");
+      const ids = [...new Set(params.ids)];
+      const release = suppression.acquire(ids);
+      let tasks: TaskRecord[];
+      try {
+        const found = await Promise.all(ids.map((id) => registry.get(id)));
+        const missing = ids.filter((_id, index) => !found[index]);
+        if (missing.length)
+          throw new Error(`Unknown orchestration task ${missing.join(", ")}.`);
+        tasks = found as TaskRecord[];
+      } catch (error) {
+        release();
+        throw error;
+      }
+
+      void (async () => {
+        try {
+          const settled = await manager.wait(ids);
+          const sections = await Promise.all(
+            settled.map(
+              async (task) =>
+                `## ${describe(task)}\n\n${await manager.output(task.id)}`,
+            ),
+          );
+          const status = settled.every((task) => task.status === "done")
+            ? "done"
+            : "settled";
+          sendTaskResult(pi, {
+            content: `subagent wait ${ids.join(", ")} ${status}.\n\n${sections.join("\n\n---\n\n")}`,
+            id: ids.length === 1 ? ids[0]! : `${ids.length} subagents`,
+            kind: "subagent",
+            status,
+            label:
+              settled.length === 1
+                ? settled[0]!.label
+                : "background wait complete",
+          });
+        } catch (error) {
+          sendTaskResult(pi, {
+            content: `subagent wait ${ids.join(", ")} failed.\n\n${error instanceof Error ? error.message : String(error)}`,
+            id: ids.length === 1 ? ids[0]! : `${ids.length} subagents`,
+            kind: "subagent",
+            status: "failed",
+            label: "background wait failed",
+          });
+        } finally {
+          release();
+        }
+      })();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Waiting in the background for ${ids.join(", ")}. This turn is ending now; a combined result will be delivered automatically when all requested subagents settle.`,
+          },
+        ],
+        details: { tasks },
+        terminate: true,
+      };
+    },
+    ...compactSubagentRendering(
+      (args: { ids: string[] }) => `subagent wait ${args.ids.join(", ")}`,
+    ),
+  });
+}
+
 export default function orchestration(pi: ExtensionAPI) {
   const registry = new TaskRegistry();
+  const completionSuppression = new CompletionSuppression();
   let context: ExtensionContext | undefined;
   const manager = new OrchestrationManager(
     new HerdrClient(nodeCliRunner),
@@ -159,24 +314,7 @@ export default function orchestration(pi: ExtensionAPI) {
     registry,
     {
       onComplete(task, output) {
-        try {
-          pi.sendMessage(
-            {
-              customType: "herdr-task-result",
-              content: `${task.kind} ${task.id} “${task.label}” ${task.status}.\n\n${output}`,
-              display: true,
-              details: {
-                id: task.id,
-                kind: task.kind,
-                status: task.status,
-                label: task.label,
-              },
-            },
-            { deliverAs: "followUp", triggerTurn: true },
-          );
-        } catch {
-          /* The durable result remains in the registry/result file. */
-        }
+        deliverTaskCompletion(pi, completionSuppression, task, output);
       },
       onChange() {
         void updateStatus();
@@ -489,30 +627,7 @@ export default function orchestration(pi: ExtensionAPI) {
     ),
   });
 
-  pi.registerTool({
-    name: "subagent_wait",
-    label: "Wait for Herdr Subagents",
-    description: "Wait only when blocked on one or more child results.",
-    parameters: Type.Object({
-      ids: Type.Array(Type.String(), { minItems: 1 }),
-    }),
-    async execute(_call, params, signal) {
-      const tasks = await manager.wait(params.ids, signal);
-      const sections = await Promise.all(
-        tasks.map(
-          async (task) =>
-            `## ${describe(task)}\n\n${await manager.output(task.id)}`,
-        ),
-      );
-      return {
-        content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
-        details: { tasks },
-      };
-    },
-    ...compactSubagentRendering(
-      (args: { ids: string[] }) => `subagent wait ${args.ids.join(", ")}`,
-    ),
-  });
+  registerSubagentWait(pi, manager, registry, completionSuppression);
   pi.registerTool({
     name: "subagent_check",
     label: "Inspect Herdr Subagent",
