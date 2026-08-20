@@ -3,20 +3,23 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 export const TOOL_ARGUMENT_MAX_BYTES = 2_000;
 export const TOOL_RESULT_MAX_BYTES = 5_000;
 export const TRANSCRIPT_MAX_BYTES = 48_000;
+export const RECAP_MIN_RUN_DURATION_MS = 60_000;
+export const RECAP_MIN_VISIBLE_CHARACTERS = 1_000;
 
 const SECRET_KEY_PATTERN =
   /(?:api[_-]?key|access[_-]?key|authorization|cookie|credential|password|passwd|private[_-]?key|secret|token)/i;
 
 export interface RunMarker {
   readonly baselineLeafId: string | null;
+  readonly startedAt: number;
 }
 
 export function createRunBoundary() {
   let pending: RunMarker | undefined;
 
   return {
-    begin(baselineLeafId: string | null) {
-      pending = { baselineLeafId };
+    begin(baselineLeafId: string | null, startedAt = Date.now()) {
+      pending = { baselineLeafId, startedAt };
     },
     settle() {
       const run = pending;
@@ -27,6 +30,13 @@ export function createRunBoundary() {
       pending = undefined;
     },
   };
+}
+
+export function hasMinimumRecapDuration(
+  run: RunMarker,
+  settledAt = Date.now(),
+) {
+  return settledAt - run.startedAt >= RECAP_MIN_RUN_DURATION_MS;
 }
 
 export function hasMultipleUserTurns(entries: readonly SessionEntry[]) {
@@ -145,6 +155,51 @@ function textContent(content: unknown) {
       return [];
     })
     .join("\n");
+}
+
+function characterCount(text: string) {
+  return [...text].length;
+}
+
+export function countVisibleRunCharacters(entries: readonly SessionEntry[]) {
+  let count = 0;
+  for (const entry of entries) {
+    if (entry.type === "custom_message") {
+      if (entry.customType !== "summary-recap") {
+        count += characterCount(textContent(entry.content));
+      }
+      continue;
+    }
+    if (entry.type !== "message") continue;
+
+    const { message } = entry;
+    if (message.role === "user") {
+      count += characterCount(textContent(message.content));
+    } else if (message.role === "assistant") {
+      for (const block of message.content) {
+        if (block.type === "text") count += characterCount(block.text);
+        if (block.type === "toolCall") count += characterCount(block.name);
+      }
+    } else if (message.role === "toolResult") {
+      count += characterCount(textContent(message.content));
+    } else if (message.role === "bashExecution") {
+      count += characterCount(message.command);
+      count += characterCount(message.output);
+    } else if (
+      message.role === "custom" &&
+      message.customType !== "summary-recap" &&
+      message.display
+    ) {
+      count += characterCount(textContent(message.content));
+    }
+  }
+  return count;
+}
+
+export function hasMinimumVisibleRecapContent(
+  entries: readonly SessionEntry[],
+) {
+  return countVisibleRunCharacters(entries) >= RECAP_MIN_VISIBLE_CHARACTERS;
 }
 
 function serializeMessage(entry: Extract<SessionEntry, { type: "message" }>) {
