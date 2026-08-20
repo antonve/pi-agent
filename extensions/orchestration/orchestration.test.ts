@@ -18,10 +18,15 @@ import {
 } from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
 import { HerdrClient } from "./herdr-client.ts";
+import {
+  BackgroundWaitRegistry,
+  createBackgroundWaitExecutor,
+} from "../shared/background-waits.ts";
 import orchestration, {
   CompletionSuppression,
   deliverTaskCompletion,
   registerSubagentWait,
+  registerWaitableSubagent,
   renderHerdrTaskResult,
 } from "./index.ts";
 import {
@@ -83,6 +88,7 @@ const FAST_HERDR_TIMING = {
 function registeredOrchestrationTools() {
   const tools = new Map<string, ToolDefinition>();
   const pi = {
+    events: {},
     registerTool(definition: ToolDefinition) {
       tools.set(definition.name, definition);
     },
@@ -214,14 +220,21 @@ test("subagent wait returns immediately and delivers one grouped completion", as
     finishWait = resolve;
   });
   const manager = {
-    wait: async () => waitFinished,
+    wait: async (ids: string[]) =>
+      waitFinished.then((tasks) =>
+        tasks.filter((task) => ids.includes(task.id)),
+      ),
     output: async (id: string) => `output for ${id}`,
   };
-  const registry = {
-    get: async (id: string) => running.find((task) => task.id === id),
-  };
   const suppression = new CompletionSuppression();
-  registerSubagentWait(pi, manager, registry, suppression);
+  const backgroundWaits = new BackgroundWaitRegistry();
+  for (const task of running)
+    registerWaitableSubagent(backgroundWaits, manager, suppression, task);
+  registerSubagentWait(
+    pi,
+    backgroundWaits,
+    createBackgroundWaitExecutor(pi, backgroundWaits),
+  );
 
   const waitTool = tools.get("subagent_wait");
   assert.ok(waitTool);
@@ -251,7 +264,7 @@ test("subagent wait returns immediately and delivers one grouped completion", as
     triggerTurn: true,
   });
   const notification = notifications[0]?.message;
-  assert.equal(notification?.customType, "herdr-task-result");
+  assert.equal(notification?.customType, "background-wait-result");
   assert.match(String(notification?.content), /output for sa-one/);
   assert.match(String(notification?.content), /output for sa-two/);
   assert.equal(suppression.has("sa-one"), false);
@@ -279,6 +292,7 @@ test("grouped waits suppress individual completion notifications", () => {
 
 test("collapsed subagent tools occupy one line and expand on demand", () => {
   const tools = registeredOrchestrationTools();
+  assert.equal(tools.has("background_wait"), true);
   const theme = {
     fg: (_color: string, text: string) => text,
     bold: (text: string) => text,

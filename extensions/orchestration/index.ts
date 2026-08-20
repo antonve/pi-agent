@@ -26,6 +26,12 @@ import { OrchestrationManager } from "./manager.ts";
 import { TaskRegistry } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
 import { registerWorkflow } from "./workflows/index.ts";
+import {
+  BackgroundWaitRegistry,
+  getBackgroundWaitRegistry,
+  registerBackgroundWaitTool,
+  type BackgroundWaitExecutor,
+} from "../shared/background-waits.ts";
 import { shouldRenderToolPart } from "../shared/calm-tool-output.ts";
 
 function renderResultText(result: AgentToolResult<unknown>, theme: Theme) {
@@ -172,9 +178,6 @@ export class CompletionSuppression {
   }
 }
 
-type WaitManager = Pick<OrchestrationManager, "wait" | "output">;
-type WaitRegistry = Pick<TaskRegistry, "get">;
-
 function sendTaskResult(
   pi: ExtensionAPI,
   message: {
@@ -222,11 +225,41 @@ export function deliverTaskCompletion(
   return true;
 }
 
+type SubagentWaitManager = Pick<OrchestrationManager, "wait" | "output">;
+
+export function registerWaitableSubagent(
+  backgroundWaits: BackgroundWaitRegistry,
+  manager: SubagentWaitManager,
+  suppression: CompletionSuppression,
+  task: TaskRecord,
+) {
+  if (task.kind !== "subagent") return;
+  backgroundWaits.register({
+    id: task.id,
+    label: task.label,
+    kind: "subagent",
+    async wait(signal) {
+      const release = suppression.acquire([task.id]);
+      try {
+        const [settled] = await manager.wait([task.id], signal);
+        if (!settled) throw new Error(`Unknown subagent ${task.id}.`);
+        return {
+          status: settled.status,
+          successful: settled.status === "done",
+          output: await manager.output(settled.id),
+          details: settled,
+        };
+      } finally {
+        release();
+      }
+    },
+  });
+}
+
 export function registerSubagentWait(
   pi: ExtensionAPI,
-  manager: WaitManager,
-  registry: WaitRegistry,
-  suppression: CompletionSuppression,
+  backgroundWaits: BackgroundWaitRegistry,
+  executeBackgroundWait: BackgroundWaitExecutor,
 ) {
   pi.registerTool({
     name: "subagent_wait",
@@ -237,66 +270,13 @@ export function registerSubagentWait(
       ids: Type.Array(Type.String(), { minItems: 1 }),
     }),
     async execute(_call, params, signal) {
-      if (signal?.aborted) throw new Error("Subagent wait cancelled.");
       const ids = [...new Set(params.ids)];
-      const release = suppression.acquire(ids);
-      let tasks: TaskRecord[];
-      try {
-        const found = await Promise.all(ids.map((id) => registry.get(id)));
-        const missing = ids.filter((_id, index) => !found[index]);
-        if (missing.length)
-          throw new Error(`Unknown orchestration task ${missing.join(", ")}.`);
-        tasks = found as TaskRecord[];
-      } catch (error) {
-        release();
-        throw error;
-      }
-
-      void (async () => {
-        try {
-          const settled = await manager.wait(ids);
-          const sections = await Promise.all(
-            settled.map(
-              async (task) =>
-                `## ${describe(task)}\n\n${await manager.output(task.id)}`,
-            ),
-          );
-          const status = settled.every((task) => task.status === "done")
-            ? "done"
-            : "settled";
-          sendTaskResult(pi, {
-            content: `subagent wait ${ids.join(", ")} ${status}.\n\n${sections.join("\n\n---\n\n")}`,
-            id: ids.length === 1 ? ids[0]! : `${ids.length} subagents`,
-            kind: "subagent",
-            status,
-            label:
-              settled.length === 1
-                ? settled[0]!.label
-                : "background wait complete",
-          });
-        } catch (error) {
-          sendTaskResult(pi, {
-            content: `subagent wait ${ids.join(", ")} failed.\n\n${error instanceof Error ? error.message : String(error)}`,
-            id: ids.length === 1 ? ids[0]! : `${ids.length} subagents`,
-            kind: "subagent",
-            status: "failed",
-            label: "background wait failed",
-          });
-        } finally {
-          release();
-        }
-      })();
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Waiting in the background for ${ids.join(", ")}. This turn is ending now; a combined result will be delivered automatically when all requested subagents settle.`,
-          },
-        ],
-        details: { tasks },
-        terminate: true,
-      };
+      const invalid = ids.filter(
+        (id) => backgroundWaits.get(id)?.kind !== "subagent",
+      );
+      if (invalid.length)
+        throw new Error(`Unknown subagent ${invalid.join(", ")}.`);
+      return executeBackgroundWait(ids, signal);
     },
     ...compactSubagentRendering(
       (args: { ids: string[] }) => `subagent wait ${args.ids.join(", ")}`,
@@ -307,6 +287,8 @@ export function registerSubagentWait(
 export default function orchestration(pi: ExtensionAPI) {
   const registry = new TaskRegistry();
   const completionSuppression = new CompletionSuppression();
+  const backgroundWaits = getBackgroundWaitRegistry(pi);
+  const executeBackgroundWait = registerBackgroundWaitTool(pi, backgroundWaits);
   let context: ExtensionContext | undefined;
   const manager = new OrchestrationManager(
     new HerdrClient(nodeCliRunner),
@@ -344,13 +326,25 @@ export default function orchestration(pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     context = ctx;
-    void manager.reconcile().catch((error) => {
-      if (ctx.hasUI && process.env.HERDR_ENV === "1")
-        ctx.ui.notify(
-          `Herdr reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
-          "warning",
-        );
-    });
+    void manager
+      .reconcile()
+      .then(async () => {
+        const tasks = await manager.list(ctx.sessionManager.getSessionId());
+        for (const task of tasks)
+          registerWaitableSubagent(
+            backgroundWaits,
+            manager,
+            completionSuppression,
+            task,
+          );
+      })
+      .catch((error) => {
+        if (ctx.hasUI && process.env.HERDR_ENV === "1")
+          ctx.ui.notify(
+            `Herdr reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+            "warning",
+          );
+      });
     void updateStatus();
     pi.setActiveTools(
       pi.getActiveTools().filter((name) => name !== "workflow"),
@@ -366,6 +360,7 @@ export default function orchestration(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", (_event, ctx) => {
     context = undefined;
+    backgroundWaits.dispose();
     if (ctx.hasUI) ctx.ui.setStatus("herdr-orchestration", undefined);
   });
 
@@ -612,11 +607,17 @@ export default function orchestration(pi: ExtensionAPI) {
           : undefined,
         parentReasoning: pi.getThinkingLevel() as ReasoningLevel,
       });
+      registerWaitableSubagent(
+        backgroundWaits,
+        manager,
+        completionSuppression,
+        task,
+      );
       return {
         content: [
           {
             type: "text",
-            text: `Spawned ${describe(task)}. Continue useful work; the result will be delivered automatically.`,
+            text: `Spawned ${describe(task)}. Task ID ${task.id} is registered for background_wait. Continue useful work; the result will be delivered automatically.`,
           },
         ],
         details: task,
@@ -627,7 +628,7 @@ export default function orchestration(pi: ExtensionAPI) {
     ),
   });
 
-  registerSubagentWait(pi, manager, registry, completionSuppression);
+  registerSubagentWait(pi, backgroundWaits, executeBackgroundWait);
   pi.registerTool({
     name: "subagent_check",
     label: "Inspect Herdr Subagent",
