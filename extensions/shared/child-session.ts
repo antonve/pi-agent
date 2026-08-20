@@ -12,6 +12,7 @@ const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 
 /** Tools that headless children must not receive. Everything else stays enabled. */
 export const CHILD_EXCLUDED_TOOL_NAMES = [
+  "background_wait",
   "subagent_spawn",
   "subagent_wait",
   "subagent_cancel",
