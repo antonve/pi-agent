@@ -1,14 +1,19 @@
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { createWriteStream } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
-import { Effect, FileSystem, Stream } from "effect";
-import { ChildProcess } from "effect/unstable/process";
 import type { CapturedOutput } from "./output.ts";
 
 const STDERR_MAX_BYTES = 64 * 1024;
+const KILL_GRACE_MS = 1_000;
 
 interface PreviewState {
   readonly decoder: TextDecoder;
@@ -30,7 +35,7 @@ function makePreviewState(): PreviewState {
   };
 }
 
-function observeStdout(state: PreviewState, chunk: Uint8Array) {
+function observeStdout(state: PreviewState, chunk: Buffer) {
   state.totalBytes += chunk.byteLength;
   for (const byte of chunk) {
     if (byte === 0x0a) {
@@ -67,80 +72,107 @@ function finishStdout(state: PreviewState, fullOutputPath: string) {
   } satisfies CapturedOutput;
 }
 
-function collectStderr<E, R>(stream: Stream.Stream<Uint8Array, E, R>) {
-  return Stream.runFold(
-    stream,
-    () => Buffer.alloc(0),
-    (captured, chunk) => {
-      if (captured.byteLength >= STDERR_MAX_BYTES) return captured;
-      const remaining = STDERR_MAX_BYTES - captured.byteLength;
-      return Buffer.concat([captured, chunk.subarray(0, remaining)]);
+type SearchChild = ChildProcessByStdio<null, Readable, Readable>;
+
+function waitForExit(child: SearchChild) {
+  return new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
     },
-  ).pipe(Effect.map((bytes) => bytes.toString("utf8")));
+  );
 }
 
-export function executeSearchProcess(options: {
+export async function executeSearchProcess(options: {
   readonly command: string;
   readonly args: readonly string[];
   readonly cwd: string;
   readonly tempPrefix: string;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs: number;
 }) {
-  return Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const directory = yield* fs.makeTempDirectory({
-      prefix: options.tempPrefix,
+  const directory = await mkdtemp(join(tmpdir(), options.tempPrefix));
+  const fullOutputPath = join(directory, "output.txt");
+  let retainDirectory = false;
+  let child: SearchChild | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let forceKill: ReturnType<typeof setTimeout> | undefined;
+  let aborted = false;
+  let timedOut = false;
+
+  const terminate = () => {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    child.kill("SIGTERM");
+    forceKill = setTimeout(() => child?.kill("SIGKILL"), KILL_GRACE_MS);
+    forceKill.unref?.();
+  };
+  const abort = () => {
+    aborted = true;
+    terminate();
+  };
+
+  try {
+    if (options.signal?.aborted) throw new Error("Search was cancelled.");
+
+    const preview = makePreviewState();
+    const stderr: Buffer[] = [];
+    let stderrBytes = 0;
+    const spawned = spawn(options.command, options.args, {
+      cwd: options.cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    const fullOutputPath = join(directory, "output.txt");
-    let retainDirectory = false;
+    child = spawned;
+    spawned.stdout.on("data", (chunk: Buffer) => observeStdout(preview, chunk));
+    spawned.stderr.on("data", (chunk: Buffer) => {
+      if (stderrBytes >= STDERR_MAX_BYTES) return;
+      const captured = chunk.subarray(0, STDERR_MAX_BYTES - stderrBytes);
+      stderr.push(captured);
+      stderrBytes += captured.byteLength;
+    });
 
-    return yield* Effect.gen(function* () {
-      const preview = makePreviewState();
-      const process = yield* ChildProcess.make(options.command, options.args, {
-        cwd: options.cwd,
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+    options.signal?.addEventListener("abort", abort, { once: true });
+    timeout = setTimeout(() => {
+      timedOut = true;
+      terminate();
+    }, options.timeoutMs);
+    timeout.unref?.();
 
-      const result = yield* Effect.all(
-        {
-          exitCode: process.exitCode,
-          stdout: process.stdout.pipe(
-            Stream.tap((chunk) =>
-              Effect.sync(() => observeStdout(preview, chunk)),
-            ),
-            Stream.run(fs.sink(fullOutputPath)),
-          ),
-          stderr: collectStderr(process.stderr),
-        },
-        { concurrency: "unbounded" },
+    const [exit] = await Promise.all([
+      waitForExit(spawned),
+      pipeline(spawned.stdout, createWriteStream(fullOutputPath)),
+    ]);
+    if (aborted) throw new Error("Search was cancelled.");
+    if (timedOut) throw new Error("Search timed out.");
+    if (exit.code === null) {
+      throw new Error(
+        `process terminated by ${exit.signal ?? "unknown signal"}`,
       );
-      const output = finishStdout(preview, fullOutputPath);
-      retainDirectory = output.truncated;
-      return {
-        code: Number(result.exitCode),
-        stderr: result.stderr,
-        output,
-      };
-    }).pipe(
-      Effect.ensuring(
-        Effect.suspend(() =>
-          retainDirectory
-            ? Effect.void
-            : fs
-                .remove(directory, { recursive: true, force: true })
-                .pipe(Effect.orDie),
-        ),
-      ),
-    );
-  }).pipe(Effect.scoped);
+    }
+
+    const output = finishStdout(preview, fullOutputPath);
+    retainDirectory = output.truncated;
+    return {
+      code: exit.code,
+      stderr: Buffer.concat(stderr).toString("utf8"),
+      output,
+    };
+  } catch (error) {
+    if (child?.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    throw error;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (forceKill) clearTimeout(forceKill);
+    options.signal?.removeEventListener("abort", abort);
+    if (!retainDirectory) {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
 }
 
-export function discardCapturedOutput(output: CapturedOutput) {
-  if (!output.fullOutputPath) return Effect.void;
-  const directory = dirname(output.fullOutputPath);
-  return Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    yield* fs.remove(directory, { recursive: true, force: true });
-  });
+export async function discardCapturedOutput(output: CapturedOutput) {
+  if (!output.fullOutputPath) return;
+  await rm(dirname(output.fullOutputPath), { recursive: true, force: true });
 }

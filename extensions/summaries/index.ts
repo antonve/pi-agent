@@ -2,8 +2,6 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { loadSummaryConfig, saveSummaryConfig } from "./src/config.ts";
-import { summarizeRun } from "./src/summarizer.ts";
 import {
   buildFallbackRecap,
   createRunBoundary,
@@ -21,6 +19,24 @@ import {
 const RECAP_ENTRY_TYPE = "summary-recap";
 const STATUS_KEY = "summaries";
 const SHUTDOWN_WAIT_MS = 1_000;
+
+type SummaryRuntime = {
+  loadSummaryConfig: typeof import("./src/config.ts").loadSummaryConfig;
+  saveSummaryConfig: typeof import("./src/config.ts").saveSummaryConfig;
+  summarizeRun: typeof import("./src/summarizer.ts").summarizeRun;
+};
+
+let summaryRuntime: Promise<SummaryRuntime> | undefined;
+function loadSummaryRuntime() {
+  return (summaryRuntime ??= Promise.all([
+    import("./src/config.ts"),
+    import("./src/summarizer.ts"),
+  ]).then(([config, summarizer]) => ({
+    loadSummaryConfig: config.loadSummaryConfig,
+    saveSummaryConfig: config.saveSummaryConfig,
+    summarizeRun: summarizer.summarizeRun,
+  })));
+}
 
 async function waitForCancellation(
   tasks: readonly Promise<void>[],
@@ -82,10 +98,11 @@ export default function (pi: ExtensionAPI) {
     const entries = getRunEntries(branch, run.baselineLeafId);
     if (entries.length === 0) return;
 
-    const config = loadSummaryConfig();
     const controller = new AbortController();
     statusContext = ctx;
     const task = (async () => {
+      const { loadSummaryConfig, summarizeRun } = await loadSummaryRuntime();
+      const config = loadSummaryConfig();
       let recap: RecapEntryData;
       try {
         const generated = await summarizeRun({
@@ -150,6 +167,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      const { loadSummaryConfig, saveSummaryConfig } =
+        await loadSummaryRuntime();
       const current = loadSummaryConfig();
       const model = await openModelPicker(ctx, current);
       if (!model) return;

@@ -1,22 +1,16 @@
 /**
  * file-search — first-class `fd` and `rg` tools for pi.
  *
- * On session start the extension resolves a usable binary for each tool:
- * a normally installed system binary is preferred (silently), then an
- * existing fallback in this repo's `bin/` directory (silently), and only
- * when neither exists is an official release downloaded into `bin/` — the
- * single case that shows a UI notification. Tools await that initialization
- * before executing, and report a clear error if it failed.
+ * Binary discovery and process/output modules load on first use so this
+ * extension adds no subprocess probes or heavy runtime imports to Pi startup.
  */
 
-import { NodeServices } from "@effect/platform-node";
 import type {
   AgentToolResult,
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { Cause, Data, Effect, Exit } from "effect";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -37,7 +31,7 @@ import {
   type BinarySource,
   type PlatformTarget,
 } from "./src/binaries.ts";
-import { formatCapturedOutput, type CapturedOutput } from "./src/output.ts";
+import type { CapturedOutput } from "./src/output.ts";
 import {
   FD_PARAMETER_DESCRIPTIONS,
   FD_PROMPT_GUIDELINES,
@@ -48,26 +42,25 @@ import {
   RG_PROMPT_SNIPPET,
   RG_TOOL_DESCRIPTION,
 } from "./src/prompt.ts";
-import { discardCapturedOutput, executeSearchProcess } from "./src/process.ts";
 
 export function makeBinaryInitializers(
   binDir: string,
   target: PlatformTarget,
   env: BinaryEnv,
 ) {
+  const cache = new Map<"fd" | "rg", ReturnType<typeof resolveBinary>>();
+  const initialize = (tool: "fd" | "rg") => {
+    const existing = cache.get(tool);
+    if (existing) return existing;
+    const pending = resolveBinary(TOOL_SPECS[tool], binDir, target, env);
+    cache.set(tool, pending);
+    return pending;
+  };
   return {
-    fd: Effect.runSync(
-      Effect.cached(resolveBinary(TOOL_SPECS.fd, binDir, target, env)),
-    ),
-    rg: Effect.runSync(
-      Effect.cached(resolveBinary(TOOL_SPECS.rg, binDir, target, env)),
-    ),
+    fd: () => initialize("fd"),
+    rg: () => initialize("rg"),
   };
 }
-
-class SearchError extends Data.TaggedError("SearchError")<{
-  readonly message: string;
-}> {}
 
 interface SearchOutcome {
   readonly output: CapturedOutput;
@@ -91,104 +84,82 @@ export interface RgToolDetails {
 
 const EXEC_TIMEOUT_MS = 60_000;
 
-function causeMessage<E>(cause: Cause.Cause<E>) {
-  const [first] = Cause.prettyErrors(cause);
-  return first?.message ?? Cause.pretty(cause);
-}
+type SearchRuntime = {
+  executeSearchProcess: typeof import("./src/process.ts").executeSearchProcess;
+  discardCapturedOutput: typeof import("./src/process.ts").discardCapturedOutput;
+  formatCapturedOutput: typeof import("./src/output.ts").formatCapturedOutput;
+};
 
-function unwrapToolExit<A, E>(exit: Exit.Exit<A, E>, tool: "fd" | "rg") {
-  if (Exit.isSuccess(exit)) return exit.value;
-  if (Cause.hasInterruptsOnly(exit.cause)) {
-    throw new Error(`${tool} search was cancelled.`);
-  }
-  throw new Error(causeMessage(exit.cause));
+let searchRuntime: Promise<SearchRuntime> | undefined;
+function loadSearchRuntime() {
+  return (searchRuntime ??= Promise.all([
+    import("./src/process.ts"),
+    import("./src/output.ts"),
+  ]).then(([processModule, outputModule]) => ({
+    executeSearchProcess: processModule.executeSearchProcess,
+    discardCapturedOutput: processModule.discardCapturedOutput,
+    formatCapturedOutput: outputModule.formatCapturedOutput,
+  })));
 }
 
 export default function fileSearchTools(pi: ExtensionAPI) {
-  let notified = false;
-
   const binDir = repositoryBinDir();
   const target = currentTarget();
   const initializers = makeBinaryInitializers(binDir, target, liveBinaryEnv);
 
-  pi.on("session_start", async (_event, ctx) => {
-    const exit = await Effect.runPromiseExit(
-      Effect.gen(function* () {
-        const initialized = yield* Effect.all(
-          {
-            fd: Effect.exit(initializers.fd),
-            rg: Effect.exit(initializers.rg),
-          },
-          { concurrency: "unbounded" },
-        );
-        if (!ctx.hasUI || notified) return;
+  /** Resolve on first use, stream output to disk, and classify the exit. */
+  async function runSearch(
+    tool: "fd" | "rg",
+    args: string[],
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) {
+    if (signal?.aborted) throw new Error(`${tool} search was cancelled.`);
+    const [binary, runtime] = await Promise.all([
+      initializers[tool](),
+      loadSearchRuntime(),
+    ]);
+    if (signal?.aborted) throw new Error(`${tool} search was cancelled.`);
 
-        notified = true;
-        for (const tool of ["fd", "rg"] as const) {
-          const toolExit = initialized[tool];
-          if (Exit.isFailure(toolExit)) {
-            ctx.ui.notify(
-              `file-search ${tool} setup failed: ${causeMessage(toolExit.cause)}`,
-              "error",
-            );
-          }
-        }
-      }),
-    );
-
-    if (Exit.isFailure(exit) && ctx.hasUI && !notified) {
-      notified = true;
-      ctx.ui.notify(
-        `file-search setup failed: ${causeMessage(exit.cause)}`,
-        "error",
-      );
-    }
-  });
-
-  /** Await init, stream the binary output to disk, and classify its exit. */
-  function runSearch(tool: "fd" | "rg", args: string[], ctx: ExtensionContext) {
-    return Effect.gen(function* () {
-      const binary = yield* initializers[tool];
-      const result = yield* executeSearchProcess({
+    let result;
+    try {
+      result = await runtime.executeSearchProcess({
         command: binary.command,
         args,
         cwd: ctx.cwd,
         tempPrefix: `pi-${tool}-`,
+        signal,
+        timeoutMs: EXEC_TIMEOUT_MS,
       });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === "Search was cancelled.") {
+        throw new Error(`${tool} search was cancelled.`);
+      }
+      if (message === "Search timed out.") {
+        throw new Error(`${tool} timed out.`);
+      }
+      throw error;
+    }
 
-      // ripgrep exits 1 for "no matches"; fd exits 0 even with no results.
-      if (tool === "rg" && result.code === 1 && result.output.lineCount === 0) {
-        return {
-          output: result.output,
-          noMatches: true,
-          binarySource: binary.source,
-        } satisfies SearchOutcome;
-      }
-      if (result.code !== 0) {
-        yield* discardCapturedOutput(result.output);
-        const detail = result.stderr.trim() || `exit code ${result.code}`;
-        return yield* new SearchError({ message: `${tool} failed: ${detail}` });
-      }
+    // ripgrep exits 1 for "no matches"; fd exits 0 even with no results.
+    if (tool === "rg" && result.code === 1 && result.output.lineCount === 0) {
       return {
         output: result.output,
-        noMatches: result.output.lineCount === 0,
+        noMatches: true,
         binarySource: binary.source,
       } satisfies SearchOutcome;
-    }).pipe(
-      Effect.timeout(EXEC_TIMEOUT_MS),
-      Effect.mapError((error) => {
-        if (error instanceof SearchError) return error;
-        return new SearchError({
-          message:
-            error._tag === "TimeoutError"
-              ? `${tool} timed out.`
-              : error instanceof Error
-                ? error.message
-                : String(error),
-        });
-      }),
-      Effect.provide(NodeServices.layer),
-    );
+    }
+    if (result.code !== 0) {
+      await runtime.discardCapturedOutput(result.output);
+      const detail = result.stderr.trim() || `exit code ${result.code}`;
+      throw new Error(`${tool} failed: ${detail}`);
+    }
+    return {
+      output: result.output,
+      noMatches: result.output.lineCount === 0,
+      binarySource: binary.source,
+    } satisfies SearchOutcome;
   }
 
   pi.registerTool<ReturnType<typeof fdParameters>, FdToolDetails>({
@@ -200,34 +171,29 @@ export default function fileSearchTools(pi: ExtensionAPI) {
     parameters: fdParameters(),
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const exit = await Effect.runPromiseExit(
-        Effect.gen(function* () {
-          const outcome = yield* runSearch("fd", buildFdArgs(params), ctx);
-          if (outcome.noMatches) {
-            return {
-              content: [{ type: "text", text: "No files found" }],
-              details: {
-                binarySource: outcome.binarySource,
-                matchCount: 0,
-                truncated: false,
-              },
-            } satisfies AgentToolResult<FdToolDetails>;
-          }
+      const outcome = await runSearch("fd", buildFdArgs(params), ctx, signal);
+      if (outcome.noMatches) {
+        return {
+          content: [{ type: "text", text: "No files found" }],
+          details: {
+            binarySource: outcome.binarySource,
+            matchCount: 0,
+            truncated: false,
+          },
+        } satisfies AgentToolResult<FdToolDetails>;
+      }
 
-          const formatted = formatCapturedOutput(outcome.output);
-          return {
-            content: [{ type: "text", text: formatted.text }],
-            details: {
-              binarySource: outcome.binarySource,
-              matchCount: formatted.lineCount,
-              truncated: formatted.truncated,
-              fullOutputPath: formatted.fullOutputPath,
-            },
-          } satisfies AgentToolResult<FdToolDetails>;
-        }),
-        signal ? { signal } : undefined,
-      );
-      return unwrapToolExit(exit, "fd");
+      const { formatCapturedOutput } = await loadSearchRuntime();
+      const formatted = formatCapturedOutput(outcome.output);
+      return {
+        content: [{ type: "text", text: formatted.text }],
+        details: {
+          binarySource: outcome.binarySource,
+          matchCount: formatted.lineCount,
+          truncated: formatted.truncated,
+          fullOutputPath: formatted.fullOutputPath,
+        },
+      } satisfies AgentToolResult<FdToolDetails>;
     },
 
     renderCall(args, theme) {
@@ -271,34 +237,29 @@ export default function fileSearchTools(pi: ExtensionAPI) {
     parameters: rgParameters(),
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const exit = await Effect.runPromiseExit(
-        Effect.gen(function* () {
-          const outcome = yield* runSearch("rg", buildRgArgs(params), ctx);
-          if (outcome.noMatches) {
-            return {
-              content: [{ type: "text", text: "No matches found" }],
-              details: {
-                binarySource: outcome.binarySource,
-                outputLines: 0,
-                truncated: false,
-              },
-            } satisfies AgentToolResult<RgToolDetails>;
-          }
+      const outcome = await runSearch("rg", buildRgArgs(params), ctx, signal);
+      if (outcome.noMatches) {
+        return {
+          content: [{ type: "text", text: "No matches found" }],
+          details: {
+            binarySource: outcome.binarySource,
+            outputLines: 0,
+            truncated: false,
+          },
+        } satisfies AgentToolResult<RgToolDetails>;
+      }
 
-          const formatted = formatCapturedOutput(outcome.output);
-          return {
-            content: [{ type: "text", text: formatted.text }],
-            details: {
-              binarySource: outcome.binarySource,
-              outputLines: formatted.lineCount,
-              truncated: formatted.truncated,
-              fullOutputPath: formatted.fullOutputPath,
-            },
-          } satisfies AgentToolResult<RgToolDetails>;
-        }),
-        signal ? { signal } : undefined,
-      );
-      return unwrapToolExit(exit, "rg");
+      const { formatCapturedOutput } = await loadSearchRuntime();
+      const formatted = formatCapturedOutput(outcome.output);
+      return {
+        content: [{ type: "text", text: formatted.text }],
+        details: {
+          binarySource: outcome.binarySource,
+          outputLines: formatted.lineCount,
+          truncated: formatted.truncated,
+          fullOutputPath: formatted.fullOutputPath,
+        },
+      } satisfies AgentToolResult<RgToolDetails>;
     },
 
     renderCall(args, theme) {

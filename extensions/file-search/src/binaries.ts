@@ -1,6 +1,5 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { Data, Effect } from "effect";
 
 const execFileAsync = promisify(execFile);
 
@@ -24,7 +23,7 @@ export interface PlatformTarget {
 }
 
 export interface BinaryEnv {
-  readonly probe: (command: string, tool: ToolName) => Effect.Effect<boolean>;
+  readonly probe: (command: string, tool: ToolName) => Promise<boolean>;
 }
 
 export interface ResolvedBinary {
@@ -33,11 +32,12 @@ export interface ResolvedBinary {
   readonly source: BinarySource;
 }
 
-export class BinaryUnavailableError extends Data.TaggedError(
-  "BinaryUnavailableError",
-)<{
-  readonly message: string;
-}> {}
+export class BinaryUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BinaryUnavailableError";
+  }
+}
 
 export function currentTarget(): PlatformTarget {
   return { os: process.platform, arch: process.arch };
@@ -48,39 +48,32 @@ export function repositoryBinDir() {
   return "";
 }
 
-export function resolveBinary(
+export async function resolveBinary(
   spec: ToolSpec,
   _binDir: string,
   _target: PlatformTarget,
   env: BinaryEnv,
-): Effect.Effect<ResolvedBinary, BinaryUnavailableError> {
-  return Effect.gen(function* () {
-    for (const command of spec.systemCommands) {
-      if (yield* env.probe(command, spec.tool)) {
-        return { tool: spec.tool, command, source: "system" as const };
-      }
+): Promise<ResolvedBinary> {
+  for (const command of spec.systemCommands) {
+    if (await env.probe(command, spec.tool)) {
+      return { tool: spec.tool, command, source: "system" };
     }
-    return yield* new BinaryUnavailableError({
-      message: `${spec.tool} is unavailable on PATH. Install it through the system/Home Manager configuration and restart Pi.`,
-    });
-  });
+  }
+  throw new BinaryUnavailableError(
+    `${spec.tool} is unavailable on PATH. Install it through the system/Home Manager configuration and restart Pi.`,
+  );
 }
 
 export const liveBinaryEnv: BinaryEnv = {
-  probe: (command, tool) =>
-    Effect.promise(async () => {
-      try {
-        await execFileAsync(
-          command,
-          tool === "fd" ? ["--version"] : ["--version"],
-          {
-            timeout: 5_000,
-            env: process.env,
-          },
-        );
-        return true;
-      } catch {
-        return false;
-      }
-    }),
+  probe: async (command) => {
+    try {
+      await execFileAsync(command, ["--version"], {
+        timeout: 5_000,
+        env: process.env,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  },
 };
