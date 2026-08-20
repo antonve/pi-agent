@@ -7,6 +7,7 @@ import {
   createRunBoundary,
   getRunEntries,
   hasMinimumRecapDuration,
+  hasMinimumVisibleRecapContent,
   hasMultipleUserTurns,
   serializeRunTranscript,
 } from "./src/transcript.ts";
@@ -103,7 +104,7 @@ export default function (pi: ExtensionAPI) {
     if (!hasMultipleUserTurns(branch)) return;
 
     const entries = getRunEntries(branch, run.baselineLeafId);
-    if (entries.length === 0) return;
+    if (entries.length === 0 || !hasMinimumVisibleRecapContent(entries)) return;
 
     const controller = new AbortController();
     statusContext = ctx;
