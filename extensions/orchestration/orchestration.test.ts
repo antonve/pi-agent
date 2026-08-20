@@ -31,12 +31,16 @@ import orchestration, {
 } from "./index.ts";
 import {
   advanceAgentLifecycle,
+  BACKGROUND_SNAPSHOT_VARIABLE,
   buildAgentName,
+  buildBackgroundScript,
   buildChildPrompt,
+  extractFinalBackgroundSnapshot,
   extractParentReport,
   OrchestrationManager,
   PARENT_REPORT_END,
   PARENT_REPORT_START,
+  stripBackgroundSnapshotMarkers,
 } from "./manager.ts";
 import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry } from "./registry.ts";
@@ -432,6 +436,45 @@ test("Herdr response fields are decoded through envelopes", () => {
   };
   assert.equal(findString(response, ["pane_id"]), "w1:p2");
   assert.equal(findNumber(response, ["state_change_seq"]), 42);
+});
+
+test("background scripts expose a unique snapshot marker", () => {
+  const script = buildBackgroundScript(
+    "poll-deployment",
+    "__DONE__",
+    "__SNAPSHOT__",
+  );
+  assert.match(
+    script,
+    new RegExp(`export ${BACKGROUND_SNAPSHOT_VARIABLE}='__SNAPSHOT__'`),
+  );
+  assert.match(script, /poll-deployment/);
+  assert.match(script, /__DONE__:%s/);
+});
+
+test("background completion selects the final marked snapshot", () => {
+  const marker = "__SNAPSHOT__";
+  const output = [
+    marker,
+    "ADMIN success",
+    "GO in_progress",
+    marker,
+    "ADMIN success",
+    "GO success",
+  ].join("\n");
+  assert.equal(
+    extractFinalBackgroundSnapshot(output, marker),
+    "ADMIN success\nGO success",
+  );
+  assert.equal(
+    stripBackgroundSnapshotMarkers(output, marker),
+    "ADMIN success\nGO in_progress\nADMIN success\nGO success",
+  );
+  assert.equal(extractFinalBackgroundSnapshot(output), undefined);
+  assert.equal(
+    extractFinalBackgroundSnapshot(output, "__MISSING__"),
+    undefined,
+  );
 });
 
 test("subagent prompts request a marked parent report without changing workflow protocol", () => {
@@ -1108,6 +1151,70 @@ test("auto-closed failures no longer require inspection", () => {
   );
   assert.equal(needsInspection({ ...task, status: "blocked" }, now), true);
   assert.equal(needsInspection({ ...task, resourceClosedAt: now }, now), false);
+});
+
+test("completed polling tasks deliver only the final snapshot and retain history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-snapshot-"));
+  const registry = new TaskRegistry(join(directory, "registry.json"));
+  const marker = "__SNAPSHOT__";
+  await registry.put({
+    ...taskRecord("bg-snapshot", "running"),
+    kind: "background",
+    sentinel: "__DONE__",
+    snapshotMarker: marker,
+  });
+  const paneOutput = [
+    marker,
+    "ADMIN success",
+    "GO in_progress",
+    marker,
+    "ADMIN success",
+    "GO success",
+    "__DONE__:0",
+  ].join("\n");
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "pane" && args[1] === "read")
+        return { stdout: paneOutput, stderr: "", code: 0 };
+      if (args[0] === "notify") return { stdout: "{}", stderr: "", code: 0 };
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    },
+  };
+  const completions: string[] = [];
+  const manager = new OrchestrationManager(
+    new HerdrClient(runner),
+    new TreehouseClient(runner),
+    registry,
+    { onComplete: (_task, output) => completions.push(output) },
+  );
+  const previousHerdrEnv = process.env.HERDR_ENV;
+  const previousStateDirectory = process.env.PI_HERDR_STATE_DIR;
+  process.env.HERDR_ENV = "1";
+  process.env.PI_HERDR_STATE_DIR = directory;
+  try {
+    await manager.reconcile();
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if ((await registry.get("bg-snapshot"))?.status === "done") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(completions, ["ADMIN success\nGO success"]);
+    assert.equal(
+      await manager.output("bg-snapshot"),
+      "ADMIN success\nGO in_progress\nADMIN success\nGO success",
+    );
+    assert.equal(
+      await manager.report("bg-snapshot"),
+      "ADMIN success\nGO success",
+    );
+    assert.equal((await registry.get("bg-snapshot"))?.exitCode, 0);
+  } finally {
+    manager.dispose();
+    if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previousHerdrEnv;
+    if (previousStateDirectory === undefined)
+      delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousStateDirectory;
+  }
 });
 
 test("a stale pane monitor cannot overwrite a captured background failure", async () => {

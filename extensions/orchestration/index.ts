@@ -376,6 +376,7 @@ export default function orchestration(pi: ExtensionAPI) {
       "Start a visible Herdr background command for servers, watchers, long builds, or long tests",
     promptGuidelines: [
       "Use bg_start for long-running commands; use bash for quick commands. Continue useful work after bg_start because completion is delivered automatically.",
+      'For polling commands that print repeated status snapshots, print "$PI_BACKGROUND_SNAPSHOT" on its own line immediately before each complete snapshot. Completion delivers only the final marked snapshot; bg_status retains the full history.',
     ],
     parameters: Type.Object({
       command: Type.String(),

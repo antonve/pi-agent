@@ -27,6 +27,7 @@ import { TreehouseClient } from "./treehouse-client.ts";
 const POLL_MS = 1_000;
 export const PARENT_REPORT_START = "PI_PARENT_REPORT_BEGIN";
 export const PARENT_REPORT_END = "PI_PARENT_REPORT_END";
+export const BACKGROUND_SNAPSHOT_VARIABLE = "PI_BACKGROUND_SNAPSHOT";
 const VALID_KEYS = new Set([
   "enter",
   "esc",
@@ -66,6 +67,45 @@ export function extractParentReport(output: string) {
     if (report) return report;
   }
   return output.trim();
+}
+
+export function buildBackgroundScript(
+  command: string,
+  sentinel: string,
+  snapshotMarker: string,
+) {
+  return `export ${BACKGROUND_SNAPSHOT_VARIABLE}='${snapshotMarker}'\n${command}\nstatus=$?\nprintf '\\n${sentinel}:%s\\n' "$status"`;
+}
+
+export function extractFinalBackgroundSnapshot(
+  output: string,
+  marker?: string,
+) {
+  if (!marker) return undefined;
+  const lines = output.split(/\r?\n/);
+  let lastMarker = -1;
+  for (let index = lines.length - 1; index >= 0; index--) {
+    if (lines[index]!.trim() === marker) {
+      lastMarker = index;
+      break;
+    }
+  }
+  if (lastMarker < 0) return undefined;
+  return lines
+    .slice(lastMarker + 1)
+    .join("\n")
+    .trim();
+}
+
+export function stripBackgroundSnapshotMarkers(
+  output: string,
+  marker?: string,
+) {
+  if (!marker) return output;
+  return output
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== marker)
+    .join("\n");
 }
 
 export function buildChildPrompt(options: {
@@ -242,11 +282,16 @@ export class OrchestrationManager {
       parentSession: options.parentSession,
     });
     const sentinel = `__PI_HERDR_DONE_${randomBytes(12).toString("hex")}__`;
+    const snapshotMarker = `__PI_HERDR_SNAPSHOT_${randomBytes(12).toString("hex")}__`;
     try {
-      const script = `${command}\nstatus=$?\nprintf '\\n${sentinel}:%s\\n' "$status"`;
+      const script = buildBackgroundScript(command, sentinel, snapshotMarker);
       await this.herdr.runInPane(task.paneId, "sh", ["-lc", script]);
-      await this.registry.update(task.id, { status: "running", sentinel });
-      this.monitorBackground(task.id, sentinel);
+      await this.registry.update(task.id, {
+        status: "running",
+        sentinel,
+        snapshotMarker,
+      });
+      this.monitorBackground(task.id, sentinel, snapshotMarker);
       return (await this.registry.get(task.id))!;
     } catch (error) {
       await this.markFailed(task.id, error);
@@ -254,7 +299,11 @@ export class OrchestrationManager {
     }
   }
 
-  private monitorBackground(taskId: string, sentinel: string) {
+  private monitorBackground(
+    taskId: string,
+    sentinel: string,
+    snapshotMarker?: string,
+  ) {
     if (this.monitors.has(taskId)) return;
     const controller = new AbortController();
     this.monitors.set(taskId, controller);
@@ -293,11 +342,17 @@ export class OrchestrationManager {
                 "",
               )
               .trimEnd();
+            const report = extractFinalBackgroundSnapshot(
+              cleaned,
+              snapshotMarker,
+            );
             await this.settle(
               taskId,
               exitCode === 0 ? "done" : "failed",
-              cleaned,
+              stripBackgroundSnapshotMarkers(cleaned, snapshotMarker),
               { exitCode },
+              ["starting", "running"],
+              report,
             );
             return;
           }
@@ -624,7 +679,7 @@ export class OrchestrationManager {
       if (parentSession && task.parentSession !== parentSession) continue;
       if (task.status === "running") {
         if (task.kind === "background" && task.sentinel)
-          this.monitorBackground(task.id, task.sentinel);
+          this.monitorBackground(task.id, task.sentinel, task.snapshotMarker);
         else if (task.agentName)
           this.monitorAgent(task.id, task.promptStateChangeSeq);
       } else if (
