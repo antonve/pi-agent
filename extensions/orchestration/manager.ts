@@ -25,6 +25,8 @@ import { TaskRegistry, stateDirectory } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
 
 const POLL_MS = 1_000;
+export const PARENT_REPORT_START = "PI_PARENT_REPORT_BEGIN";
+export const PARENT_REPORT_END = "PI_PARENT_REPORT_END";
 const VALID_KEYS = new Set([
   "enter",
   "esc",
@@ -49,6 +51,36 @@ function id(prefix: string) {
 function cleanLabel(label: string) {
   return label.replace(/\s+/g, " ").trim().slice(0, 80) || "task";
 }
+
+export function extractParentReport(output: string) {
+  const end = output.lastIndexOf(PARENT_REPORT_END);
+  const start = output.lastIndexOf(PARENT_REPORT_START, end);
+  if (start >= 0 && end > start) {
+    const report = output.slice(start + PARENT_REPORT_START.length, end).trim();
+    if (report && report !== "<report>") return report;
+  }
+
+  const thinking = [...output.matchAll(/^\s*Thinking\.\.\.\s*$/gm)].at(-1);
+  if (thinking?.index !== undefined) {
+    const report = output.slice(thinking.index + thinking[0].length).trim();
+    if (report) return report;
+  }
+  return output.trim();
+}
+
+export function buildChildPrompt(options: {
+  prompt: string;
+  cwd: string;
+  kind: TaskRecord["kind"];
+  lease?: { leaseId: string; holder: string };
+}) {
+  const ending =
+    options.kind === "subagent"
+      ? `- End with a concise report for the parent agent between these exact marker lines:\n${PARENT_REPORT_START}\n<report>\n${PARENT_REPORT_END}`
+      : "- End with a concise report for the parent agent.";
+  return `${options.prompt.trim()}\n\nOrchestration constraints:\n- Do not spawn subagents or workflows.\n- Work only in ${options.cwd}.\n${options.lease ? `- This is Treehouse lease ${options.lease.leaseId} held by ${options.lease.holder}; do not return or force-clean it.` : "- This task intentionally uses the supplied shared checkout."}\n${ending}`;
+}
+
 export function buildAgentName(taskId: string, label: string) {
   const suffix = label
     .toLowerCase()
@@ -92,6 +124,16 @@ function sleep(ms: number, signal?: AbortSignal) {
 }
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function boundedReport(output: string) {
+  const truncation = truncateTail(output, {
+    maxBytes: DEFAULT_MAX_BYTES,
+    maxLines: DEFAULT_MAX_LINES,
+  });
+  return truncation.truncated
+    ? `${truncation.content}\n\n[Final report truncated: ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}. Use subagent_check for full activity.]`
+    : truncation.content;
 }
 
 export class OrchestrationManager {
@@ -328,7 +370,12 @@ export class OrchestrationManager {
         launch.args,
       );
       await this.registry.update(task.id, { agentName });
-      const childPrompt = `${options.prompt.trim()}\n\nOrchestration constraints:\n- Do not spawn subagents or workflows.\n- Work only in ${cwd}.\n${lease ? `- This is Treehouse lease ${lease.leaseId} held by ${lease.holder}; do not return or force-clean it.` : "- This task intentionally uses the supplied shared checkout."}\n- End with a concise report for the parent agent.`;
+      const childPrompt = buildChildPrompt({
+        prompt: options.prompt,
+        cwd,
+        kind: task.kind,
+        lease,
+      });
       const prompted = await this.herdr.deliverInitialPrompt({
         name: agentName,
         harness: options.harness,
@@ -404,10 +451,17 @@ export class OrchestrationManager {
           );
           activityObserved = lifecycle.activityObserved;
           if (lifecycle.settled) {
+            const status = agent.status === "blocked" ? "blocked" : "done";
+            const output = await this.herdr.readAgent(task.agentName);
             await this.settle(
               task.id,
-              agent.status === "blocked" ? "blocked" : "done",
-              await this.herdr.readAgent(task.agentName),
+              status,
+              output,
+              {},
+              ["starting", "running"],
+              status === "done" && task.kind === "subagent"
+                ? extractParentReport(output)
+                : undefined,
             );
             return;
           }
@@ -450,17 +504,23 @@ export class OrchestrationManager {
     output: string,
     patch: Partial<TaskRecord> = {},
     expectedStatuses: TaskRecord["status"][] = ["starting", "running"],
+    completionReport?: string,
   ) {
     const settledAt = Date.now();
     const successful = status === "done";
     const autoClosable = isAutoCloseStatus(status);
     const fullPath = `${stateDirectory()}/results/${taskId}.${randomBytes(5).toString("hex")}.txt`;
     const result = await this.boundedOutput(taskId, output, fullPath);
+    const report =
+      completionReport === undefined
+        ? result.text
+        : boundedReport(completionReport);
     const task = await this.registry.transition(taskId, expectedStatuses, {
       ...patch,
       status,
       settledAt,
       completionResultPath: fullPath,
+      ...(completionReport === undefined ? {} : { completionReport: report }),
       autoCloseCancelled: false,
       ...(autoClosable ? { autoCloseAt: settledAt + AUTO_CLOSE_MS } : {}),
     });
@@ -468,12 +528,12 @@ export class OrchestrationManager {
       await unlink(fullPath).catch(() => undefined);
       return this.require(taskId);
     }
-    this.callbacks.onComplete(task, result.text);
+    this.callbacks.onComplete(task, report);
     this.callbacks.onChange?.();
     await this.herdr
       .notify(
         `${task.kind} ${status}: ${task.label}`,
-        result.text.slice(0, 500),
+        report.slice(0, 500),
         successful ? "done" : "request",
       )
       .catch(() => undefined);
@@ -613,6 +673,11 @@ export class OrchestrationManager {
       ? await this.herdr.readAgent(task.agentName)
       : await this.herdr.readPane(task.paneId);
     return (await this.boundedOutput(task.id, output)).text;
+  }
+
+  async report(idValue: string) {
+    const task = await this.require(idValue);
+    return task.completionReport ?? this.output(idValue);
   }
 
   async focus(idValue: string) {

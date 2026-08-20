@@ -32,7 +32,11 @@ import orchestration, {
 import {
   advanceAgentLifecycle,
   buildAgentName,
+  buildChildPrompt,
+  extractParentReport,
   OrchestrationManager,
+  PARENT_REPORT_END,
+  PARENT_REPORT_START,
 } from "./manager.ts";
 import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry } from "./registry.ts";
@@ -224,7 +228,7 @@ test("subagent wait returns immediately and delivers one grouped completion", as
       waitFinished.then((tasks) =>
         tasks.filter((task) => ids.includes(task.id)),
       ),
-    output: async (id: string) => `output for ${id}`,
+    report: async (id: string) => `output for ${id}`,
   };
   const suppression = new CompletionSuppression();
   const backgroundWaits = new BackgroundWaitRegistry();
@@ -428,6 +432,53 @@ test("Herdr response fields are decoded through envelopes", () => {
   };
   assert.equal(findString(response, ["pane_id"]), "w1:p2");
   assert.equal(findNumber(response, ["state_change_seq"]), 42);
+});
+
+test("subagent prompts request a marked parent report without changing workflow protocol", () => {
+  const subagentPrompt = buildChildPrompt({
+    prompt: "Review the change",
+    cwd: "/repo",
+    kind: "subagent",
+  });
+  assert.match(subagentPrompt, new RegExp(PARENT_REPORT_START));
+  assert.match(subagentPrompt, new RegExp(PARENT_REPORT_END));
+
+  const workflowPrompt = buildChildPrompt({
+    prompt: "Return structured JSON",
+    cwd: "/repo",
+    kind: "workflow-child",
+  });
+  assert.doesNotMatch(workflowPrompt, new RegExp(PARENT_REPORT_START));
+  assert.match(
+    workflowPrompt,
+    /End with a concise report for the parent agent\./,
+  );
+});
+
+test("parent report extraction omits child thinking and tool activity", () => {
+  const transcript = [
+    " Thinking...",
+    " $ npm test",
+    " lots of test output",
+    PARENT_REPORT_START,
+    "Implemented the fix. Tests pass.",
+    PARENT_REPORT_END,
+    "child prompt footer",
+  ].join("\n");
+  assert.equal(
+    extractParentReport(transcript),
+    "Implemented the fix. Tests pass.",
+  );
+});
+
+test("parent report extraction falls back to the final visible response", () => {
+  const transcript = [
+    " Thinking...",
+    " old tool activity",
+    " Thinking...",
+    "Concise legacy child report.",
+  ].join("\n");
+  assert.equal(extractParentReport(transcript), "Concise legacy child report.");
 });
 
 test("stale settled status cannot complete a newly prompted agent", () => {
@@ -1153,6 +1204,72 @@ test("a stale pane monitor cannot overwrite a captured background failure", asyn
   }
 });
 
+test("completed subagents deliver only their report and retain full activity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-report-"));
+  const registry = new TaskRegistry(join(directory, "registry.json"));
+  await registry.put({
+    ...taskRecord("sa-report", "running"),
+    agentName: "sa-report-agent",
+    promptStateChangeSeq: 1,
+  });
+  const transcript = [
+    " Thinking...",
+    " $ npm test",
+    " verbose test activity",
+    PARENT_REPORT_START,
+    "Implemented the requested fix.",
+    PARENT_REPORT_END,
+  ].join("\n");
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "agent" && args[1] === "get")
+        return {
+          stdout: agentResponse({ status: "done", seq: 2 }),
+          stderr: "",
+          code: 0,
+        };
+      if (args[0] === "agent" && args[1] === "read")
+        return { stdout: transcript, stderr: "", code: 0 };
+      if (args[0] === "notify") return { stdout: "{}", stderr: "", code: 0 };
+      throw new Error(`unexpected call: ${args.join(" ")}`);
+    },
+  };
+  const completions: string[] = [];
+  const manager = new OrchestrationManager(
+    new HerdrClient(runner),
+    new TreehouseClient(runner),
+    registry,
+    { onComplete: (_task, output) => completions.push(output) },
+  );
+  const previousHerdrEnv = process.env.HERDR_ENV;
+  const previousStateDirectory = process.env.PI_HERDR_STATE_DIR;
+  process.env.HERDR_ENV = "1";
+  process.env.PI_HERDR_STATE_DIR = directory;
+  try {
+    await manager.reconcile();
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if ((await registry.get("sa-report"))?.status === "done") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const task = await registry.get("sa-report");
+    assert.equal(task?.status, "done");
+    assert.deepEqual(completions, ["Implemented the requested fix."]);
+    assert.equal(await manager.report("sa-report"), completions[0]);
+    assert.equal(await manager.output("sa-report"), transcript);
+    assert.equal(
+      await readFile(task!.completionResultPath!, "utf8"),
+      transcript,
+    );
+  } finally {
+    manager.dispose();
+    if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previousHerdrEnv;
+    if (previousStateDirectory === undefined)
+      delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousStateDirectory;
+  }
+});
+
 test("settled task output survives after its Herdr agent exits", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-herdr-output-"));
   const resultPath = join(directory, "child-result.txt");
@@ -1178,6 +1295,7 @@ test("settled task output survives after its Herdr agent exits", async () => {
     updatedAt: now,
     settledAt: now,
     completionResultPath: resultPath,
+    completionReport: "concise child report",
   });
   const calls: Array<readonly string[]> = [];
   const runner: CliRunner = {
@@ -1196,6 +1314,7 @@ test("settled task output survives after its Herdr agent exits", async () => {
   process.env.PI_HERDR_STATE_DIR = directory;
   try {
     assert.equal(await manager.output("sa-done"), "complete child review\n");
+    assert.equal(await manager.report("sa-done"), "concise child report");
   } finally {
     if (previousStateDirectory === undefined)
       delete process.env.PI_HERDR_STATE_DIR;
