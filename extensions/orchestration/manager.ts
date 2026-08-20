@@ -25,6 +25,7 @@ import { TaskRegistry, stateDirectory } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
 
 const POLL_MS = 1_000;
+export const CANCEL_CLOSE_MS = 2_000;
 export const PARENT_REPORT_START = "PI_PARENT_REPORT_BEGIN";
 export const PARENT_REPORT_END = "PI_PARENT_REPORT_END";
 export const BACKGROUND_SNAPSHOT_VARIABLE = "PI_BACKGROUND_SNAPSHOT";
@@ -774,13 +775,22 @@ export class OrchestrationManager {
     const task = await this.require(idValue);
     this.monitors.get(task.id)?.abort();
     await this.herdr.sendKeys(task.paneId, ["ctrl+c"]);
-    return this.settle(
+    const cancelled = await this.settle(
       task.id,
       "cancelled",
       "The tracked Herdr resource was cancelled.",
       {},
       ["starting", "running", "blocked"],
     );
+    if (cancelled.resourceClosedAt !== undefined) return cancelled;
+
+    const autoCloseAt = Date.now() + CANCEL_CLOSE_MS;
+    const updated = await this.registry.update(cancelled.id, {
+      autoCloseAt,
+      autoCloseCancelled: false,
+    });
+    this.scheduleClose(updated.id, CANCEL_CLOSE_MS);
+    return updated;
   }
 
   async close(idValue: string) {

@@ -35,6 +35,7 @@ import {
   buildAgentName,
   buildBackgroundScript,
   buildChildPrompt,
+  CANCEL_CLOSE_MS,
   extractFinalBackgroundSnapshot,
   extractParentReport,
   OrchestrationManager,
@@ -1121,6 +1122,60 @@ test("all settled resources except blocked ones are eligible for auto-close", ()
   assert.equal(isAutoCloseStatus("cancelled"), true);
   assert.equal(isAutoCloseStatus("interrupted"), true);
   assert.equal(isAutoCloseStatus("blocked"), false);
+});
+
+test("cancelling schedules prompt resource cleanup after Ctrl+C", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-cancel-"));
+  const registry = new TaskRegistry(join(directory, "registry.json"));
+  await registry.put({
+    ...taskRecord("bg-running", "running"),
+    kind: "background",
+  });
+  await registry.put({
+    ...taskRecord("bg-settled", "done"),
+    kind: "background",
+  });
+  const calls: Array<readonly string[]> = [];
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push(args);
+      return { stdout: "{}", stderr: "", code: 0 };
+    },
+  };
+  const manager = new OrchestrationManager(
+    new HerdrClient(runner),
+    new TreehouseClient(runner),
+    registry,
+    { onComplete() {} },
+  );
+  const previousStateDirectory = process.env.PI_HERDR_STATE_DIR;
+  process.env.PI_HERDR_STATE_DIR = directory;
+  try {
+    for (const id of ["bg-running", "bg-settled"]) {
+      const before = Date.now();
+      const task = await manager.cancel(id);
+      const after = Date.now();
+      assert.ok(task.autoCloseAt);
+      assert.ok(task.autoCloseAt >= before + CANCEL_CLOSE_MS);
+      assert.ok(task.autoCloseAt <= after + CANCEL_CLOSE_MS);
+    }
+    assert.equal((await registry.get("bg-running"))?.status, "cancelled");
+    assert.equal((await registry.get("bg-settled"))?.status, "done");
+    assert.equal(
+      calls.filter(
+        (args) =>
+          args[0] === "pane" &&
+          args[1] === "send-keys" &&
+          args.includes("ctrl+c"),
+      ).length,
+      2,
+    );
+  } finally {
+    manager.dispose();
+    if (previousStateDirectory === undefined)
+      delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousStateDirectory;
+  }
 });
 
 test("auto-closed failures no longer require inspection", () => {
