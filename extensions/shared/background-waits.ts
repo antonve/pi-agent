@@ -4,7 +4,9 @@ import {
   formatSize,
   truncateTail,
   type ExtensionAPI,
+  type MessageRenderer,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 export interface BackgroundWaitResult {
@@ -192,11 +194,39 @@ export function createBackgroundWaitExecutor(
   };
 }
 
+export const renderBackgroundWaitResult: MessageRenderer = (
+  message,
+  options,
+  theme,
+) => {
+  const details = (message.details ?? {}) as {
+    status?: string;
+    tasks?: unknown[];
+  };
+  const status = details.status ?? "settled";
+  const taskCount = Array.isArray(details.tasks) ? details.tasks.length : 0;
+  const statusLabel = status === "done" ? "completed" : status;
+  const summary =
+    theme.fg(
+      status === "done" ? "success" : "warning",
+      `background wait ${statusLabel}`,
+    ) +
+    theme.fg("muted", ` · ${taskCount} ${taskCount === 1 ? "task" : "tasks"}`);
+  if (!options.expanded) return new Text(summary, 0, 0);
+
+  const content = typeof message.content === "string" ? message.content : "";
+  return new Text(`${summary}${content ? `\n${content}` : ""}`, 0, 0);
+};
+
 export function registerBackgroundWaitTool(
   pi: ExtensionAPI,
   registry: BackgroundWaitRegistry,
 ) {
   const executeWait = createBackgroundWaitExecutor(pi, registry);
+  pi.registerMessageRenderer(
+    "background-wait-result",
+    renderBackgroundWaitResult,
+  );
   pi.registerTool({
     name: "background_wait",
     label: "Wait for Background Tasks",

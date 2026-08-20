@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type {
   ExtensionAPI,
+  Theme,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -9,6 +10,7 @@ import {
   getBackgroundWaitRegistry,
   registerBackgroundWaitTask,
   registerBackgroundWaitTool,
+  renderBackgroundWaitResult,
   type BackgroundWaitResult,
 } from "./background-waits.ts";
 
@@ -65,8 +67,44 @@ test("background wait registry replaces tasks without stale unregisters", () => 
   assert.throws(() => registry.start(["missing"]), /Unknown background task/);
 });
 
+test("background wait results collapse to a title and expand on demand", () => {
+  const message = {
+    role: "custom" as const,
+    customType: "background-wait-result",
+    content: "very long combined output\n".repeat(100),
+    display: true,
+    timestamp: Date.now(),
+    details: {
+      status: "done",
+      tasks: [{ id: "ci-1" }, { id: "deploy-1" }],
+    },
+  };
+  const theme = {
+    fg: (_color: string, text: string) => text,
+  } as Theme;
+
+  const collapsed = renderBackgroundWaitResult(
+    message,
+    { expanded: false, outputPad: 0 },
+    theme,
+  );
+  assert.ok(collapsed);
+  const collapsedText = collapsed.render(120).join("\n");
+  assert.match(collapsedText, /background wait completed · 2 tasks/);
+  assert.doesNotMatch(collapsedText, /very long combined output/);
+
+  const expanded = renderBackgroundWaitResult(
+    message,
+    { expanded: true, outputPad: 0 },
+    theme,
+  );
+  assert.ok(expanded);
+  assert.match(expanded.render(120).join("\n"), /very long combined output/);
+});
+
 test("background_wait yields immediately and injects combined settled output", async () => {
   const tools = new Map<string, ToolDefinition>();
+  const renderers: string[] = [];
   const notifications: Array<{
     message: Parameters<ExtensionAPI["sendMessage"]>[0];
     options: Parameters<ExtensionAPI["sendMessage"]>[1];
@@ -74,6 +112,9 @@ test("background_wait yields immediately and injects combined settled output", a
   const pi = {
     registerTool(definition: ToolDefinition) {
       tools.set(definition.name, definition);
+    },
+    registerMessageRenderer(customType: string) {
+      renderers.push(customType);
     },
     sendMessage(
       message: Parameters<ExtensionAPI["sendMessage"]>[0],
@@ -99,6 +140,7 @@ test("background_wait yields immediately and injects combined settled output", a
   });
   registerBackgroundWaitTool(pi, registry);
 
+  assert.deepEqual(renderers, ["background-wait-result"]);
   const tool = tools.get("background_wait");
   assert.ok(tool);
   const result = await tool.execute(
@@ -154,6 +196,7 @@ test("disposing background waits aborts providers without notifying the model", 
   const notifications: unknown[] = [];
   const pi = {
     registerTool() {},
+    registerMessageRenderer() {},
     sendMessage(message: unknown) {
       notifications.push(message);
     },
