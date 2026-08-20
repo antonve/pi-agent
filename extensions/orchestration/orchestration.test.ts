@@ -1006,16 +1006,27 @@ test("registry writes private durable JSON atomically", async () => {
     createdAt: now,
     updatedAt: now,
   });
-  await registry.update("bg-1", { status: "done" });
-  assert.equal((await registry.get("bg-1"))?.status, "done");
+  const competingRegistry = new TaskRegistry(path);
+  const attempts = await Promise.all([
+    registry.transition("bg-1", ["running"], { status: "done" }),
+    competingRegistry.transition("bg-1", ["running"], { status: "failed" }),
+  ]);
+  const winners = attempts.filter((task) => task !== undefined);
+  assert.equal(winners.length, 1);
+  assert.equal((await registry.get("bg-1"))?.status, winners[0]?.status);
   assert.match(await readFile(path, "utf8"), /"bg-1"/);
+
+  await registry.update("bg-1", { resourceClosedAt: now - 10_000 });
+  assert.equal(await registry.pruneClosedBefore(now - 5_000), 1);
+  assert.equal(await registry.get("bg-1"), undefined);
 });
 
-test("completed and failed tasks are eligible for auto-close", () => {
+test("all settled resources except blocked ones are eligible for auto-close", () => {
   assert.equal(isAutoCloseStatus("done"), true);
   assert.equal(isAutoCloseStatus("failed"), true);
+  assert.equal(isAutoCloseStatus("cancelled"), true);
+  assert.equal(isAutoCloseStatus("interrupted"), true);
   assert.equal(isAutoCloseStatus("blocked"), false);
-  assert.equal(isAutoCloseStatus("cancelled"), false);
 });
 
 test("auto-closed failures no longer require inspection", () => {
@@ -1045,6 +1056,101 @@ test("auto-closed failures no longer require inspection", () => {
     true,
   );
   assert.equal(needsInspection({ ...task, status: "blocked" }, now), true);
+  assert.equal(needsInspection({ ...task, resourceClosedAt: now }, now), false);
+});
+
+test("a stale pane monitor cannot overwrite a captured background failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-settle-race-"));
+  const registryPath = join(directory, "registry.json");
+  const registry = new TaskRegistry(registryPath);
+  const now = Date.now();
+  await registry.put({
+    id: "bg-race",
+    label: "settlement race",
+    kind: "background",
+    parentSession: "owner-session",
+    parentWorkspaceId: "w",
+    parentTabId: "w:t1",
+    parentPaneId: "w:p1",
+    tabId: "w:t1",
+    paneId: "w:p2",
+    createdTab: false,
+    createdPane: true,
+    cwd: "/tmp",
+    placement: "pane",
+    status: "running",
+    createdAt: now,
+    updatedAt: now,
+    sentinel: "__DONE__",
+  });
+  let paneReads = 0;
+  let releaseReads!: () => void;
+  const bothReading = new Promise<void>((resolve) => {
+    releaseReads = resolve;
+  });
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "pane" && args[1] === "read") {
+        paneReads++;
+        const readNumber = paneReads;
+        if (paneReads === 2) releaseReads();
+        await bothReading;
+        if (readNumber === 1)
+          return {
+            stdout: "real command failure\n__DONE__:1\n",
+            stderr: "",
+            code: 0,
+          };
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return {
+          stdout: "",
+          stderr: '{"error":{"code":"pane_not_found"}}',
+          code: 1,
+        };
+      }
+      if (args[0] === "pane" && args[1] === "get")
+        return { stdout: "", stderr: "pane not found", code: 1 };
+      return { stdout: "{}", stderr: "", code: 0 };
+    },
+  };
+  const completions: string[] = [];
+  const createManager = () =>
+    new OrchestrationManager(
+      new HerdrClient(runner),
+      new TreehouseClient(runner),
+      new TaskRegistry(registryPath),
+      { onComplete: (_task, output) => completions.push(output) },
+    );
+  const managers = [createManager(), createManager()];
+  const previousHerdrEnv = process.env.HERDR_ENV;
+  const previousStateDirectory = process.env.PI_HERDR_STATE_DIR;
+  process.env.HERDR_ENV = "1";
+  process.env.PI_HERDR_STATE_DIR = directory;
+  try {
+    await Promise.all(
+      managers.map((manager) => manager.reconcile("owner-session")),
+    );
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if ((await registry.get("bg-race"))?.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const task = await registry.get("bg-race");
+    assert.equal(task?.status, "failed");
+    assert.equal(completions.length, 1);
+    assert.match(completions[0] ?? "", /real command failure/);
+    assert.doesNotMatch(completions[0] ?? "", /pane_not_found/);
+    const output = await readFile(task!.completionResultPath!, "utf8");
+    assert.match(output, /real command failure/);
+    assert.doesNotMatch(output, /pane_not_found/);
+  } finally {
+    for (const manager of managers) manager.dispose();
+    if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previousHerdrEnv;
+    if (previousStateDirectory === undefined)
+      delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousStateDirectory;
+  }
 });
 
 test("settled task output survives after its Herdr agent exits", async () => {
@@ -1139,20 +1245,13 @@ test("reconciliation closes failed tasks whose deadline passed", async () => {
   process.env.HERDR_ENV = "1";
   try {
     await manager.reconcile();
-    for (let attempt = 0; attempt < 20; attempt++) {
-      if (
-        calls.some(
-          (call) =>
-            call.command === "herdr" &&
-            call.args[0] === "tab" &&
-            call.args[1] === "close" &&
-            call.args[2] === "w:t2",
-        )
-      )
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if ((await registry.get("bg-failed"))?.resourceClosedAt !== undefined)
         break;
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   } finally {
+    manager.dispose();
     if (previousHerdrEnv === undefined) delete process.env.HERDR_ENV;
     else process.env.HERDR_ENV = previousHerdrEnv;
   }

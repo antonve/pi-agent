@@ -1,13 +1,17 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import {
   formatSize,
   truncateTail,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
 } from "@earendil-works/pi-coding-agent";
-import { AUTO_CLOSE_MS, isAutoCloseStatus } from "./domain.ts";
+import {
+  AUTO_CLOSE_MS,
+  isAutoCloseStatus,
+  UNKNOWN_AGENT_GRACE_MS,
+} from "./domain.ts";
 import type {
   CreatedResource,
   Placement,
@@ -15,7 +19,7 @@ import type {
   TaskRecord,
 } from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
-import { HerdrClient } from "./herdr-client.ts";
+import { HerdrClient, type HerdrAgent } from "./herdr-client.ts";
 import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry, stateDirectory } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
@@ -209,6 +213,7 @@ export class OrchestrationManager {
   }
 
   private monitorBackground(taskId: string, sentinel: string) {
+    if (this.monitors.has(taskId)) return;
     const controller = new AbortController();
     this.monitors.set(taskId, controller);
     void (async () => {
@@ -216,11 +221,25 @@ export class OrchestrationManager {
         while (!controller.signal.aborted) {
           const task = await this.registry.get(taskId);
           if (!task || task.status !== "running") return;
-          const output = await this.herdr.readPane(
-            task.paneId,
-            800,
-            controller.signal,
-          );
+          let output: string;
+          try {
+            output = await this.herdr.readPane(
+              task.paneId,
+              800,
+              controller.signal,
+            );
+          } catch (error) {
+            if (controller.signal.aborted) return;
+            if (!(await this.herdr.paneExists(task.paneId))) {
+              await this.settle(
+                taskId,
+                "interrupted",
+                "The tracked Herdr pane closed before the command reported an exit status.",
+              );
+              return;
+            }
+            throw error;
+          }
           const match = output.match(
             new RegExp(`${escapeRegExp(sentinel)}:(\\d+)`),
           );
@@ -258,7 +277,8 @@ export class OrchestrationManager {
             error instanceof Error ? error.message : String(error),
           );
       } finally {
-        this.monitors.delete(taskId);
+        if (this.monitors.get(taskId) === controller)
+          this.monitors.delete(taskId);
       }
     })();
   }
@@ -332,15 +352,51 @@ export class OrchestrationManager {
   }
 
   private monitorAgent(taskId: string, promptStateChangeSeq?: number) {
+    if (this.monitors.has(taskId)) return;
     const controller = new AbortController();
     this.monitors.set(taskId, controller);
     void (async () => {
       try {
         let activityObserved = false;
+        let unknownSince: number | undefined;
         while (!controller.signal.aborted) {
           const task = await this.registry.get(taskId);
           if (!task || task.status !== "running" || !task.agentName) return;
-          const agent = await this.herdr.getAgent(task.agentName);
+          let agent: HerdrAgent;
+          try {
+            agent = await this.herdr.getAgent(task.agentName);
+          } catch (error) {
+            if (!(await this.herdr.paneExists(task.paneId))) {
+              await this.settle(
+                task.id,
+                "interrupted",
+                "The tracked Herdr agent pane closed before completion.",
+              );
+              return;
+            }
+            unknownSince ??= Date.now();
+            if (Date.now() - unknownSince >= UNKNOWN_AGENT_GRACE_MS) {
+              await this.settle(
+                task.id,
+                "interrupted",
+                `Herdr could not identify the tracked agent for ${UNKNOWN_AGENT_GRACE_MS / 60_000} minutes.`,
+              );
+              return;
+            }
+            await sleep(POLL_MS, controller.signal);
+            continue;
+          }
+          if (agent.status === "unknown") {
+            unknownSince ??= Date.now();
+            if (Date.now() - unknownSince >= UNKNOWN_AGENT_GRACE_MS) {
+              await this.settle(
+                task.id,
+                "interrupted",
+                `The tracked Herdr agent remained unknown for ${UNKNOWN_AGENT_GRACE_MS / 60_000} minutes.`,
+              );
+              return;
+            }
+          } else unknownSince = undefined;
           const lifecycle = advanceAgentLifecycle(
             agent,
             promptStateChangeSeq,
@@ -355,17 +411,6 @@ export class OrchestrationManager {
             );
             return;
           }
-          if (
-            agent.status === "unknown" &&
-            !(await this.herdr.paneExists(task.paneId))
-          ) {
-            await this.settle(
-              task.id,
-              "interrupted",
-              "The tracked Herdr agent pane closed before completion.",
-            );
-            return;
-          }
           await sleep(POLL_MS, controller.signal);
         }
       } catch (error) {
@@ -376,15 +421,18 @@ export class OrchestrationManager {
             error instanceof Error ? error.message : String(error),
           );
       } finally {
-        this.monitors.delete(taskId);
+        if (this.monitors.get(taskId) === controller)
+          this.monitors.delete(taskId);
       }
     })();
   }
 
-  private async boundedOutput(taskId: string, output: string) {
-    const directory = `${stateDirectory()}/results`;
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const fullPath = `${directory}/${taskId}.txt`;
+  private async boundedOutput(
+    taskId: string,
+    output: string,
+    fullPath = `${stateDirectory()}/results/${taskId}.txt`,
+  ) {
+    await mkdir(dirname(fullPath), { recursive: true, mode: 0o700 });
     await writeFile(fullPath, output, { mode: 0o600 });
     const truncation = truncateTail(output, {
       maxBytes: DEFAULT_MAX_BYTES,
@@ -401,18 +449,25 @@ export class OrchestrationManager {
     status: TaskRecord["status"],
     output: string,
     patch: Partial<TaskRecord> = {},
+    expectedStatuses: TaskRecord["status"][] = ["starting", "running"],
   ) {
-    const result = await this.boundedOutput(taskId, output);
     const settledAt = Date.now();
     const successful = status === "done";
     const autoClosable = isAutoCloseStatus(status);
-    const task = await this.registry.update(taskId, {
+    const fullPath = `${stateDirectory()}/results/${taskId}.${randomBytes(5).toString("hex")}.txt`;
+    const result = await this.boundedOutput(taskId, output, fullPath);
+    const task = await this.registry.transition(taskId, expectedStatuses, {
       ...patch,
       status,
       settledAt,
-      completionResultPath: result.fullPath,
+      completionResultPath: fullPath,
+      autoCloseCancelled: false,
       ...(autoClosable ? { autoCloseAt: settledAt + AUTO_CLOSE_MS } : {}),
     });
+    if (!task) {
+      await unlink(fullPath).catch(() => undefined);
+      return this.require(taskId);
+    }
     this.callbacks.onComplete(task, result.text);
     this.callbacks.onChange?.();
     await this.herdr
@@ -428,12 +483,18 @@ export class OrchestrationManager {
 
   private async markFailed(taskId: string, error: unknown) {
     const settledAt = Date.now();
-    const task = await this.registry.update(taskId, {
-      status: "failed",
-      error: error instanceof Error ? error.message : String(error),
-      settledAt,
-      autoCloseAt: settledAt + AUTO_CLOSE_MS,
-    });
+    const task = await this.registry.transition(
+      taskId,
+      ["starting", "running"],
+      {
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error),
+        settledAt,
+        autoCloseCancelled: false,
+        autoCloseAt: settledAt + AUTO_CLOSE_MS,
+      },
+    );
+    if (!task) return this.require(taskId);
     this.callbacks.onChange?.();
     this.scheduleClose(task.id, AUTO_CLOSE_MS);
     return task;
@@ -466,15 +527,19 @@ export class OrchestrationManager {
     if (
       !task ||
       !isAutoCloseStatus(task.status) ||
-      task.autoCloseCancelled ||
+      task.resourceClosedAt !== undefined ||
       !task.autoCloseAt ||
       task.autoCloseAt > Date.now()
     )
       return;
-    await this.herdr.closeResource(task).catch(() => undefined);
-    if (task.lease?.returnState === "held") {
-      const lease = await this.treehouse.returnLease(task.lease);
-      await this.registry.update(task.id, { lease });
+    try {
+      await this.herdr.closeResource(task);
+    } catch {
+      return;
+    }
+    let lease = task.lease;
+    if (lease?.returnState === "held") {
+      lease = await this.treehouse.returnLease(lease);
       if (lease.returnState !== "returned")
         await this.herdr
           .notify(
@@ -484,27 +549,46 @@ export class OrchestrationManager {
           )
           .catch(() => undefined);
     }
+    await this.registry.update(task.id, {
+      resourceClosedAt: Date.now(),
+      autoCloseCancelled: false,
+      ...(lease ? { lease } : {}),
+    });
     this.callbacks.onChange?.();
   }
 
-  async reconcile() {
+  async reconcile(parentSession?: string) {
     this.assertAvailable();
     const tasks = await this.registry.list();
     for (const task of tasks) {
+      if (parentSession && task.parentSession !== parentSession) continue;
       if (task.status === "running") {
         if (task.kind === "background" && task.sentinel)
           this.monitorBackground(task.id, task.sentinel);
         else if (task.agentName)
           this.monitorAgent(task.id, task.promptStateChangeSeq);
-      } else if (isAutoCloseStatus(task.status) && !task.autoCloseCancelled) {
+      } else if (
+        isAutoCloseStatus(task.status) &&
+        task.resourceClosedAt === undefined
+      ) {
         const autoCloseAt =
           task.autoCloseAt ??
           (task.settledAt ?? task.updatedAt) + AUTO_CLOSE_MS;
-        if (!task.autoCloseAt)
-          await this.registry.update(task.id, { autoCloseAt });
+        if (!task.autoCloseAt || task.autoCloseCancelled)
+          await this.registry.update(task.id, {
+            autoCloseAt,
+            autoCloseCancelled: false,
+          });
         this.scheduleClose(task.id, Math.max(0, autoCloseAt - Date.now()));
       }
     }
+  }
+
+  dispose() {
+    for (const controller of this.monitors.values()) controller.abort();
+    this.monitors.clear();
+    for (const timer of this.closeTimers.values()) clearTimeout(timer);
+    this.closeTimers.clear();
   }
 
   async list(parentSession?: string) {
@@ -546,6 +630,10 @@ export class OrchestrationManager {
         status: "running",
         settledAt: undefined,
         autoCloseAt: undefined,
+        autoCloseCancelled: false,
+        completionResultPath: undefined,
+        error: undefined,
+        exitCode: undefined,
         promptStateChangeSeq: prompted.stateChangeSeq,
       });
       this.monitorAgent(task.id, prompted.stateChangeSeq);
@@ -563,25 +651,29 @@ export class OrchestrationManager {
   }
 
   async cancel(idValue: string) {
-    const task = await this.interact(idValue);
-    await this.herdr.sendKeys(task.paneId, ["ctrl+c"]);
+    const task = await this.require(idValue);
     this.monitors.get(task.id)?.abort();
-    await this.registry.update(task.id, {
-      status: "cancelled",
-      settledAt: Date.now(),
-    });
-    return task;
+    await this.herdr.sendKeys(task.paneId, ["ctrl+c"]);
+    return this.settle(
+      task.id,
+      "cancelled",
+      "The tracked Herdr resource was cancelled.",
+      {},
+      ["starting", "running", "blocked"],
+    );
   }
 
   async close(idValue: string) {
     const task = await this.require(idValue);
     this.monitors.get(task.id)?.abort();
     await this.herdr.closeResource(task);
-    if (task.lease?.returnState === "held") {
-      const lease = await this.treehouse.returnLease(task.lease);
-      await this.registry.update(task.id, { lease });
-    }
-    return task;
+    let lease = task.lease;
+    if (lease?.returnState === "held")
+      lease = await this.treehouse.returnLease(lease);
+    return this.registry.update(task.id, {
+      resourceClosedAt: Date.now(),
+      ...(lease ? { lease } : {}),
+    });
   }
 
   async attach(idValue: string) {
@@ -609,10 +701,15 @@ export class OrchestrationManager {
     const timer = this.closeTimers.get(task.id);
     if (timer) clearTimeout(timer);
     this.closeTimers.delete(task.id);
-    return this.registry.update(task.id, {
-      autoCloseCancelled: true,
-      autoCloseAt: undefined,
+    if (!isAutoCloseStatus(task.status) || task.resourceClosedAt !== undefined)
+      return task;
+    const autoCloseAt = Date.now() + AUTO_CLOSE_MS;
+    const updated = await this.registry.update(task.id, {
+      autoCloseCancelled: false,
+      autoCloseAt,
     });
+    this.scheduleClose(task.id, AUTO_CLOSE_MS);
+    return updated;
   }
 
   private async require(idValue: string) {
