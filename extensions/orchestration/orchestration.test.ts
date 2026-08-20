@@ -11,10 +11,19 @@ import type {
 import type { Component } from "@earendil-works/pi-tui";
 import type { CliRunner } from "./cli.ts";
 import { findNumber, findString } from "./cli.ts";
-import { isAutoCloseStatus, needsInspection } from "./domain.ts";
+import {
+  isAutoCloseStatus,
+  needsInspection,
+  type TaskRecord,
+} from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
 import { HerdrClient } from "./herdr-client.ts";
-import orchestration, { renderHerdrTaskResult } from "./index.ts";
+import orchestration, {
+  CompletionSuppression,
+  deliverTaskCompletion,
+  registerSubagentWait,
+  renderHerdrTaskResult,
+} from "./index.ts";
 import {
   advanceAgentLifecycle,
   buildAgentName,
@@ -83,6 +92,26 @@ function registeredOrchestrationTools() {
   } as unknown as ExtensionAPI;
   orchestration(pi);
   return tools;
+}
+
+function taskRecord(id: string, status: TaskRecord["status"]): TaskRecord {
+  const now = Date.now();
+  return {
+    id,
+    label: `task ${id}`,
+    kind: "subagent",
+    parentWorkspaceId: "workspace-1",
+    parentTabId: "tab-1",
+    parentPaneId: "pane-1",
+    paneId: `pane-${id}`,
+    createdTab: true,
+    createdPane: false,
+    cwd: "/tmp/project",
+    placement: "tab",
+    status,
+    createdAt: now,
+    updatedAt: now,
+  };
 }
 
 test("completed background notifications collapse to one line", () => {
@@ -156,6 +185,96 @@ test("completed subagent notifications collapse to one line", () => {
   assert.ok(expanded);
   assert.ok(renderedLines(expanded).includes("agent output"));
   assert.ok(renderedLines(expanded).includes("more output"));
+});
+
+test("subagent wait returns immediately and delivers one grouped completion", async () => {
+  const tools = new Map<string, ToolDefinition>();
+  const notifications: Array<{
+    message: Parameters<ExtensionAPI["sendMessage"]>[0];
+    options: Parameters<ExtensionAPI["sendMessage"]>[1];
+  }> = [];
+  const pi = {
+    registerTool(definition: ToolDefinition) {
+      tools.set(definition.name, definition);
+    },
+    sendMessage(
+      message: Parameters<ExtensionAPI["sendMessage"]>[0],
+      options: Parameters<ExtensionAPI["sendMessage"]>[1],
+    ) {
+      notifications.push({ message, options });
+    },
+  } as unknown as ExtensionAPI;
+  const running = [
+    taskRecord("sa-one", "running"),
+    taskRecord("sa-two", "running"),
+  ];
+  const settled = [taskRecord("sa-one", "done"), taskRecord("sa-two", "done")];
+  let finishWait!: (tasks: TaskRecord[]) => void;
+  const waitFinished = new Promise<TaskRecord[]>((resolve) => {
+    finishWait = resolve;
+  });
+  const manager = {
+    wait: async () => waitFinished,
+    output: async (id: string) => `output for ${id}`,
+  };
+  const registry = {
+    get: async (id: string) => running.find((task) => task.id === id),
+  };
+  const suppression = new CompletionSuppression();
+  registerSubagentWait(pi, manager, registry, suppression);
+
+  const waitTool = tools.get("subagent_wait");
+  assert.ok(waitTool);
+  const result = await waitTool.execute(
+    "wait-call",
+    { ids: ["sa-one", "sa-two"] },
+    undefined,
+    undefined,
+    {} as never,
+  );
+
+  assert.equal(result.terminate, true);
+  assert.match(
+    result.content[0]?.type === "text" ? result.content[0].text : "",
+    /Waiting in the background/,
+  );
+  assert.equal(notifications.length, 0);
+  assert.equal(suppression.has("sa-one"), true);
+  assert.equal(suppression.has("sa-two"), true);
+
+  finishWait(settled);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(notifications.length, 1);
+  assert.deepEqual(notifications[0]?.options, {
+    deliverAs: "followUp",
+    triggerTurn: true,
+  });
+  const notification = notifications[0]?.message;
+  assert.equal(notification?.customType, "herdr-task-result");
+  assert.match(String(notification?.content), /output for sa-one/);
+  assert.match(String(notification?.content), /output for sa-two/);
+  assert.equal(suppression.has("sa-one"), false);
+  assert.equal(suppression.has("sa-two"), false);
+});
+
+test("grouped waits suppress individual completion notifications", () => {
+  const notifications: unknown[] = [];
+  const pi = {
+    sendMessage(message: unknown) {
+      notifications.push(message);
+    },
+  } as unknown as ExtensionAPI;
+  const suppression = new CompletionSuppression();
+  const release = suppression.acquire(["sa-one"]);
+  const task = taskRecord("sa-one", "done");
+
+  assert.equal(deliverTaskCompletion(pi, suppression, task, "output"), false);
+  assert.equal(notifications.length, 0);
+
+  release();
+  assert.equal(deliverTaskCompletion(pi, suppression, task, "output"), true);
+  assert.equal(notifications.length, 1);
 });
 
 test("collapsed subagent tools occupy one line and expand on demand", () => {
