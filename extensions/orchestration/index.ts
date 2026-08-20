@@ -98,7 +98,7 @@ export const renderHerdrTaskResult: MessageRenderer = (
     theme.fg("muted", ` · ${details.label ?? ""}`);
   if (
     !options.expanded &&
-    details.kind === "background" &&
+    (details.kind === "background" || details.kind === "subagent") &&
     details.status === "done"
   )
     return new Text(summary, 0, 0);
