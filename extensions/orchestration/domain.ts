@@ -79,6 +79,7 @@ export interface TaskRecord {
   resourceClosedAt?: number;
   lease?: LeaseRecord;
   completionResultPath?: string;
+  completionReport?: string;
   exitCode?: number;
   error?: string;
   sentinel?: string;

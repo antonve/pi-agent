@@ -225,7 +225,7 @@ export function deliverTaskCompletion(
   return true;
 }
 
-type SubagentWaitManager = Pick<OrchestrationManager, "wait" | "output">;
+type SubagentWaitManager = Pick<OrchestrationManager, "wait" | "report">;
 
 export function registerWaitableSubagent(
   backgroundWaits: BackgroundWaitRegistry,
@@ -246,7 +246,7 @@ export function registerWaitableSubagent(
         return {
           status: settled.status,
           successful: settled.status === "done",
-          output: await manager.output(settled.id),
+          output: await manager.report(settled.id),
           details: settled,
         };
       } finally {
