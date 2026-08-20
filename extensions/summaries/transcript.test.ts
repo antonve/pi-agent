@@ -4,7 +4,9 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   createRunBoundary,
   getRunEntries,
+  hasMinimumRecapDuration,
   hasMultipleUserTurns,
+  RECAP_MIN_RUN_DURATION_MS,
   serializeRunTranscript,
   TRANSCRIPT_MAX_BYTES,
 } from "./src/transcript.ts";
@@ -33,13 +35,31 @@ function entry(
 
 test("run boundaries replace stale starts and settle exactly once", () => {
   const boundary = createRunBoundary();
-  boundary.begin("before-run");
-  boundary.begin("new-top-level-run");
+  boundary.begin("before-run", 100);
+  boundary.begin("new-top-level-run", 200);
 
   assert.deepEqual(boundary.settle(), {
     baselineLeafId: "new-top-level-run",
+    startedAt: 200,
   });
   assert.equal(boundary.settle(), undefined);
+});
+
+test("recaps require a run lasting at least 60 seconds", () => {
+  const run = { baselineLeafId: "before-run", startedAt: 1_000 };
+
+  assert.equal(
+    hasMinimumRecapDuration(run, 1_000 + RECAP_MIN_RUN_DURATION_MS - 1),
+    false,
+  );
+  assert.equal(
+    hasMinimumRecapDuration(run, 1_000 + RECAP_MIN_RUN_DURATION_MS),
+    true,
+  );
+  assert.equal(
+    hasMinimumRecapDuration(run, 1_000 + RECAP_MIN_RUN_DURATION_MS + 1),
+    true,
+  );
 });
 
 test("recaps require more than one user turn on the branch", () => {

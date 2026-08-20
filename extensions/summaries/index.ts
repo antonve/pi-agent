@@ -6,6 +6,7 @@ import {
   buildFallbackRecap,
   createRunBoundary,
   getRunEntries,
+  hasMinimumRecapDuration,
   hasMultipleUserTurns,
   serializeRunTranscript,
 } from "./src/transcript.ts";
@@ -90,7 +91,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_settled", (_event, ctx) => {
     const run = runBoundary.settle();
-    if (!run || ctx.mode !== "tui" || !sessionActive) return;
+    if (
+      !run ||
+      !hasMinimumRecapDuration(run) ||
+      ctx.mode !== "tui" ||
+      !sessionActive
+    )
+      return;
 
     const branch = ctx.sessionManager.getBranch();
     if (!hasMultipleUserTurns(branch)) return;
