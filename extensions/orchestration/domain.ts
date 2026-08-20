@@ -83,6 +83,7 @@ export interface TaskRecord {
   exitCode?: number;
   error?: string;
   sentinel?: string;
+  snapshotMarker?: string;
 }
 
 export function needsInspection(task: TaskRecord, now = Date.now()) {
