@@ -21,6 +21,8 @@ export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
 export type TaskKind = "background" | "subagent" | "workflow-child";
 export const AUTO_CLOSE_MS = 30_000;
+export const UNKNOWN_AGENT_GRACE_MS = 5 * 60_000;
+export const CLOSED_RECORD_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
 export type TaskStatus =
   | "starting"
@@ -32,7 +34,12 @@ export type TaskStatus =
   | "interrupted";
 
 export function isAutoCloseStatus(status: TaskStatus) {
-  return status === "done" || status === "failed";
+  return (
+    status === "done" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "interrupted"
+  );
 }
 
 export interface LeaseRecord {
@@ -69,6 +76,7 @@ export interface TaskRecord {
   settledAt?: number;
   autoCloseAt?: number;
   autoCloseCancelled?: boolean;
+  resourceClosedAt?: number;
   lease?: LeaseRecord;
   completionResultPath?: string;
   exitCode?: number;
@@ -77,12 +85,13 @@ export interface TaskRecord {
 }
 
 export function needsInspection(task: TaskRecord, now = Date.now()) {
-  if (task.status === "blocked" || task.status === "interrupted") return true;
-  if (task.status !== "failed") return false;
+  if (task.status === "blocked") return true;
+  if (task.status !== "failed" && task.status !== "interrupted") return false;
   return (
-    task.autoCloseCancelled === true ||
-    task.autoCloseAt === undefined ||
-    task.autoCloseAt > now
+    task.resourceClosedAt === undefined &&
+    (task.autoCloseCancelled === true ||
+      task.autoCloseAt === undefined ||
+      task.autoCloseAt > now)
   );
 }
 

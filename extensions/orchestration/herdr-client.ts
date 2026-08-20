@@ -328,9 +328,20 @@ export class HerdrClient {
     createdPane: boolean;
     paneId: string;
   }) {
-    if (task.createdTab && task.tabId)
-      await this.json(["tab", "close", task.tabId]);
-    else if (task.createdPane) await this.json(["pane", "close", task.paneId]);
+    if (!(await this.paneExists(task.paneId))) return;
+    try {
+      if (task.createdTab && task.tabId)
+        await this.json(["tab", "close", task.tabId]);
+      else if (task.createdPane)
+        await this.json(["pane", "close", task.paneId]);
+    } catch (error) {
+      if (
+        error instanceof HerdrCommandError &&
+        (error.code === "pane_not_found" || error.code === "tab_not_found")
+      )
+        return;
+      throw error;
+    }
   }
 
   async focus(task: {

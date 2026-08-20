@@ -327,7 +327,7 @@ export default function orchestration(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     context = ctx;
     void manager
-      .reconcile()
+      .reconcile(ctx.sessionManager.getSessionId())
       .then(async () => {
         const tasks = await manager.list(ctx.sessionManager.getSessionId());
         for (const task of tasks)
@@ -360,6 +360,7 @@ export default function orchestration(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", (_event, ctx) => {
     context = undefined;
+    manager.dispose();
     backgroundWaits.dispose();
     if (ctx.hasUI) ctx.ui.setStatus("herdr-orchestration", undefined);
   });
@@ -518,7 +519,7 @@ export default function orchestration(pi: ExtensionAPI) {
     name: "bg_kill",
     label: "Interrupt Herdr Background Tasks",
     description:
-      "Send Ctrl+C to tracked background commands. Their panes remain visible for inspection.",
+      "Send Ctrl+C to tracked background commands. Their panes close automatically after the cleanup grace period.",
     parameters: Type.Object({
       ids: Type.Array(Type.String(), { minItems: 1 }),
     }),
@@ -533,7 +534,7 @@ export default function orchestration(pi: ExtensionAPI) {
             text: tasks
               .map(
                 (task) =>
-                  `Interrupted ${task.id}; its Herdr resource remains open.`,
+                  `Interrupted ${task.id}; its Herdr resource will close automatically.`,
               )
               .join("\n"),
           },
@@ -681,7 +682,7 @@ export default function orchestration(pi: ExtensionAPI) {
     name: "subagent_cancel",
     label: "Cancel Herdr Subagents",
     description:
-      "Interrupt child agents while retaining their visible tabs/panes and leases for inspection.",
+      "Interrupt child agents. Their visible resources close automatically after the cleanup grace period.",
     parameters: Type.Object({
       ids: Type.Array(Type.String(), { minItems: 1 }),
     }),
@@ -696,7 +697,7 @@ export default function orchestration(pi: ExtensionAPI) {
             text: tasks
               .map(
                 (task) =>
-                  `Cancelled ${task.id}; resource retained for inspection.`,
+                  `Cancelled ${task.id}; its resource will close automatically.`,
               )
               .join("\n"),
           },

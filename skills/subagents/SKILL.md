@@ -15,4 +15,4 @@ All child lifecycle, prompts, communication, inspection, and takeover go through
 - Durable agents and Treehouse leases use tabs. Panes are only for brief, directly relevant work.
 - A successful spawn means Herdr observed child activity after submitting the initial prompt; startup or delivery exhaustion is reported as a failed spawn instead of an empty running child.
 - Continue parent work after spawning. Use `subagent_wait` only when blocked; it ends the current parent turn, waits in the background, and automatically starts a new turn with one combined result after all requested children settle. Use `subagent_send` for follow-ups.
-- `/subagents` and the subagent tools inspect, focus, attach/take over, cancel, and report lease cleanup state.
+- `/subagents` and the subagent tools inspect, focus, attach/take over, cancel, and report lease cleanup state. Settled resources close automatically after the cleanup grace period; interaction postpones cleanup.
