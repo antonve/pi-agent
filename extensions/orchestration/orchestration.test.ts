@@ -122,6 +122,42 @@ test("completed background notifications collapse to one line", () => {
   assert.ok(renderedLines(expanded).includes("more output"));
 });
 
+test("completed subagent notifications collapse to one line", () => {
+  const message = {
+    role: "custom" as const,
+    customType: "herdr-task-result",
+    content: "subagent sa-123 “Review” done.\n\nagent output\nmore output",
+    display: true,
+    timestamp: Date.now(),
+    details: {
+      id: "sa-123",
+      kind: "subagent",
+      status: "done",
+      label: "Review",
+    },
+  };
+  const theme = {
+    fg: (_color: string, text: string) => text,
+  } as Theme;
+
+  const collapsed = renderHerdrTaskResult(
+    message,
+    { expanded: false, outputPad: 0 },
+    theme,
+  );
+  assert.ok(collapsed);
+  assert.deepEqual(renderedLines(collapsed), ["sa-123 done · Review"]);
+
+  const expanded = renderHerdrTaskResult(
+    message,
+    { expanded: true, outputPad: 0 },
+    theme,
+  );
+  assert.ok(expanded);
+  assert.ok(renderedLines(expanded).includes("agent output"));
+  assert.ok(renderedLines(expanded).includes("more output"));
+});
+
 test("collapsed subagent tools occupy one line and expand on demand", () => {
   const tools = registeredOrchestrationTools();
   const theme = {
