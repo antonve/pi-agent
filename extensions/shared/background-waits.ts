@@ -47,6 +47,10 @@ export class BackgroundWaitRegistry {
     return this.tasks.get(id);
   }
 
+  hasActiveWaits() {
+    return this.active.size > 0;
+  }
+
   start(ids: string[]) {
     const uniqueIds = [...new Set(ids)];
     const tasks = uniqueIds.map((id) => this.tasks.get(id));

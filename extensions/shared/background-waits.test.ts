@@ -140,6 +140,7 @@ test("background_wait yields immediately and injects combined settled output", a
   });
   registerBackgroundWaitTool(pi, registry);
 
+  assert.equal(registry.hasActiveWaits(), false);
   assert.deepEqual(renderers, ["background-wait-result"]);
   const tool = tools.get("background_wait");
   assert.ok(tool);
@@ -152,6 +153,7 @@ test("background_wait yields immediately and injects combined settled output", a
   );
 
   assert.equal(result.terminate, true);
+  assert.equal(registry.hasActiveWaits(), true);
   assert.equal(notifications.length, 0);
   first.resolve({ status: "done", output: "checks passed" });
   await new Promise((resolve) => setImmediate(resolve));
@@ -163,6 +165,7 @@ test("background_wait yields immediately and injects combined settled output", a
   });
   await new Promise((resolve) => setImmediate(resolve));
 
+  assert.equal(registry.hasActiveWaits(), false);
   assert.equal(notifications.length, 1);
   assert.deepEqual(notifications[0]?.options, {
     deliverAs: "followUp",

@@ -10,6 +10,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { registerAutoReload } from "./auto-reload.ts";
 import { nodeCliRunner } from "./cli.ts";
 import {
   HARNESSES,
@@ -303,6 +304,15 @@ export default function orchestration(pi: ExtensionAPI) {
       },
     },
   );
+  registerAutoReload(pi, {
+    hasActiveWait: () => backgroundWaits.hasActiveWaits(),
+    async hasRunningTasks(sessionId) {
+      const tasks = await manager.list(sessionId);
+      return tasks.some(
+        (task) => task.status === "running" || task.status === "starting",
+      );
+    },
+  });
 
   async function updateStatus() {
     if (!context?.hasUI) return;
