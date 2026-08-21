@@ -1,10 +1,24 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createEmptySession, nodeCommandRunner, runFree } from "./free.ts";
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("clear", {
     description: "Start a new session (alias for /new)",
     handler: async (_args, ctx) => {
       await ctx.newSession();
+    },
+  });
+
+  pi.registerCommand("free", {
+    description:
+      "Clear the chat, free a Treehouse lease, and rename the Herdr tab",
+    handler: async (_args, ctx) => {
+      await runFree(ctx, {
+        runner: nodeCommandRunner,
+        env: process.env,
+        createEmptySession,
+        chdir: (cwd) => process.chdir(cwd),
+      });
     },
   });
 
