@@ -1,5 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createEmptySession, nodeCommandRunner, runFree } from "./free.ts";
+import {
+  generateRandomTabName,
+  randomPitabAgentName,
+  runPitab,
+} from "./pitab.ts";
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("clear", {
@@ -19,6 +24,29 @@ export default function (pi: ExtensionAPI) {
         createEmptySession,
         chdir: (cwd) => process.chdir(cwd),
       });
+    },
+  });
+
+  pi.registerCommand("pitab", {
+    description: "Open Pi in a new Herdr tab for the same repository",
+    handler: async (args, ctx) => {
+      const generatingName = !args.trim();
+      if (generatingName) ctx.ui.setStatus("pitab", "Generating tab name…");
+      try {
+        await runPitab(args, ctx, {
+          runner: nodeCommandRunner,
+          env: process.env,
+          generateName: generateRandomTabName,
+          agentName: randomPitabAgentName,
+        });
+      } catch (error) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : String(error),
+          "error",
+        );
+      } finally {
+        if (generatingName) ctx.ui.setStatus("pitab", undefined);
+      }
     },
   });
 

@@ -21,7 +21,7 @@ export interface CommandRunner {
   run(
     command: string,
     args: readonly string[],
-    options?: { cwd?: string },
+    options?: { cwd?: string; timeoutMs?: number },
   ): Promise<CommandResult>;
 }
 
@@ -54,7 +54,7 @@ export const nodeCommandRunner: CommandRunner = {
       const result = await execFileAsync(command, [...args], {
         cwd: options.cwd,
         env: process.env,
-        timeout: 30_000,
+        timeout: options.timeoutMs ?? 30_000,
         maxBuffer: 4 * 1024 * 1024,
       });
       return { stdout: result.stdout, stderr: result.stderr, code: 0 };
