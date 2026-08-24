@@ -373,6 +373,10 @@ export class HerdrClient {
     return this.json(["workspace", "rename", workspaceId, label]);
   }
 
+  async renameTab(tabId: string, label: string) {
+    return this.json(["tab", "rename", tabId, label]);
+  }
+
   async moveWorkspace(
     workspaceId: string,
     insertIndex: number,
@@ -386,6 +390,10 @@ export class HerdrClient {
       },
       signal,
     );
+  }
+
+  async focusPane(paneId: string, signal?: AbortSignal) {
+    return this.socketJson("pane.focus", { pane_id: paneId }, signal);
   }
 
   async closeWorkspace(workspaceId: string) {

@@ -7,7 +7,12 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import type { CliRunner } from "./cli.ts";
-import { buildSecondMatePrompt, FleetManager } from "./fleet-manager.ts";
+import {
+  buildManagedLinearPlanCommentMarker,
+  buildSecondMatePrompt,
+  FleetManager,
+  parseLinearIssueReference,
+} from "./fleet-manager.ts";
 import { FleetStore } from "./fleet.ts";
 import {
   buildHeadlessScript,
@@ -232,6 +237,48 @@ test("leaf reports distinguish questions and capture harness sessions", () => {
   );
 });
 
+test("Linear issue references are parsed from identifiers and URLs", () => {
+  assert.equal(parseLinearIssueReference("ENG-123"), "ENG-123");
+  assert.equal(
+    parseLinearIssueReference(
+      "https://linear.app/acme/issue/ENG-123/keep-linear-sync-working",
+    ),
+    "ENG-123",
+  );
+  assert.equal(parseLinearIssueReference("not a Linear reference"), undefined);
+});
+
+test("second-mate prompts make Linear synchronization explicit", () => {
+  const marker = buildManagedLinearPlanCommentMarker({
+    id: "pi-agent-linear-sync",
+    linearIssue: "ENG-123",
+  });
+  const prompt = buildSecondMatePrompt({
+    id: "pi-agent-linear-sync",
+    title: "Keep Linear tickets synchronized",
+    brief: "Update the orchestration config.",
+    linearIssue: "ENG-123",
+    cwd: "/repo",
+    state: "assigned",
+    ownerSessionId: "first-mate-session",
+    createdAt: 0,
+    updatedAt: 0,
+    version: 1,
+    nextSequence: 1,
+  });
+  assert.match(prompt, /Before planning, read the issue with linear_get_issue/);
+  assert.match(prompt, /move the issue to the team’s started workflow state/);
+  assert.match(
+    prompt,
+    new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+  );
+  assert.match(prompt, /use linear_graphql to edit that same comment/);
+  assert.match(
+    prompt,
+    /Move the issue to completed only after verified success/,
+  );
+});
+
 test("second-mate prompts require verification and review-ready PR delivery", () => {
   const prompt = buildSecondMatePrompt({
     id: "TASK-1",
@@ -312,6 +359,16 @@ test("task assignment creates one Space with the second mate in its root tab", a
     const runner: CliRunner = {
       async run(_command, args) {
         calls.push([...args]);
+        if (args[0] === "workspace" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspace: { workspace_id: args[2], focused: true },
+              },
+            }),
+          };
         if (args[0] === "workspace" && args[1] === "create")
           return {
             code: 0,
@@ -373,11 +430,7 @@ test("task assignment creates one Space with the second mate in its root tab", a
               },
             }),
           };
-        return {
-          code: 0,
-          stderr: "",
-          stdout: JSON.stringify({ result: {} }),
-        };
+        return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
       },
     };
     const herdr = new HerdrClient(runner, {
@@ -428,9 +481,32 @@ test("task assignment creates one Space with the second mate in its root tab", a
     assert.equal(task.state, "assigned");
     assert.equal(task.workspaceId, "w-task");
     assert.equal(task.mateTabId, "w-task:t1");
+    assert.deepEqual(
+      calls
+        .find((args) => args[0] === "workspace" && args[1] === "create")
+        ?.slice(0, 6),
+      [
+        "workspace",
+        "create",
+        "--cwd",
+        "/repo",
+        "--label",
+        "TASK-1 Example task",
+      ],
+    );
     assert.equal(
       calls.some((args) => args[0] === "tab" && args[1] === "create"),
       false,
+    );
+    assert.equal(
+      calls.some(
+        (args) =>
+          args[0] === "tab" &&
+          args[1] === "rename" &&
+          args[2] === "w-task:t1" &&
+          args[3] === "secondmate",
+      ),
+      true,
     );
     assert.equal(
       (await store.messagesForTask(task.id))[0]?.type,
@@ -524,6 +600,24 @@ test("task assignment creates one Space with the second mate in its root tab", a
     assert.ok(
       calls.some(
         (args) =>
+          args[0] === "tab" &&
+          args[1] === "rename" &&
+          args[2] === "w-owner:t1" &&
+          args[3] === "firstmate",
+      ),
+    );
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === "tab" &&
+          args[1] === "rename" &&
+          args[2] === "w-replacement:t1" &&
+          args[3] === "firstmate",
+      ),
+    );
+    assert.ok(
+      calls.some(
+        (args) =>
           args[0] === "workspace" &&
           args[1] === "report-metadata" &&
           args[2] === "w-owner" &&
@@ -546,6 +640,569 @@ test("task assignment creates one Space with the second mate in its root tab", a
       [
         { workspace_id: "w-owner", insert_index: 0 },
         { workspace_id: "w-replacement", insert_index: 0 },
+      ],
+    );
+    assert.deepEqual(
+      requests
+        .filter((request) => request.method === "pane.focus")
+        .map((request) => request.params),
+      [
+        { pane_id: "w-owner:p1" },
+        { pane_id: "w-owner:p1" },
+        { pane_id: "w-replacement:p1" },
+      ],
+    );
+  });
+});
+
+test("task assignment does not steal focus when the first-mate workspace is not focused", async () => {
+  await withHerdrSocket(async (requests) => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-fleet-no-focus-"));
+    const calls: string[][] = [];
+    const runner: CliRunner = {
+      async run(_command, args) {
+        calls.push([...args]);
+        if (args[0] === "workspace" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspace: { workspace_id: args[2], focused: false },
+              },
+            }),
+          };
+        if (args[0] === "workspace" && args[1] === "create")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspace: { workspace_id: "w-task" },
+                tab: { tab_id: "w-task:t1" },
+                root_pane: { pane_id: "w-task:p1" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-task:p1",
+                agent_status: "idle",
+                agent: "pi",
+                name: "mate-task-1",
+                state_change_seq: 1,
+                interactive_ready: true,
+                launch_pending: false,
+                agent_session: { value: "mate-session" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "prompt")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-task:p1",
+                agent_status: "working",
+                agent: "pi",
+                name: "mate-task-1",
+                state_change_seq: 2,
+                interactive_ready: true,
+                launch_pending: false,
+              },
+            }),
+          };
+        return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+      },
+    };
+    const herdr = new HerdrClient(runner, {
+      promptReadyPollMs: 1,
+      promptReadyConsecutiveReads: 1,
+    });
+    const fleet = new FleetManager(
+      new FleetStore(join(directory, "fleet.json")),
+      herdr,
+      new OrchestrationManager(
+        herdr,
+        new TreehouseClient(runner),
+        new TaskRegistry(join(directory, "registry.json")),
+        { onComplete() {} },
+      ),
+    );
+    await fleet.claimFirstMate({
+      sessionId: "first-mate-session",
+      workspaceId: "w-owner",
+      tabId: "w-owner:t1",
+      paneId: "w-owner:p1",
+      cwd: "/repo",
+    });
+    requests.length = 0;
+    await fleet.assignTask({
+      id: "ENG-123",
+      title: "Keep Linear tickets synchronized",
+      brief: "Implement the sync flow.",
+      cwd: "/repo",
+      ownerSessionId: "first-mate-session",
+    });
+    assert.equal(
+      calls.some(
+        (args) =>
+          args[0] === "tab" &&
+          args[1] === "rename" &&
+          args[2] === "w-task:t1" &&
+          args[3] === "secondmate",
+      ),
+      true,
+    );
+    assert.deepEqual(
+      requests.filter((request) => request.method === "pane.focus"),
+      [],
+    );
+  });
+});
+
+test("task assignment failure closes the workspace and restores first-mate focus", async () => {
+  await withHerdrSocket(async (requests) => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-fleet-close-focus-"));
+    const calls: string[][] = [];
+    const runner: CliRunner = {
+      async run(_command, args) {
+        calls.push([...args]);
+        if (args[0] === "workspace" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspace: { workspace_id: args[2], focused: true },
+              },
+            }),
+          };
+        if (args[0] === "workspace" && args[1] === "create")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspace: { workspace_id: "w-task" },
+                tab: { tab_id: "w-task:t1" },
+                root_pane: { pane_id: "w-task:p1" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-task:p1",
+                agent_status: "idle",
+                agent: "pi",
+                name: "mate-task-1",
+                state_change_seq: 1,
+                interactive_ready: true,
+                launch_pending: false,
+                agent_session: { value: "mate-session" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "prompt")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-task:p1",
+                agent_status: "idle",
+                agent: "pi",
+                name: "mate-task-1",
+                state_change_seq: 1,
+                interactive_ready: true,
+                launch_pending: false,
+              },
+            }),
+          };
+        return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+      },
+    };
+    const herdr = new HerdrClient(runner, {
+      promptReadyPollMs: 1,
+      promptReadyConsecutiveReads: 1,
+      promptDeliveryAttempts: 2,
+      promptActivityTimeoutMs: 5,
+      promptLateActivityMs: 5,
+    });
+    const fleet = new FleetManager(
+      new FleetStore(join(directory, "fleet.json")),
+      herdr,
+      new OrchestrationManager(
+        herdr,
+        new TreehouseClient(runner),
+        new TaskRegistry(join(directory, "registry.json")),
+        { onComplete() {} },
+      ),
+    );
+    await fleet.claimFirstMate({
+      sessionId: "first-mate-session",
+      workspaceId: "w-owner",
+      tabId: "w-owner:t1",
+      paneId: "w-owner:p1",
+      cwd: "/repo",
+    });
+    requests.length = 0;
+    await assert.rejects(
+      () =>
+        fleet.assignTask({
+          id: "TASK-FAIL",
+          title: "Example task",
+          brief: "Implement the example",
+          cwd: "/repo",
+          ownerSessionId: "first-mate-session",
+        }),
+      /Initial prompt delivery/,
+    );
+    assert.equal(
+      calls.some(
+        (args) =>
+          args[0] === "workspace" &&
+          args[1] === "close" &&
+          args[2] === "w-task",
+      ),
+      true,
+    );
+    assert.deepEqual(
+      requests
+        .filter((request) => request.method === "pane.focus")
+        .map((request) => request.params),
+      [{ pane_id: "w-owner:p1" }],
+    );
+  });
+});
+
+test("task assignment propagates Linear sync metadata into the second-mate prompt", async () => {
+  await withHerdrSocket(async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-fleet-linear-sync-"));
+    const calls: string[][] = [];
+    const runner: CliRunner = {
+      async run(_command, args) {
+        calls.push([...args]);
+        if (args[0] === "workspace" && args[1] === "create")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspace: { workspace_id: "w-linear" },
+                tab: { tab_id: "w-linear:t1" },
+                root_pane: { pane_id: "w-linear:p1" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-linear:p1",
+                agent_status: "idle",
+                agent: "pi",
+                name: "mate-task-linear",
+                state_change_seq: 1,
+                interactive_ready: true,
+                launch_pending: false,
+                agent_session: { value: "mate-session" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "prompt")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-linear:p1",
+                agent_status: "working",
+                agent: "pi",
+                name: "mate-task-linear",
+                state_change_seq: 2,
+                interactive_ready: true,
+                launch_pending: false,
+              },
+            }),
+          };
+        return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+      },
+    };
+    const herdr = new HerdrClient(runner, {
+      promptReadyPollMs: 1,
+      promptReadyConsecutiveReads: 1,
+    });
+    const fleet = new FleetManager(
+      new FleetStore(join(directory, "fleet.json")),
+      herdr,
+      new OrchestrationManager(
+        herdr,
+        new TreehouseClient(runner),
+        new TaskRegistry(join(directory, "registry.json")),
+        { onComplete() {} },
+      ),
+    );
+    await fleet.claimFirstMate({
+      sessionId: "first-mate-session",
+      workspaceId: "w-owner",
+      tabId: "w-owner:t1",
+      paneId: "w-owner:p1",
+      cwd: "/repo",
+    });
+    const task = await fleet.assignTask({
+      id: "task-linear",
+      title: "Keep Linear tickets synchronized",
+      brief: "Implement the sync flow for ENG-123.",
+      linearIssue:
+        "https://linear.app/acme/issue/ENG-123/keep-linear-tickets-synchronized",
+      cwd: "/repo",
+      ownerSessionId: "first-mate-session",
+    });
+    assert.equal(task.linearIssue, "ENG-123");
+    assert.deepEqual(
+      calls
+        .find((args) => args[0] === "workspace" && args[1] === "create")
+        ?.slice(0, 6),
+      [
+        "workspace",
+        "create",
+        "--cwd",
+        "/repo",
+        "--label",
+        "ENG-123 Keep Linear tickets synchronized",
+      ],
+    );
+    assert.equal(
+      calls.some(
+        (args) =>
+          args[0] === "tab" &&
+          args[1] === "rename" &&
+          args[2] === "w-linear:t1" &&
+          args[3] === "secondmate",
+      ),
+      true,
+    );
+    const assignment = (await fleet.store.messagesForTask(task.id))[0];
+    assert.equal(assignment?.payload.linearIssue, "ENG-123");
+    const promptCall = calls.find(
+      (args) => args[0] === "agent" && args[1] === "prompt",
+    );
+    assert.ok(promptCall);
+    assert.match(promptCall[3]!, /Linear synchronization:/);
+    assert.match(
+      promptCall[3]!,
+      /<!-- pi-linear-sync task=task-linear issue=ENG-123 -->/,
+    );
+  });
+});
+
+test("workspace labels use the canonical Linear identifier resolved from the brief", async () => {
+  await withHerdrSocket(async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-fleet-linear-brief-"));
+    const calls: string[][] = [];
+    const runner: CliRunner = {
+      async run(_command, args) {
+        calls.push([...args]);
+        if (args[0] === "workspace" && args[1] === "create")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspace: { workspace_id: "w-brief" },
+                tab: { tab_id: "w-brief:t1" },
+                root_pane: { pane_id: "w-brief:p1" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-brief:p1",
+                agent_status: "idle",
+                agent: "pi",
+                name: "mate-task-brief",
+                state_change_seq: 1,
+                interactive_ready: true,
+                launch_pending: false,
+                agent_session: { value: "mate-session" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "prompt")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-brief:p1",
+                agent_status: "working",
+                agent: "pi",
+                name: "mate-task-brief",
+                state_change_seq: 2,
+                interactive_ready: true,
+                launch_pending: false,
+              },
+            }),
+          };
+        return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+      },
+    };
+    const herdr = new HerdrClient(runner, {
+      promptReadyPollMs: 1,
+      promptReadyConsecutiveReads: 1,
+    });
+    const fleet = new FleetManager(
+      new FleetStore(join(directory, "fleet.json")),
+      herdr,
+      new OrchestrationManager(
+        herdr,
+        new TreehouseClient(runner),
+        new TaskRegistry(join(directory, "registry.json")),
+        { onComplete() {} },
+      ),
+    );
+    await fleet.claimFirstMate({
+      sessionId: "first-mate-session",
+      workspaceId: "w-owner",
+      tabId: "w-owner:t1",
+      paneId: "w-owner:p1",
+      cwd: "/repo",
+    });
+    const task = await fleet.assignTask({
+      id: "task-brief",
+      title: "Implement the sync flow",
+      brief: "Handle follow-up work for ENG-456.",
+      cwd: "/repo",
+      ownerSessionId: "first-mate-session",
+    });
+    assert.equal(task.linearIssue, "ENG-456");
+    assert.deepEqual(
+      calls
+        .find((args) => args[0] === "workspace" && args[1] === "create")
+        ?.slice(0, 6),
+      [
+        "workspace",
+        "create",
+        "--cwd",
+        "/repo",
+        "--label",
+        "ENG-456 Implement the sync flow",
+      ],
+    );
+  });
+});
+
+test("workspace labels use the canonical Linear identifier resolved from task_id", async () => {
+  await withHerdrSocket(async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-fleet-linear-task-id-"));
+    const calls: string[][] = [];
+    const runner: CliRunner = {
+      async run(_command, args) {
+        calls.push([...args]);
+        if (args[0] === "workspace" && args[1] === "create")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspace: { workspace_id: "w-task-id" },
+                tab: { tab_id: "w-task-id:t1" },
+                root_pane: { pane_id: "w-task-id:p1" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-task-id:p1",
+                agent_status: "idle",
+                agent: "pi",
+                name: "mate-task-id",
+                state_change_seq: 1,
+                interactive_ready: true,
+                launch_pending: false,
+                agent_session: { value: "mate-session" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "prompt")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-task-id:p1",
+                agent_status: "working",
+                agent: "pi",
+                name: "mate-task-id",
+                state_change_seq: 2,
+                interactive_ready: true,
+                launch_pending: false,
+              },
+            }),
+          };
+        return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+      },
+    };
+    const herdr = new HerdrClient(runner, {
+      promptReadyPollMs: 1,
+      promptReadyConsecutiveReads: 1,
+    });
+    const fleet = new FleetManager(
+      new FleetStore(join(directory, "fleet.json")),
+      herdr,
+      new OrchestrationManager(
+        herdr,
+        new TreehouseClient(runner),
+        new TaskRegistry(join(directory, "registry.json")),
+        { onComplete() {} },
+      ),
+    );
+    await fleet.claimFirstMate({
+      sessionId: "first-mate-session",
+      workspaceId: "w-owner",
+      tabId: "w-owner:t1",
+      paneId: "w-owner:p1",
+      cwd: "/repo",
+    });
+    const task = await fleet.assignTask({
+      id: "ENG-789",
+      title: "Implement the sync flow",
+      brief: "Handle follow-up work.",
+      cwd: "/repo",
+      ownerSessionId: "first-mate-session",
+    });
+    assert.equal(task.linearIssue, "ENG-789");
+    assert.deepEqual(
+      calls
+        .find((args) => args[0] === "workspace" && args[1] === "create")
+        ?.slice(0, 6),
+      [
+        "workspace",
+        "create",
+        "--cwd",
+        "/repo",
+        "--label",
+        "ENG-789 Implement the sync flow",
       ],
     );
   });

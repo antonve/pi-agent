@@ -30,12 +30,17 @@ export interface AssignTaskOptions {
   id: string;
   title: string;
   brief: string;
+  linearIssue?: string;
   cwd: string;
   ownerSessionId: string;
   ownerPaneId?: string;
   model?: string;
   reasoning?: ReasoningLevel;
 }
+
+const LINEAR_ISSUE_IDENTIFIER = /\b([A-Z][A-Z0-9]+-\d+)\b/;
+const LINEAR_ISSUE_URL =
+  /\bhttps:\/\/(?:app\.)?linear\.app\/[^\s/]+\/issue\/([A-Z][A-Z0-9]+-\d+)(?:\b|\/[^\s]*)/i;
 
 function cleanTitle(title: string) {
   return title.replace(/\s+/g, " ").trim().slice(0, 80) || "task";
@@ -69,13 +74,71 @@ function mateAgentName(taskId: string) {
   return `mate-${clean || randomUUID().slice(0, 8)}`;
 }
 
+export function parseLinearIssueReference(value: string) {
+  const urlMatch = value.match(LINEAR_ISSUE_URL);
+  if (urlMatch?.[1]) return urlMatch[1].toUpperCase();
+  const identifierMatch = value.match(LINEAR_ISSUE_IDENTIFIER);
+  if (identifierMatch?.[1]) return identifierMatch[1].toUpperCase();
+  return undefined;
+}
+
+function resolveLinearIssueReference(options: {
+  linearIssue?: string;
+  taskId?: string;
+  title: string;
+  brief: string;
+}) {
+  if (options.linearIssue) {
+    const explicit = parseLinearIssueReference(options.linearIssue.trim());
+    if (!explicit)
+      throw new Error(
+        `Linear issue must be an identifier like ENG-123 or a Linear issue URL; received ${options.linearIssue}.`,
+      );
+    return explicit;
+  }
+  return parseLinearIssueReference(
+    `${options.taskId ?? ""}\n${options.title}\n${options.brief}`,
+  );
+}
+
+export function buildManagedLinearPlanCommentMarker(
+  task: Pick<FleetTask, "id" | "linearIssue">,
+) {
+  if (!task.linearIssue)
+    throw new Error("Managed Linear plan comments require a Linear issue.");
+  return `<!-- pi-linear-sync task=${task.id} issue=${task.linearIssue} -->`;
+}
+
+function buildWorkspaceLabel(
+  task: Pick<FleetTask, "id" | "title" | "linearIssue">,
+) {
+  return `${task.linearIssue ?? task.id} ${task.title}`;
+}
+
+function buildLinearSyncPrompt(task: FleetTask) {
+  if (!task.linearIssue) return "";
+  return `
+
+Linear synchronization:
+- This task is linked to Linear issue ${task.linearIssue}.
+- Before planning, read the issue with linear_get_issue.
+- When work begins, move the issue to the team’s started workflow state.
+- Preserve the issue description and any human-authored content.
+- Maintain exactly one managed living-plan comment whose first line is ${buildManagedLinearPlanCommentMarker(task)}.
+- If that managed comment already exists, update it instead of creating another; create it once with linear_add_comment, then use linear_graphql to edit that same comment when the plan or checkbox progress changes.
+- Add concise material decisions, blockers, and outcome context to that same managed comment.
+- Prefer linear_get_issue, linear_list_resources, linear_update_issue, and linear_add_comment; use linear_graphql only as the fallback for editing the managed comment.
+- Leave blocked or failed work open with an explanatory update.
+- Move the issue to completed only after verified success and immediately before complete_task.`;
+}
+
 export function buildSecondMatePrompt(task: FleetTask) {
   return `You are the second mate responsible for exactly one task.
 
 Task: ${task.id} — ${task.title}
 Working directory: ${task.cwd}
 
-${task.brief.trim()}
+${task.brief.trim()}${buildLinearSyncPrompt(task)}
 
 Ownership rules:
 - Own this task through planning, delegation, verification, and final reporting.
@@ -114,6 +177,28 @@ export class FleetManager {
     this.orchestration = orchestration;
   }
 
+  private async preserveFocus<T>(
+    owner:
+      | {
+          workspaceId: string;
+          paneId: string;
+        }
+      | undefined,
+    operation: () => Promise<T>,
+  ) {
+    const shouldRestore = owner
+      ? await this.herdr
+          .workspaceIsFocused(owner.workspaceId)
+          .catch(() => false)
+      : false;
+    try {
+      return await operation();
+    } finally {
+      if (shouldRestore && owner)
+        await this.herdr.focusPane(owner.paneId).catch(() => undefined);
+    }
+  }
+
   async claimFirstMate(options: {
     sessionId: string;
     workspaceId: string;
@@ -139,10 +224,16 @@ export class FleetManager {
       paneId: options.paneId,
       expectedSessionId: current?.sessionId,
     });
-    await this.herdr.renameWorkspace(lease.workspaceId, "firstmate");
-    await this.herdr.moveWorkspace(lease.workspaceId, 0);
-    await this.publishFirstMateMetadata(lease.workspaceId, options.cwd);
-    await this.refreshMetadata();
+    await this.preserveFocus(
+      { workspaceId: options.workspaceId, paneId: options.paneId },
+      async () => {
+        await this.herdr.renameWorkspace(lease.workspaceId, "firstmate");
+        await this.herdr.renameTab(lease.tabId, "firstmate");
+        await this.herdr.moveWorkspace(lease.workspaceId, 0);
+        await this.publishFirstMateMetadata(lease.workspaceId, options.cwd);
+        await this.refreshMetadata();
+      },
+    );
     return lease;
   }
 
@@ -175,18 +266,25 @@ export class FleetManager {
   }
 
   async assignTask(options: AssignTaskOptions) {
-    await this.requireFirstMate(options.ownerSessionId);
+    const lease = await this.requireFirstMate(options.ownerSessionId);
     if (!TASK_ID.test(options.id))
       throw new Error(
         "Task ID must start with a letter or number and contain at most 64 letters, numbers, dots, underscores, or hyphens.",
       );
     const title = cleanTitle(options.title);
+    const linearIssue = resolveLinearIssueReference({
+      taskId: options.id,
+      linearIssue: options.linearIssue,
+      title: options.title,
+      brief: options.brief,
+    });
     const cwd = resolve(options.cwd);
     const repoBasename = await repositoryBasename(cwd);
     let task = await this.store.createTask({
       id: options.id,
       title,
       brief: options.brief.trim(),
+      linearIssue,
       cwd,
       repoBasename,
       state: "assigning",
@@ -194,69 +292,79 @@ export class FleetManager {
       ownerPaneId: options.ownerPaneId,
     });
     let workspaceId: string | undefined;
-    try {
-      const workspace = await this.herdr.createTaskWorkspace(
-        cwd,
-        `${task.id} ${title}`,
-        {
-          PI_FIRST_MATE_ROLE: "second-mate",
-          PI_FIRST_MATE_TASK_ID: task.id,
-          PI_FIRST_MATE_OWNER_SESSION_ID: options.ownerSessionId,
-        },
-      );
-      workspaceId = workspace.workspaceId;
-      const agentName = mateAgentName(task.id);
-      task = await this.store.updateTask(task.id, {
-        workspaceId: workspace.workspaceId,
-        mateTabId: workspace.tabId,
-        matePaneId: workspace.paneId,
-        mateAgentName: agentName,
-      });
-      await this.publishMetadata(task);
-      const assignment = await this.store.enqueue({
-        taskId: task.id,
-        type: "TASK_ASSIGNED",
-        fromSessionId: options.ownerSessionId,
-        toTaskMate: true,
-        payload: {
-          title: task.title,
-          brief: task.brief,
-          cwd: task.cwd,
-        },
-      });
-      const args = [
-        "--session-id",
-        randomUUID(),
-        "--name",
-        `${task.id} second mate`,
-        ...(options.model ? ["--model", options.model] : []),
-        ...(options.reasoning ? ["--thinking", options.reasoning] : []),
-        "--exclude-tools",
-        "first_mate_claim,first_mate_status,task_assign,task_list,task_send,task_cancel,mate_register,workflow",
-      ];
-      await this.herdr.startAgent(agentName, "pi", workspace.paneId, args);
-      await this.herdr.deliverInitialPrompt({
-        name: agentName,
-        harness: "pi",
-        paneId: workspace.paneId,
-        launchArgs: args,
-        prompt: `${buildSecondMatePrompt(task)}\n\nAssignment envelope: ${assignment.id}`,
-      });
-      const registered = await this.store.getTask(task.id);
-      task = await this.store.updateTask(task.id, {
-        state: registered?.mateSessionId ? "active" : "assigned",
-      });
-      await this.publishMetadata(task);
-      return task;
-    } catch (error) {
-      task = await this.store.updateTask(task.id, {
-        state: "failed",
-        error: error instanceof Error ? error.message : String(error),
-      });
-      if (workspaceId)
-        await this.herdr.closeWorkspace(workspaceId).catch(() => undefined);
-      throw error;
-    }
+    return this.preserveFocus(
+      {
+        workspaceId: lease.workspaceId,
+        paneId: options.ownerPaneId ?? lease.paneId,
+      },
+      async () => {
+        try {
+          const workspace = await this.herdr.createTaskWorkspace(
+            cwd,
+            buildWorkspaceLabel(task),
+            {
+              PI_FIRST_MATE_ROLE: "second-mate",
+              PI_FIRST_MATE_TASK_ID: task.id,
+              PI_FIRST_MATE_OWNER_SESSION_ID: options.ownerSessionId,
+            },
+          );
+          workspaceId = workspace.workspaceId;
+          await this.herdr.renameTab(workspace.tabId, "secondmate");
+          const agentName = mateAgentName(task.id);
+          task = await this.store.updateTask(task.id, {
+            workspaceId: workspace.workspaceId,
+            mateTabId: workspace.tabId,
+            matePaneId: workspace.paneId,
+            mateAgentName: agentName,
+          });
+          await this.publishMetadata(task);
+          const assignment = await this.store.enqueue({
+            taskId: task.id,
+            type: "TASK_ASSIGNED",
+            fromSessionId: options.ownerSessionId,
+            toTaskMate: true,
+            payload: {
+              title: task.title,
+              brief: task.brief,
+              linearIssue: task.linearIssue,
+              cwd: task.cwd,
+            },
+          });
+          const args = [
+            "--session-id",
+            randomUUID(),
+            "--name",
+            `${task.id} second mate`,
+            ...(options.model ? ["--model", options.model] : []),
+            ...(options.reasoning ? ["--thinking", options.reasoning] : []),
+            "--exclude-tools",
+            "first_mate_claim,first_mate_status,task_assign,task_list,task_send,task_cancel,mate_register,workflow",
+          ];
+          await this.herdr.startAgent(agentName, "pi", workspace.paneId, args);
+          await this.herdr.deliverInitialPrompt({
+            name: agentName,
+            harness: "pi",
+            paneId: workspace.paneId,
+            launchArgs: args,
+            prompt: `${buildSecondMatePrompt(task)}\n\nAssignment envelope: ${assignment.id}`,
+          });
+          const registered = await this.store.getTask(task.id);
+          task = await this.store.updateTask(task.id, {
+            state: registered?.mateSessionId ? "active" : "assigned",
+          });
+          await this.publishMetadata(task);
+          return task;
+        } catch (error) {
+          task = await this.store.updateTask(task.id, {
+            state: "failed",
+            error: error instanceof Error ? error.message : String(error),
+          });
+          if (workspaceId)
+            await this.herdr.closeWorkspace(workspaceId).catch(() => undefined);
+          throw error;
+        }
+      },
+    );
   }
 
   async registerMate(options: {
@@ -314,6 +422,7 @@ export class FleetManager {
     taskId: string;
     title: string;
     brief: string;
+    linearIssue?: string;
     cwd: string;
     ownerSessionId: string;
     mateSessionId: string;
@@ -336,6 +445,12 @@ export class FleetManager {
       id: options.taskId,
       title: cleanTitle(options.title),
       brief: options.brief.trim(),
+      linearIssue: resolveLinearIssueReference({
+        taskId: options.taskId,
+        linearIssue: options.linearIssue,
+        title: options.title,
+        brief: options.brief,
+      }),
       cwd,
       repoBasename: await repositoryBasename(cwd),
       state: "active",
@@ -347,7 +462,7 @@ export class FleetManager {
     });
     await this.herdr.renameWorkspace(
       options.workspaceId,
-      `${task.id} ${task.title}`,
+      buildWorkspaceLabel(task),
     );
     await this.publishMetadata(task);
     await this.store.enqueue({

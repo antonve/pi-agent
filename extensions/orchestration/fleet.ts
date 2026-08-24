@@ -58,6 +58,7 @@ export interface FleetTask {
   id: string;
   title: string;
   brief: string;
+  linearIssue?: string;
   cwd: string;
   repoBasename?: string;
   state: FleetTaskState;

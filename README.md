@@ -1,6 +1,6 @@
 # Managed Pi setup
 
-This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. It includes the upstream-inspired dashboard, ask-user, copy-all, system `fd`/`rg`, Git/model state, automatic summaries for multi-turn conversations, and Herdr/Treehouse orchestration. Firecrawl is intentionally excluded.
+This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. It includes the upstream-inspired dashboard, ask-user, copy-all, system `fd`/`rg`, Git/model state, and Herdr/Treehouse orchestration. The run recap extension remains available for explicit opt-in use. Firecrawl is intentionally excluded.
 
 ## Operations
 
@@ -9,12 +9,13 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 - `/ps` — list and interact with tracked background commands.
 - `/subagents` — list, inspect, focus, prompt, interrupt, close, or attach to children.
 - `/workflows` — list workflow run artifacts.
-- `/summary-model` — store a private summary-model override under `~/.config/pi-herdr`.
+- To opt into run recaps, load `./extensions/summaries/index.ts` explicitly; that also provides `/summary-model` for storing a private summary-model override under `~/.config/pi-herdr`.
 - `/firstmate status` inspects the machine-wide singleton first mate; `/firstmate claim` explicitly claims it or reclaims it from a dead owner.
 - Claimed first-mate turns stay supervisory: new repo-changing work must be delegated with `task_assign` before direct investigation or edits.
 - `first_mate_claim` and `first_mate_status` expose the same lifecycle to the model.
 - First-mate tools create one Herdr Space per task, with a persistent Pi second mate in the first tab and active headless leaves in later tabs.
 - `task_assign`, `task_list`, `task_send`, and `task_cancel` manage the durable task portfolio after the role is claimed.
+- `task_assign` and `mate_register` accept `linear_issue`; linked second mates then read the issue before planning, keep one managed living-plan comment updated, move the issue to started when work begins, and complete it only after verified success.
 - `mate_register`, `raise_decision`, `complete_task`, and `fail_task` support task-scoped second mates, including independently opened Pi sessions.
 - Linear tools cover routine issue search/read/create/update/comment workflows, with unrestricted GraphQL as a fallback. Set `LINEAR_API_KEY` in `~/.config/agentbox/secrets.env`.
 - `github-dark-default` and warm yellow-orange `gruvbox-dark` themes are included.
