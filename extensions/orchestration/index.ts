@@ -23,7 +23,7 @@ import {
   type TaskRecord,
 } from "./domain.ts";
 import { FleetManager, formatFleetMessage } from "./fleet-manager.ts";
-import { FleetStore } from "./fleet.ts";
+import { FleetStore, type FleetMessage } from "./fleet.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import { OrchestrationManager } from "./manager.ts";
 import { compileFleetReports } from "./report-compiler.ts";
@@ -62,6 +62,16 @@ function renderResultText(result: AgentToolResult<unknown>, theme: Theme) {
   );
 }
 
+function renderDetailedResult(result: AgentToolResult<unknown>, theme: Theme) {
+  const content = result.content.find((block) => block.type === "text");
+  const text = content?.type === "text" ? content.text : "";
+  const details =
+    result.details === undefined
+      ? ""
+      : theme.fg("muted", JSON.stringify(result.details, null, 2));
+  return new Text([text, details].filter(Boolean).join("\n"), 0, 0);
+}
+
 function compactSubagentRendering<TArgs>(summary: (args: TArgs) => string) {
   return {
     renderShell: "self" as const,
@@ -96,6 +106,42 @@ function compactSubagentRendering<TArgs>(summary: (args: TArgs) => string) {
   };
 }
 
+function compactFirstMateControlRendering<TArgs>(
+  summary: (args: TArgs) => string,
+) {
+  return {
+    renderShell: "self" as const,
+    renderCall(
+      args: TArgs,
+      theme: Theme,
+      context: { expanded: boolean; isError: boolean },
+    ) {
+      const title = theme.fg("toolTitle", theme.bold(summary(args)));
+      if (!context.expanded && !context.isError) return new Text(title, 0, 0);
+      return new Text(
+        `${title}\n${theme.fg("muted", JSON.stringify(args, null, 2))}`,
+        0,
+        0,
+      );
+    },
+    renderResult(
+      result: AgentToolResult<unknown>,
+      options: ToolRenderResultOptions,
+      theme: Theme,
+      context: { isError: boolean },
+    ) {
+      return shouldRenderToolPart(
+        "compact",
+        "result",
+        options.expanded,
+        context.isError,
+      )
+        ? renderDetailedResult(result, theme)
+        : new Container();
+    },
+  };
+}
+
 function describe(task: TaskRecord) {
   const lease = task.lease
     ? ` · lease ${task.lease.leaseId.slice(0, 8)} (${task.lease.returnState})`
@@ -105,6 +151,64 @@ function describe(task: TaskRecord) {
     : "";
   return `${task.id} [${task.status}] ${task.label}${agent} · ${task.placement} · ${task.cwd}${lease}`;
 }
+
+const FIRST_MATE_CONTROL_WARNING_TYPES = new Set<FleetMessage["type"]>([
+  "DECISION_REQUEST",
+  "MATERIAL_RISK",
+  "TASK_BLOCKED",
+  "CANCEL",
+]);
+
+function firstMateControlSummary(message: FleetMessage, theme: Theme) {
+  const label = message.type.toLowerCase().replaceAll("_", " ");
+  const payload = message.payload;
+  const detail = [
+    typeof payload.summary === "string" ? payload.summary : undefined,
+    typeof payload.message === "string" ? payload.message : undefined,
+    typeof payload.error === "string" ? payload.error : undefined,
+    typeof payload.question === "string" ? payload.question : undefined,
+    typeof payload.reason === "string" ? payload.reason : undefined,
+  ]
+    .find((value) => value && value.trim())
+    ?.replace(/\s+/g, " ")
+    .trim();
+  const color =
+    message.type === "TASK_FAILED"
+      ? "error"
+      : message.type === "TASK_COMPLETED"
+        ? "success"
+        : FIRST_MATE_CONTROL_WARNING_TYPES.has(message.type)
+          ? "warning"
+          : "accent";
+  return (
+    theme.fg(color, `${message.taskId} ${label}`) +
+    (detail ? theme.fg("muted", ` · ${detail}`) : "")
+  );
+}
+
+export const renderFirstMateControlMessage: MessageRenderer = (
+  message,
+  options,
+  theme,
+) => {
+  const details = (message.details ?? {}) as Partial<FleetMessage>;
+  if (
+    typeof details.taskId !== "string" ||
+    typeof details.type !== "string" ||
+    !details.payload ||
+    typeof details.payload !== "object"
+  )
+    return new Text(
+      typeof message.content === "string" ? message.content : "",
+      0,
+      0,
+    );
+  const fleetMessage = details as FleetMessage;
+  const summary = firstMateControlSummary(fleetMessage, theme);
+  if (!options.expanded) return new Text(summary, 0, 0);
+  const content = typeof message.content === "string" ? message.content : "";
+  return new Text(`${summary}\n${content}`, 0, 0);
+};
 
 export const renderHerdrTaskResult: MessageRenderer = (
   message,
@@ -550,6 +654,10 @@ export default function orchestration(pi: ExtensionAPI) {
     if (ctx.hasUI) ctx.ui.setStatus("herdr-orchestration", undefined);
   });
 
+  pi.registerMessageRenderer(
+    "first-mate-control",
+    renderFirstMateControlMessage,
+  );
   pi.registerMessageRenderer("herdr-task-result", renderHerdrTaskResult);
 
   pi.registerTool({
@@ -570,7 +678,7 @@ export default function orchestration(pi: ExtensionAPI) {
         details: { lease, tasks },
       };
     },
-    ...compactSubagentRendering(() => "first mate claim"),
+    ...compactFirstMateControlRendering(() => "first mate claim"),
   });
 
   pi.registerTool({
@@ -593,7 +701,7 @@ export default function orchestration(pi: ExtensionAPI) {
         details: status,
       };
     },
-    ...compactSubagentRendering(() => "first mate status"),
+    ...compactFirstMateControlRendering(() => "first mate status"),
   });
 
   pi.registerTool({
@@ -634,7 +742,7 @@ export default function orchestration(pi: ExtensionAPI) {
         details: task,
       };
     },
-    ...compactSubagentRendering(
+    ...compactFirstMateControlRendering(
       (args: { task_id: string; title: string }) =>
         `task assign ${args.task_id} ${args.title}`,
     ),
@@ -669,7 +777,7 @@ export default function orchestration(pi: ExtensionAPI) {
         details: { tasks },
       };
     },
-    ...compactSubagentRendering(() => "tasks"),
+    ...compactFirstMateControlRendering(() => "task list"),
   });
 
   pi.registerTool({
@@ -699,7 +807,7 @@ export default function orchestration(pi: ExtensionAPI) {
         details: message,
       };
     },
-    ...compactSubagentRendering(
+    ...compactFirstMateControlRendering(
       (args: { task_id: string; type: string }) =>
         `task send ${args.task_id} ${args.type}`,
     ),
@@ -731,7 +839,7 @@ export default function orchestration(pi: ExtensionAPI) {
         details: message,
       };
     },
-    ...compactSubagentRendering(
+    ...compactFirstMateControlRendering(
       (args: { task_id: string }) => `task cancel ${args.task_id}`,
     ),
   });

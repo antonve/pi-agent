@@ -27,6 +27,7 @@ import orchestration, {
   deliverTaskCompletion,
   registerSubagentWait,
   registerWaitableSubagent,
+  renderFirstMateControlMessage,
   renderHerdrTaskResult,
 } from "./index.ts";
 import {
@@ -299,6 +300,80 @@ test("grouped waits suppress individual completion notifications", () => {
   assert.equal(notifications.length, 1);
 });
 
+test("collapsed first-mate control tools occupy one line and expand on demand", () => {
+  const tools = registeredOrchestrationTools();
+  const theme = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  } as Theme;
+  const cases: Array<[string, object, string]> = [
+    ["first_mate_claim", {}, "first mate claim"],
+    ["first_mate_status", {}, "first mate status"],
+    [
+      "task_assign",
+      { task_id: "task-1", title: "Review UI", brief: "Do the work" },
+      "task assign task-1 Review UI",
+    ],
+    ["task_list", {}, "task list"],
+    [
+      "task_send",
+      { task_id: "task-1", type: "SCOPE_UPDATE", message: "Narrow scope" },
+      "task send task-1 SCOPE_UPDATE",
+    ],
+    [
+      "task_cancel",
+      { task_id: "task-1", reason: "No longer needed" },
+      "task cancel task-1",
+    ],
+  ];
+  const collapsed = {
+    expanded: false,
+    isError: false,
+  } as never;
+  const expanded = { expanded: true, isError: false } as never;
+  const result = {
+    content: [{ type: "text" as const, text: "Detailed tool result" }],
+    details: { ok: true },
+  };
+
+  for (const [name, args, expected] of cases) {
+    const tool = tools.get(name);
+    assert.ok(tool?.renderCall, `${name} should render its call`);
+    assert.ok(tool.renderResult, `${name} should render its result`);
+    assert.equal(tool.renderShell, "self");
+    assert.deepEqual(
+      renderedLines(tool.renderCall(args as never, theme, collapsed)),
+      [expected],
+    );
+    assert.deepEqual(
+      renderedLines(
+        tool.renderResult(
+          result,
+          { expanded: false, isPartial: false },
+          theme,
+          collapsed,
+        ),
+      ),
+      [],
+    );
+    assert.ok(
+      renderedLines(tool.renderCall(args as never, theme, expanded)).some(
+        (line) => line.includes("{") || line.includes('"task_id"'),
+      ),
+    );
+    const expandedLines = renderedLines(
+      tool.renderResult(
+        result,
+        { expanded: true, isPartial: false },
+        theme,
+        expanded,
+      ),
+    );
+    assert.ok(expandedLines.includes("Detailed tool result"));
+    assert.ok(expandedLines.some((line) => line.includes('"ok": true')));
+  }
+});
+
 test("collapsed subagent tools occupy one line and expand on demand", () => {
   const tools = registeredOrchestrationTools();
   assert.equal(tools.has("background_wait"), true);
@@ -387,6 +462,67 @@ test("collapsed subagent tools occupy one line and expand on demand", () => {
       ),
     ).includes("Detailed tool result"),
   );
+});
+
+test("first-mate control messages collapse to concise headers", () => {
+  const theme = {
+    fg: (_color: string, text: string) => text,
+  } as Theme;
+
+  const routineMessage = {
+    role: "custom" as const,
+    customType: "first-mate-control",
+    content: `[First-mate control message fm-1]\nTask: task-1\nType: SCOPE_UPDATE\nSequence: 3\nPayload:\n{\n  \"message\": \"Narrow scope\"\n}`,
+    display: true,
+    timestamp: Date.now(),
+    details: {
+      id: "fm-1",
+      taskId: "task-1",
+      type: "SCOPE_UPDATE",
+      sequence: 3,
+      payload: { message: "Narrow scope" },
+    },
+  };
+  const collapsedRoutine = renderFirstMateControlMessage(
+    routineMessage,
+    { expanded: false, outputPad: 0 },
+    theme,
+  );
+  assert.ok(collapsedRoutine);
+  assert.deepEqual(renderedLines(collapsedRoutine), [
+    "task-1 scope update · Narrow scope",
+  ]);
+
+  const expandedRoutineComponent = renderFirstMateControlMessage(
+    routineMessage,
+    { expanded: true, outputPad: 0 },
+    theme,
+  );
+  assert.ok(expandedRoutineComponent);
+  const expandedRoutine = renderedLines(expandedRoutineComponent);
+  assert.ok(expandedRoutine.includes("[First-mate control message fm-1]"));
+  assert.ok(expandedRoutine.includes("Payload:"));
+
+  const outcomeMessage = {
+    ...routineMessage,
+    content: `[First-mate control message fm-2]\nTask: task-1\nType: TASK_COMPLETED\nSequence: 4\nPayload:\n{\n  \"summary\": \"Collapsed rendering updated\"\n}`,
+    details: {
+      ...routineMessage.details,
+      id: "fm-2",
+      type: "TASK_COMPLETED",
+      sequence: 4,
+      payload: { summary: "Collapsed rendering updated" },
+    },
+  };
+  const collapsedOutcome = renderFirstMateControlMessage(
+    outcomeMessage,
+    { expanded: false, outputPad: 0 },
+    theme,
+  );
+  assert.ok(collapsedOutcome);
+  assert.deepEqual(renderedLines(collapsedOutcome), [
+    "task-1 task completed · Collapsed rendering updated",
+  ]);
 });
 
 test("auto isolation is conservative", () => {
