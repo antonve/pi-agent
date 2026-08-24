@@ -7,10 +7,12 @@ description: Delegate self-contained work to headless Pi, Claude Code, Codex, or
 
 All leaf lifecycle, prompts, follow-ups, output, cancellation, and cleanup go through the orchestration tools. Leaves cannot recursively call subagent, workflow, first-mate, or Herdr-control tools.
 
-- Choose `pi`, `claude`, `codex`, or `opencode` deliberately.
-- Pi inherits the parent model/reasoning by default. Grok runs through Pi with high reasoning; never silently route Grok through OpenCode.
-- Claude defaults to latest Fable at high reasoning. Codex defaults to `gpt-5.6-sol` at high reasoning. OpenCode uses its configured default unless overridden.
-- Give a complete standalone prompt with paths, constraints, and expected structured output.
+- Set `role` deliberately: `implementation` (default), `data-processing`, or `review`.
+- Implementation uses direct `openai-codex/gpt-5.6-sol` at high/xhigh/max (high preferred), `openrouter/x-ai/grok-4.6` through Pi at high, or exact `claude-fable-5` through Claude Code at high/xhigh/max.
+- Data processing uses direct `openai-codex/gpt-5.6-luna` at high/xhigh or `openrouter/deepseek/deepseek-v4-flash-0731` through Pi at high.
+- Fable never runs through Pi/OpenRouter, direct GPT-5.6 never runs through OpenRouter, and OpenCode has no approved orchestration route.
+- Review workers require `review_target_model` and a different model family. Default primary review is Sol↔Fable; highly reliable work also gets a Grok 4.6 secondary review so all three families participate.
+- Give a complete standalone prompt with paths, narrow scope, acceptance criteria, and expected structured output. Actively monitor leaves and redirect or cancel scope drift.
 - Mutation-capable tasks use `isolation: auto` or `treehouse`; read-only review may use `shared`. When uncertain, isolate.
 - Every leaf gets a tab in its owning task workspace. The harness runs headlessly with the initial prompt supplied during process startup; never create an empty interactive TUI or simulate Enter.
 - A successful spawn means structured process activity was observed. Startup without activity is bounded and fails instead of leaving an empty worker.

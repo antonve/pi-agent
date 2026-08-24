@@ -3,6 +3,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { Data, Effect } from "effect";
 import type { SummaryConfig } from "./config.ts";
 import { buildSummaryPrompt, SUMMARY_SYSTEM_PROMPT } from "./prompt.ts";
+import { resolveSummaryPolicy } from "../../shared/model-policy.ts";
 
 const RECAP_MAX_LENGTH = 2_400;
 const NEXT_MAX_LENGTH = 400;
@@ -100,15 +101,13 @@ export function summarizeRun(options: {
   readonly transcript: string;
   readonly signal: AbortSignal;
 }) {
+  const config = resolveSummaryPolicy(options.config);
   const completion = Effect.tryPromise({
     try: async (effectSignal) => {
-      const model = options.modelRegistry.find(
-        options.config.provider,
-        options.config.model,
-      );
+      const model = options.modelRegistry.find(config.provider, config.model);
       if (!model) {
         throw new SummaryError({
-          message: `Summary model is unavailable: ${options.config.provider}/${options.config.model}`,
+          message: `Summary model is unavailable: ${config.provider}/${config.model}`,
         });
       }
 
@@ -135,7 +134,7 @@ export function summarizeRun(options: {
           maxRetries: 1,
           signal: effectSignal,
           timeoutMs: 40_000,
-          ...reasoningOptions(options.config.reasoning),
+          ...reasoningOptions(config.reasoning),
         },
       );
 

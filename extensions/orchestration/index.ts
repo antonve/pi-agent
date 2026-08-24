@@ -38,6 +38,13 @@ import {
   type BackgroundWaitExecutor,
 } from "../shared/background-waits.ts";
 import { shouldRenderToolPart } from "../shared/calm-tool-output.ts";
+import {
+  FIRST_MATE_DEFAULT,
+  resolveSecondMatePolicy,
+  resolveWorkerPolicy,
+  WORKER_ROLES,
+  type WorkerRole,
+} from "../shared/model-policy.ts";
 
 const FIRST_MATE_MESSAGE_TYPES = [
   "DECISION_RESPONSE",
@@ -253,31 +260,11 @@ async function resolvePiModel(
   requested: string | undefined,
 ) {
   if (!requested) return undefined;
-  const models = ctx.modelRegistry.getAll();
-  let candidates =
-    requested.toLowerCase() === "grok"
-      ? models.filter((model) =>
-          /grok|xai/i.test(`${model.provider}/${model.id}`),
-        )
-      : models.filter(
-          (model) =>
-            `${model.provider}/${model.id}` === requested ||
-            model.id === requested,
-        );
-  if (candidates.length === 0) {
-    const detail = requested.toLowerCase().includes("grok")
-      ? "No Grok model is configured in Pi."
-      : `Pi model is unavailable: ${requested}`;
-    throw new Error(detail);
-  }
-  if (
-    candidates.length > 1 &&
-    requested.toLowerCase() !== "grok" &&
-    !requested.includes("/")
-  )
-    throw new Error(
-      `Pi model id is ambiguous: ${requested}; use provider/model-id.`,
-    );
+  const candidates = ctx.modelRegistry
+    .getAll()
+    .filter((model) => `${model.provider}/${model.id}` === requested);
+  if (candidates.length === 0)
+    throw new Error(`Approved Pi model is unavailable: ${requested}`);
   for (const model of candidates) {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (auth.ok) return `${model.provider}/${model.id}`;
@@ -708,8 +695,7 @@ export default function orchestration(pi: ExtensionAPI) {
   pi.registerTool({
     name: "first_mate_claim",
     label: "Claim Machine First Mate",
-    description:
-      "Explicitly claim the singleton first-mate role for this machine. Refuses while another live first mate owns it; reclaims all tasks and pending outcomes from a dead owner.",
+    description: `Explicitly claim the singleton first-mate role for this machine. Refuses while another live first mate owns it; reclaims all tasks and pending outcomes from a dead owner. First-mate sessions default to ${FIRST_MATE_DEFAULT.provider}/${FIRST_MATE_DEFAULT.model} at ${FIRST_MATE_DEFAULT.reasoning} reasoning.`,
     parameters: Type.Object({}),
     async execute(_call, _params, _signal, _update, ctx) {
       const { lease, tasks } = await claimCurrentFirstMate(ctx);
@@ -758,6 +744,7 @@ export default function orchestration(pi: ExtensionAPI) {
       "Assign one task to a persistent Pi second mate in its own Herdr Space",
     promptGuidelines: [
       "When the assignment references a Linear issue, pass linear_issue so the second mate gets explicit sync instructions.",
+      "Persistent second mates always use direct openai-codex/gpt-5.6-sol at high reasoning; omitted model settings select that policy default and other settings fail.",
     ],
     parameters: Type.Object({
       task_id: Type.String(),
@@ -921,6 +908,14 @@ export default function orchestration(pi: ExtensionAPI) {
       }),
     }),
     async execute(_call, params, _signal, _update, ctx) {
+      if (!ctx.model)
+        throw new Error(
+          "Model policy violation: independent second mates require an active direct openai-codex/gpt-5.6-sol model.",
+        );
+      resolveSecondMatePolicy({
+        model: `${ctx.model.provider}/${ctx.model.id}`,
+        reasoning: pi.getThinkingLevel() as ReasoningLevel,
+      });
       const location = await herdr.current();
       const task = await fleet.registerIndependent({
         taskId: params.task_id,
@@ -1382,40 +1377,51 @@ export default function orchestration(pi: ExtensionAPI) {
       "Delegate a self-contained task to a visible Herdr child agent with optional Treehouse isolation",
     promptGuidelines: [
       "Use subagent_spawn for self-contained delegated work. Supply complete paths, constraints, and expected output; continue parent work after spawning and wait only when blocked.",
+      "Set role to review and review_target_model for reviewers. Reviewers must use a different model family, remain strictly scoped, and be actively monitored; highly reliable work also gets a Grok 4.6 secondary review after the default Sol/Fable cross-review.",
     ],
     parameters: Type.Object({
       prompt: Type.String(),
       name: Type.String(),
       harness: StringEnum(HARNESSES),
+      role: Type.Optional(StringEnum(WORKER_ROLES)),
       working_dir: Type.Optional(Type.String()),
       model: Type.Optional(Type.String()),
       reasoning_effort: Type.Optional(StringEnum(REASONING_LEVELS)),
+      review_target_model: Type.Optional(
+        Type.String({
+          description:
+            "Required for review workers; the model whose output or changes are being reviewed.",
+        }),
+      ),
       isolation: Type.Optional(StringEnum(ISOLATIONS)),
       placement: Type.Optional(StringEnum(TAB_PLACEMENTS)),
     }),
     async execute(_call, params, signal, _update, ctx) {
       if (signal?.aborted) throw new Error("Subagent spawn cancelled.");
-      let model = params.model;
-      let reasoning = params.reasoning_effort as ReasoningLevel | undefined;
-      if (params.harness === "pi") {
-        model = await resolvePiModel(ctx, model);
-        if (params.model?.toLowerCase().includes("grok")) reasoning ??= "high";
-      }
+      const policy = resolveWorkerPolicy({
+        role: params.role as WorkerRole | undefined,
+        harness: params.harness as Harness,
+        model: params.model,
+        reasoning: params.reasoning_effort as ReasoningLevel | undefined,
+        reviewTargetModel: params.review_target_model,
+      });
+      const model =
+        params.harness === "pi"
+          ? await resolvePiModel(ctx, policy.model)
+          : policy.model;
       const task = await manager.spawnLeaf({
         prompt: params.prompt,
         label: params.name,
         harness: params.harness as Harness,
+        role: policy.role,
         cwd: resolvePath(ctx.cwd, params.working_dir ?? "."),
         model,
-        reasoning,
+        reasoning: policy.reasoning,
+        reviewTargetModel: params.review_target_model,
         isolation: params.isolation ?? "auto",
         placement: params.placement ?? "auto",
         parentSession: ctx.sessionManager.getSessionId(),
         ownerTaskId: mateTaskId,
-        parentModel: ctx.model
-          ? `${ctx.model.provider}/${ctx.model.id}`
-          : undefined,
-        parentReasoning: pi.getThinkingLevel() as ReasoningLevel,
       });
       registerWaitableSubagent(
         backgroundWaits,

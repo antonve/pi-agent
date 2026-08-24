@@ -317,6 +317,9 @@ test("second-mate prompts require verification, plan ownership, and review-ready
   );
   assert.match(prompt, /include the PR URL in complete_task/i);
   assert.match(prompt, /retain the Treehouse lease for review follow-up/i);
+  assert.match(prompt, /actively monitor its progress/);
+  assert.match(prompt, /Reject leaf suggestions that expand/);
+  assert.match(prompt, /Mark review workers with the review role/);
   assert.match(
     prompt,
     /Call complete_task or fail_task exactly once when the task truly reaches a terminal outcome/i,
@@ -591,6 +594,18 @@ test("task assignment creates one Space with the second mate in its root tab", a
       () => fleet.requireFirstMate("other-session"),
       /owned by session first-mate-session/,
     );
+    await assert.rejects(
+      () =>
+        fleet.assignTask({
+          id: "TASK-BANNED",
+          title: "Banned model",
+          brief: "Must fail before assignment",
+          cwd: "/repo",
+          ownerSessionId: "first-mate-session",
+          model: "openai-codex/gpt-5.5",
+        }),
+      /persistent second mates require openai-codex\/gpt-5\.6-sol/,
+    );
     const task = await fleet.assignTask({
       id: "TASK-1",
       title: "Example task",
@@ -601,6 +616,12 @@ test("task assignment creates one Space with the second mate in its root tab", a
     assert.equal(task.state, "assigned");
     assert.equal(task.workspaceId, "w-task");
     assert.equal(task.mateTabId, "w-task:t1");
+    const startCall = calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    );
+    assert.ok(startCall);
+    assert.ok(startCall.includes("openai-codex/gpt-5.6-sol"));
+    assert.ok(startCall.includes("high"));
     assert.deepEqual(
       calls
         .find((args) => args[0] === "workspace" && args[1] === "create")
@@ -763,19 +784,13 @@ test("task assignment creates one Space with the second mate in its root tab", a
       ],
     );
     assert.deepEqual(
-      requests
-        .filter((request) => request.method === "pane.focus")
-        .map((request) => request.params),
-      [
-        { pane_id: "w-owner:p1" },
-        { pane_id: "w-owner:p1" },
-        { pane_id: "w-replacement:p1" },
-      ],
+      requests.filter((request) => request.method === "pane.focus"),
+      [],
     );
   });
 });
 
-test("task assignment does not steal focus when the first-mate workspace is not focused", async () => {
+test("task assignment creates its workspace without focus churn", async () => {
   await withHerdrSocket(async (requests) => {
     const directory = await mkdtemp(join(tmpdir(), "pi-fleet-no-focus-"));
     const calls: string[][] = [];
@@ -788,7 +803,7 @@ test("task assignment does not steal focus when the first-mate workspace is not 
             stderr: "",
             stdout: JSON.stringify({
               result: {
-                workspace: { workspace_id: args[2], focused: false },
+                workspace: { workspace_id: args[2], focused: true },
               },
             }),
           };
@@ -872,6 +887,15 @@ test("task assignment does not steal focus when the first-mate workspace is not 
     assert.equal(
       calls.some(
         (args) =>
+          args[0] === "workspace" &&
+          args[1] === "create" &&
+          args.includes("--no-focus"),
+      ),
+      true,
+    );
+    assert.equal(
+      calls.some(
+        (args) =>
           args[0] === "tab" &&
           args[1] === "rename" &&
           args[2] === "w-task:t1" &&
@@ -890,6 +914,7 @@ test("task assignment failure closes the workspace and restores first-mate focus
   await withHerdrSocket(async (requests) => {
     const directory = await mkdtemp(join(tmpdir(), "pi-fleet-close-focus-"));
     const calls: string[][] = [];
+    let workspaceReads = 0;
     const runner: CliRunner = {
       async run(_command, args) {
         calls.push([...args]);
@@ -899,7 +924,10 @@ test("task assignment failure closes the workspace and restores first-mate focus
             stderr: "",
             stdout: JSON.stringify({
               result: {
-                workspace: { workspace_id: args[2], focused: true },
+                workspace: {
+                  workspace_id: args[2],
+                  focused: workspaceReads++ === 0,
+                },
               },
             }),
           };
@@ -975,6 +1003,7 @@ test("task assignment failure closes the workspace and restores first-mate focus
       paneId: "w-owner:p1",
       cwd: "/repo",
     });
+    workspaceReads = 0;
     requests.length = 0;
     await assert.rejects(
       () =>
@@ -1412,6 +1441,24 @@ test("manager starts leaves through the headless tab path without agent UI comma
       "resumed turns must reuse the logical leaf tab",
     );
     assert.equal(
+      calls
+        .find((args) => args[0] === "tab" && args[1] === "create")
+        ?.includes("--no-focus"),
+      true,
+      "background leaf tabs must be created without focus",
+    );
+    assert.equal(
+      calls.some(
+        (args) =>
+          (args[0] === "workspace" ||
+            args[0] === "tab" ||
+            args[0] === "pane") &&
+          args[1] === "focus",
+      ),
+      false,
+      "background leaf lifecycle must not issue focus commands",
+    );
+    assert.equal(
       calls.some((args) => args[0] === "agent"),
       false,
       "leaf launch must not call Herdr's interactive agent surface",
@@ -1484,6 +1531,7 @@ test("Herdr task workspaces and sidebar metadata use workspace APIs", async () =
     worker_summary: "2 active",
   });
   assert.ok(calls[0]!.includes("PI_FIRST_MATE_TASK_ID=TASK-1"));
+  assert.ok(calls[0]!.includes("--no-focus"));
   assert.deepEqual(calls[1]!.slice(0, 4), [
     "workspace",
     "report-metadata",

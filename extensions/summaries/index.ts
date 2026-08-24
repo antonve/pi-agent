@@ -163,7 +163,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("summary-model", {
-    description: "Choose the model and reasoning level used for run recaps",
+    description: "Confirm the approved direct Luna/high route for run recaps",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") {
         if (ctx.hasUI) {

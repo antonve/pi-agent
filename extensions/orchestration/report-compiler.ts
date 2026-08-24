@@ -1,6 +1,7 @@
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { loadSummaryConfig } from "../summaries/src/config.ts";
+import { resolveSummaryPolicy } from "../shared/model-policy.ts";
 
 const SINGLE_REPORT_SKIP_LENGTH = 4_000;
 const MAX_REPORT_LENGTH = 12_000;
@@ -25,7 +26,7 @@ export async function compileFleetReports(options: {
   signal?: AbortSignal;
 }): Promise<CompiledFleetReport | undefined> {
   if (!shouldCompileReports(options.reports)) return undefined;
-  const config = loadSummaryConfig();
+  const config = resolveSummaryPolicy(loadSummaryConfig());
   const model = options.modelRegistry.find(config.provider, config.model);
   if (!model)
     throw new Error(
@@ -58,7 +59,7 @@ export async function compileFleetReports(options: {
       maxRetries: 1,
       timeoutMs: 40_000,
       signal: options.signal,
-      ...(config.reasoning === "off" ? {} : { reasoning: config.reasoning }),
+      reasoning: config.reasoning,
     },
   );
   if (response.stopReason === "error" || response.stopReason === "aborted")

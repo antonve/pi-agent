@@ -1,3 +1,9 @@
+import {
+  POLICY_REASONING_LEVELS,
+  type PolicyReasoningLevel,
+  type WorkerRole,
+} from "../shared/model-policy.ts";
+
 export const PLACEMENTS = ["auto", "tab", "pane"] as const;
 export type Placement = (typeof PLACEMENTS)[number];
 export type ResolvedPlacement = Exclude<Placement, "auto">;
@@ -8,16 +14,8 @@ export type Isolation = (typeof ISOLATIONS)[number];
 export const HARNESSES = ["pi", "claude", "codex", "opencode"] as const;
 export type Harness = (typeof HARNESSES)[number];
 
-export const REASONING_LEVELS = [
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
-export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
+export const REASONING_LEVELS = POLICY_REASONING_LEVELS;
+export type ReasoningLevel = PolicyReasoningLevel;
 
 export type TaskKind = "background" | "subagent" | "workflow-child";
 export type ExecutionMode = "interactive" | "headless";
@@ -85,6 +83,7 @@ export interface TaskRecord {
   readinessAt?: number;
   stopPolicy?: "parent" | "task";
   harness?: Harness;
+  role?: WorkerRole;
   model?: string;
   reasoning?: ReasoningLevel;
   cwd: string;
@@ -141,14 +140,14 @@ export interface SpawnAgentOptions {
   prompt: string;
   label: string;
   harness: Harness;
+  role?: WorkerRole;
   cwd: string;
   model?: string;
   reasoning?: ReasoningLevel;
+  reviewTargetModel?: string;
   isolation: Isolation;
   placement: Placement;
   parentSession?: string;
   ownerTaskId?: string;
-  parentModel?: string;
-  parentReasoning?: ReasoningLevel;
   kind?: "subagent" | "workflow-child";
 }

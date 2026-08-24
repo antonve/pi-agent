@@ -1,6 +1,5 @@
 import {
   getMarkdownTheme,
-  ThinkingSelectorComponent,
   type ExtensionCommandContext,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -8,7 +7,6 @@ import {
   getSupportedThinkingLevels,
   type Api,
   type Model,
-  type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import type { ReasoningLevel, SummaryConfig } from "./config.ts";
@@ -74,12 +72,13 @@ export async function openModelPicker(
   ctx: ExtensionCommandContext,
   _config: SummaryConfig,
 ) {
-  const models = [...ctx.modelRegistry.getAvailable()].sort((a, b) =>
-    `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`),
+  const models = [...ctx.modelRegistry.getAvailable()].filter(
+    (model) =>
+      model.provider === _config.provider && model.id === _config.model,
   );
   if (models.length === 0) {
     ctx.ui.notify(
-      "No configured models are available for run recaps.",
+      `Approved summary model is unavailable: ${_config.provider}/${_config.model}.`,
       "warning",
     );
     return undefined;
@@ -95,27 +94,12 @@ export function openReasoningPicker(
   current: ReasoningLevel,
 ) {
   const supported = getSupportedThinkingLevels(model);
-  const selectedCurrent = supported.includes(current)
-    ? current
-    : (supported[0] ?? "off");
-
-  return ctx.ui.custom<ModelThinkingLevel | undefined>(
-    (tui, _theme, _keybindings, done) => {
-      const selector = new ThinkingSelectorComponent(
-        selectedCurrent,
-        supported,
-        (level) => done(level),
-        () => done(undefined),
-      );
-      const list = selector.getSelectList();
-      return {
-        render: (width) => selector.render(width),
-        invalidate: () => selector.invalidate(),
-        handleInput: (data) => {
-          list.handleInput(data);
-          tui.requestRender();
-        },
-      };
-    },
-  );
+  if (!supported.includes(current)) {
+    ctx.ui.notify(
+      `Approved summary reasoning ${current} is unavailable for this model.`,
+      "warning",
+    );
+    return Promise.resolve(undefined);
+  }
+  return Promise.resolve(current);
 }
