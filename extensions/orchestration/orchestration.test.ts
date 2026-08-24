@@ -344,7 +344,6 @@ test("slash-command firstmate claim makes later turns explicitly supervisory", a
             method: "workspace.move",
             params: { workspace_id: "w-owner", insert_index: 0 },
           },
-          { method: "pane.focus", params: { pane_id: "w-owner:p1" } },
         ],
       );
 
@@ -452,7 +451,6 @@ test("tool first_mate_claim renames and reorders the claimed workspace", async (
             method: "workspace.move",
             params: { workspace_id: "w-owner", insert_index: 0 },
           },
-          { method: "pane.focus", params: { pane_id: "w-owner:p1" } },
         ],
       );
     } finally {
@@ -1495,7 +1493,24 @@ test("Herdr uses the returned root pane and retries while its shell starts", asy
   await client.startAgent("sa-123-review", "codex", resource.paneId, []);
 
   assert.equal(resource.paneId, "w1:p2");
+  assert.equal(
+    calls
+      .find((call) => call.args[0] === "tab" && call.args[1] === "create")
+      ?.args.includes("--no-focus"),
+    true,
+  );
   assert.equal(starts, 3);
+  assert.equal(
+    calls.some(
+      (call) =>
+        (call.args[0] === "workspace" ||
+          call.args[0] === "tab" ||
+          call.args[0] === "pane" ||
+          call.args[0] === "agent") &&
+        call.args[1] === "focus",
+    ),
+    false,
+  );
   assert.equal(
     calls.some((call) => call.args[0] === "pane" && call.args[1] === "list"),
     false,

@@ -201,8 +201,13 @@ export class FleetManager {
     try {
       return await operation();
     } finally {
-      if (shouldRestore && owner)
-        await this.herdr.focusPane(owner.paneId).catch(() => undefined);
+      if (shouldRestore && owner) {
+        const stillFocused = await this.herdr
+          .workspaceIsFocused(owner.workspaceId)
+          .catch(() => false);
+        if (!stillFocused)
+          await this.herdr.focusPane(owner.paneId).catch(() => undefined);
+      }
     }
   }
 

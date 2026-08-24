@@ -784,19 +784,13 @@ test("task assignment creates one Space with the second mate in its root tab", a
       ],
     );
     assert.deepEqual(
-      requests
-        .filter((request) => request.method === "pane.focus")
-        .map((request) => request.params),
-      [
-        { pane_id: "w-owner:p1" },
-        { pane_id: "w-owner:p1" },
-        { pane_id: "w-replacement:p1" },
-      ],
+      requests.filter((request) => request.method === "pane.focus"),
+      [],
     );
   });
 });
 
-test("task assignment does not steal focus when the first-mate workspace is not focused", async () => {
+test("task assignment creates its workspace without focus churn", async () => {
   await withHerdrSocket(async (requests) => {
     const directory = await mkdtemp(join(tmpdir(), "pi-fleet-no-focus-"));
     const calls: string[][] = [];
@@ -809,7 +803,7 @@ test("task assignment does not steal focus when the first-mate workspace is not 
             stderr: "",
             stdout: JSON.stringify({
               result: {
-                workspace: { workspace_id: args[2], focused: false },
+                workspace: { workspace_id: args[2], focused: true },
               },
             }),
           };
@@ -893,6 +887,15 @@ test("task assignment does not steal focus when the first-mate workspace is not 
     assert.equal(
       calls.some(
         (args) =>
+          args[0] === "workspace" &&
+          args[1] === "create" &&
+          args.includes("--no-focus"),
+      ),
+      true,
+    );
+    assert.equal(
+      calls.some(
+        (args) =>
           args[0] === "tab" &&
           args[1] === "rename" &&
           args[2] === "w-task:t1" &&
@@ -911,16 +914,40 @@ test("task assignment failure closes the workspace and restores first-mate focus
   await withHerdrSocket(async (requests) => {
     const directory = await mkdtemp(join(tmpdir(), "pi-fleet-close-focus-"));
     const calls: string[][] = [];
+    let workspaceReads = 0;
     const runner: CliRunner = {
       async run(_command, args) {
         calls.push([...args]);
+        if (args[0] === "workspace" && args[1] === "list")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspaces: [{ workspace_id: "w-owner", focused: true }],
+              },
+            }),
+          };
+        if (args[0] === "pane" && args[1] === "list")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                panes: [{ pane_id: "w-owner:p1", focused: true }],
+              },
+            }),
+          };
         if (args[0] === "workspace" && args[1] === "get")
           return {
             code: 0,
             stderr: "",
             stdout: JSON.stringify({
               result: {
-                workspace: { workspace_id: args[2], focused: true },
+                workspace: {
+                  workspace_id: args[2],
+                  focused: workspaceReads++ !== 1,
+                },
               },
             }),
           };
@@ -996,6 +1023,7 @@ test("task assignment failure closes the workspace and restores first-mate focus
       paneId: "w-owner:p1",
       cwd: "/repo",
     });
+    workspaceReads = 0;
     requests.length = 0;
     await assert.rejects(
       () =>
@@ -1433,6 +1461,24 @@ test("manager starts leaves through the headless tab path without agent UI comma
       "resumed turns must reuse the logical leaf tab",
     );
     assert.equal(
+      calls
+        .find((args) => args[0] === "tab" && args[1] === "create")
+        ?.includes("--no-focus"),
+      true,
+      "background leaf tabs must be created without focus",
+    );
+    assert.equal(
+      calls.some(
+        (args) =>
+          (args[0] === "workspace" ||
+            args[0] === "tab" ||
+            args[0] === "pane") &&
+          args[1] === "focus",
+      ),
+      false,
+      "background leaf lifecycle must not issue focus commands",
+    );
+    assert.equal(
       calls.some((args) => args[0] === "agent"),
       false,
       "leaf launch must not call Herdr's interactive agent surface",
@@ -1505,6 +1551,7 @@ test("Herdr task workspaces and sidebar metadata use workspace APIs", async () =
     worker_summary: "2 active",
   });
   assert.ok(calls[0]!.includes("PI_FIRST_MATE_TASK_ID=TASK-1"));
+  assert.ok(calls[0]!.includes("--no-focus"));
   assert.deepEqual(calls[1]!.slice(0, 4), [
     "workspace",
     "report-metadata",
