@@ -953,19 +953,15 @@ test("durable and uncertain placement defaults to tab", () => {
 test("harness defaults and native arguments", () => {
   assert.deepEqual(buildHarnessLaunch({ harness: "claude" }).args.slice(0, 4), [
     "--model",
-    "fable",
+    "claude-fable-5",
     "--effort",
     "high",
   ]);
   const codex = buildHarnessLaunch({ harness: "codex" });
   assert.equal(codex.model, "gpt-5.6-sol");
   assert.ok(codex.args.includes('model_reasoning_effort="high"'));
-  const pi = buildHarnessLaunch({
-    harness: "pi",
-    parentModel: "openai/gpt",
-    parentReasoning: "medium",
-  });
-  assert.equal(pi.model, "openai/gpt");
+  const pi = buildHarnessLaunch({ harness: "pi" });
+  assert.equal(pi.model, "openai-codex/gpt-5.6-sol");
   assert.ok(pi.args.includes("--exclude-tools"));
 });
 
@@ -1024,6 +1020,16 @@ test("subagent prompts request a marked parent report without changing workflow 
   });
   assert.match(subagentPrompt, new RegExp(PARENT_REPORT_START));
   assert.match(subagentPrompt, new RegExp(PARENT_REPORT_END));
+
+  const reviewPrompt = buildChildPrompt({
+    prompt: "Review the change",
+    cwd: "/repo",
+    kind: "subagent",
+    role: "review",
+  });
+  assert.match(reviewPrompt, /Review scope guard/);
+  assert.match(reviewPrompt, /Do not modify files/);
+  assert.match(reviewPrompt, /scope-expanding suggestions as out of scope/);
 
   const workflowPrompt = buildChildPrompt({
     prompt: "Return structured JSON",
@@ -1565,7 +1571,7 @@ test("spawn records failed delivery without releasing its held Treehouse lease",
       manager.spawnAgent({
         prompt: "Review the change",
         label: "delivery failure",
-        harness: "opencode",
+        harness: "codex",
         cwd: "/repo",
         isolation: "treehouse",
         placement: "tab",

@@ -11,6 +11,7 @@ import type {
   TaskRecord,
 } from "../domain.ts";
 import { HARNESSES, ISOLATIONS, REASONING_LEVELS } from "../domain.ts";
+import { WORKER_ROLES, type WorkerRole } from "../../shared/model-policy.ts";
 import type { OrchestrationManager } from "../manager.ts";
 import { stateDirectory } from "../registry.ts";
 import { RunController } from "./controller.ts";
@@ -163,21 +164,56 @@ export function registerWorkflow(
         options: SandboxAgentOptions,
         invocationSignal: AbortSignal,
       ): Promise<SandboxAgentResult> => {
-        const harness =
-          typeof options.harness === "string" &&
-          (HARNESSES as readonly string[]).includes(options.harness)
-            ? (options.harness as Harness)
-            : "pi";
-        const isolation =
-          typeof options.isolation === "string" &&
-          (ISOLATIONS as readonly string[]).includes(options.isolation)
-            ? (options.isolation as Isolation)
-            : "auto";
-        const effort =
-          typeof options.effort === "string" &&
-          (REASONING_LEVELS as readonly string[]).includes(options.effort)
-            ? (options.effort as ReasoningLevel)
-            : undefined;
+        if (
+          options.harness !== undefined &&
+          (typeof options.harness !== "string" ||
+            !(HARNESSES as readonly string[]).includes(options.harness))
+        )
+          throw new Error(
+            `Unsupported workflow harness: ${String(options.harness)}`,
+          );
+        const harness = (options.harness ?? "pi") as Harness;
+        if (
+          options.isolation !== undefined &&
+          (typeof options.isolation !== "string" ||
+            !(ISOLATIONS as readonly string[]).includes(options.isolation))
+        )
+          throw new Error(
+            `Unsupported workflow isolation: ${String(options.isolation)}`,
+          );
+        const isolation = (options.isolation ?? "auto") as Isolation;
+        if (
+          options.effort !== undefined &&
+          (typeof options.effort !== "string" ||
+            !(REASONING_LEVELS as readonly string[]).includes(options.effort))
+        )
+          throw new Error(
+            `Unsupported workflow reasoning effort: ${String(options.effort)}`,
+          );
+        const effort = options.effort as ReasoningLevel | undefined;
+        if (
+          options.role !== undefined &&
+          (typeof options.role !== "string" ||
+            !(WORKER_ROLES as readonly string[]).includes(options.role))
+        )
+          throw new Error(
+            `Unsupported workflow worker role: ${String(options.role)}`,
+          );
+        const role = options.role as WorkerRole | undefined;
+        if (options.model !== undefined && typeof options.model !== "string")
+          throw new Error("Workflow child model must be a string.");
+        if (
+          options.provider !== undefined &&
+          (typeof options.provider !== "string" || options.model === undefined)
+        )
+          throw new Error(
+            "Workflow child provider must be a string and requires model.",
+          );
+        if (
+          options.reviewTargetModel !== undefined &&
+          typeof options.reviewTargetModel !== "string"
+        )
+          throw new Error("Workflow reviewTargetModel must be a string.");
         const model =
           typeof options.model === "string"
             ? typeof options.provider === "string"
@@ -206,16 +242,14 @@ export function registerWorkflow(
           prompt: `${prompt}${structuredInstruction}`,
           label,
           harness,
+          role,
           cwd: useSharedLease ? run.sharedLease!.path : ctx.cwd,
           model,
           reasoning: effort,
+          reviewTargetModel: options.reviewTargetModel as string | undefined,
           isolation: useSharedLease ? "shared" : isolation,
           placement: "tab",
           parentSession: ctx.sessionManager.getSessionId(),
-          parentModel: ctx.model
-            ? `${ctx.model.provider}/${ctx.model.id}`
-            : undefined,
-          parentReasoning: pi.getThinkingLevel() as ReasoningLevel,
           kind: "workflow-child",
         });
         run.children.push(task.id);

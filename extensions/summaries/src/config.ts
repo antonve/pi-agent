@@ -4,23 +4,21 @@ import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { Data, Effect } from "effect";
+import {
+  POLICY_REASONING_LEVELS,
+  resolveSummaryPolicy,
+  SUMMARY_DEFAULT,
+  type PolicyReasoningLevel,
+} from "../../shared/model-policy.ts";
 
 class ConfigWriteError extends Data.TaggedError("ConfigWriteError")<{
   readonly message: string;
   readonly cause?: unknown;
 }> {}
 
-export const REASONING_LEVELS = [
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
+export const REASONING_LEVELS = POLICY_REASONING_LEVELS;
 
-export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
+export type ReasoningLevel = PolicyReasoningLevel;
 
 export interface SummaryConfig {
   readonly provider: string;
@@ -28,11 +26,7 @@ export interface SummaryConfig {
   readonly reasoning: ReasoningLevel;
 }
 
-export const DEFAULT_SUMMARY_CONFIG: SummaryConfig = {
-  provider: "openai-codex",
-  model: "gpt-5.6-luna",
-  reasoning: "medium",
-};
+export const DEFAULT_SUMMARY_CONFIG: SummaryConfig = SUMMARY_DEFAULT;
 
 export const PRIVATE_CONFIG_PATH = join(
   process.env.PI_HERDR_CONFIG_DIR ?? join(homedir(), ".config", "pi-herdr"),
@@ -59,30 +53,31 @@ export function parseSummaryConfig(value: unknown) {
     return DEFAULT_SUMMARY_CONFIG;
   }
 
-  return {
+  return resolveSummaryPolicy({
     provider: value.provider.trim(),
     model: value.model.trim(),
     reasoning: value.reasoning,
-  } satisfies SummaryConfig;
+  });
 }
 
 export function loadSummaryConfig() {
+  let value: unknown;
   try {
-    return parseSummaryConfig(
-      JSON.parse(readFileSync(PRIVATE_CONFIG_PATH, "utf8")),
-    );
+    value = JSON.parse(readFileSync(PRIVATE_CONFIG_PATH, "utf8"));
   } catch {
     return DEFAULT_SUMMARY_CONFIG;
   }
+  return parseSummaryConfig(value);
 }
 
 export function saveSummaryConfig(config: SummaryConfig, signal?: AbortSignal) {
+  const approved = resolveSummaryPolicy(config);
   const tempPath = `${PRIVATE_CONFIG_PATH}.${process.pid}.${randomUUID()}.tmp`;
   const write = Effect.tryPromise({
     try: async (effectSignal) => {
       await mkdir(dirname(PRIVATE_CONFIG_PATH), { recursive: true });
       try {
-        await writeFile(tempPath, `${JSON.stringify(config, null, 2)}\n`, {
+        await writeFile(tempPath, `${JSON.stringify(approved, null, 2)}\n`, {
           encoding: "utf8",
           mode: 0o600,
           signal: effectSignal,

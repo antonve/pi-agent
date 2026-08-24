@@ -317,6 +317,9 @@ test("second-mate prompts require verification, plan ownership, and review-ready
   );
   assert.match(prompt, /include the PR URL in complete_task/i);
   assert.match(prompt, /retain the Treehouse lease for review follow-up/i);
+  assert.match(prompt, /actively monitor its progress/);
+  assert.match(prompt, /Reject leaf suggestions that expand/);
+  assert.match(prompt, /Mark review workers with the review role/);
   assert.match(
     prompt,
     /Call complete_task or fail_task exactly once when the task truly reaches a terminal outcome/i,
@@ -591,6 +594,18 @@ test("task assignment creates one Space with the second mate in its root tab", a
       () => fleet.requireFirstMate("other-session"),
       /owned by session first-mate-session/,
     );
+    await assert.rejects(
+      () =>
+        fleet.assignTask({
+          id: "TASK-BANNED",
+          title: "Banned model",
+          brief: "Must fail before assignment",
+          cwd: "/repo",
+          ownerSessionId: "first-mate-session",
+          model: "openai-codex/gpt-5.5",
+        }),
+      /persistent second mates require openai-codex\/gpt-5\.6-sol/,
+    );
     const task = await fleet.assignTask({
       id: "TASK-1",
       title: "Example task",
@@ -601,6 +616,12 @@ test("task assignment creates one Space with the second mate in its root tab", a
     assert.equal(task.state, "assigned");
     assert.equal(task.workspaceId, "w-task");
     assert.equal(task.mateTabId, "w-task:t1");
+    const startCall = calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    );
+    assert.ok(startCall);
+    assert.ok(startCall.includes("openai-codex/gpt-5.6-sol"));
+    assert.ok(startCall.includes("high"));
     assert.deepEqual(
       calls
         .find((args) => args[0] === "workspace" && args[1] === "create")

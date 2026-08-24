@@ -9,7 +9,7 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 - `/ps` — list and interact with tracked background commands.
 - `/subagents` — list, inspect, focus, prompt, interrupt, close, or attach to children.
 - `/workflows` — list workflow run artifacts.
-- To opt into run recaps, load `./extensions/summaries/index.ts` explicitly; that also provides `/summary-model` for storing a private summary-model override under `~/.config/pi-herdr`.
+- To opt into run recaps, load `./extensions/summaries/index.ts` explicitly; `/summary-model` confirms the fixed approved direct Luna/high route under `~/.config/pi-herdr`.
 - `/firstmate status` inspects the machine-wide singleton first mate; `/firstmate claim` explicitly claims it or reclaims it from a dead owner.
 - Claimed first-mate turns stay supervisory: new repo-changing work must be delegated with `task_assign` before direct investigation or edits.
 - `first_mate_claim` and `first_mate_status` expose the same lifecycle to the model.
@@ -22,6 +22,12 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 - State, results, workflow artifacts, and lease ownership live under `~/.local/state/pi-herdr`.
 - `systemctl --user status pi-herdr-janitor.timer` — inspect durable cleanup.
 - `journalctl --user -u pi-herdr-janitor.service` — inspect cleanup errors.
+
+## Orchestration model policy
+
+First mates default to direct `openai-codex/gpt-5.6-sol` at medium reasoning. Persistent second mates are fixed to that direct model at high. Implementation leaves may use direct Sol at high/xhigh/max, Grok 4.6 through Pi at high, or exact `claude-fable-5` through Claude Code at high/xhigh/max. Data-processing leaves use direct Luna at high/xhigh or DeepSeek V4 Flash through Pi at high. Summaries and compiled reports are fixed to direct `openai-codex/gpt-5.6-luna` at high.
+
+Review leaves declare `role: "review"` and `review_target_model`; the reviewer must be from a different family. Primary review defaults across Sol and Fable. Reliability-critical work adds Grok 4.6 as a secondary review so Sol, Fable, and Grok all participate. Fable never routes through OpenRouter, GPT-5.6 never routes through OpenRouter, and unapproved models, harnesses, providers, or reasoning levels fail explicitly.
 
 Completed, failed, cancelled, interrupted, and timed-out resources close automatically after 30 seconds; focusing or interacting with one postpones cleanup by another 30 seconds. Only explicit pinning retains a settled resource. Blocked leaf turns stay available for a headless resume. Captured output remains on disk after terminal cleanup, and closed registry records are pruned after seven days. Guarded Treehouse return never uses `--force`; dirty leases remain visible in the registry and `treehouse status`.
 
