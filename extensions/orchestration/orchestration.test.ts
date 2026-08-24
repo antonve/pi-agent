@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,7 +11,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import type { CliRunner } from "./cli.ts";
-import { findNumber, findString } from "./cli.ts";
+import { findNumber, findString, nodeCliRunner } from "./cli.ts";
 import {
   isAutoCloseStatus,
   needsInspection,
@@ -110,6 +111,73 @@ function registeredOrchestrationTools() {
   return tools;
 }
 
+async function withHerdrSocket<T>(
+  run: (requests: Array<Record<string, unknown>>) => Promise<T>,
+) {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-socket-"));
+  const socketPath = join(directory, "herdr.sock");
+  const requests: Array<Record<string, unknown>> = [];
+  const server = createServer((connection) => {
+    let buffer = "";
+    connection.on("data", (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const request = JSON.parse(line) as Record<string, unknown>;
+        requests.push(request);
+        connection.write(
+          `${JSON.stringify({ id: request.id, result: { ok: true } })}\n`,
+        );
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => resolve());
+  });
+  const previousSocketPath = process.env.HERDR_SOCKET_PATH;
+  process.env.HERDR_SOCKET_PATH = socketPath;
+  try {
+    return await run(requests);
+  } finally {
+    if (previousSocketPath === undefined) delete process.env.HERDR_SOCKET_PATH;
+    else process.env.HERDR_SOCKET_PATH = previousSocketPath;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await unlink(socketPath).catch(() => undefined);
+  }
+}
+
+function registeredOrchestrationRuntime() {
+  const tools = new Map<string, ToolDefinition>();
+  const commands = new Map<
+    string,
+    { handler: (args: string, ctx: any) => unknown }
+  >();
+  const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
+  const pi = {
+    events: {},
+    registerTool(definition: ToolDefinition) {
+      tools.set(definition.name, definition);
+    },
+    registerMessageRenderer() {},
+    registerCommand(
+      name: string,
+      options: { handler: (args: string, ctx: any) => unknown },
+    ) {
+      commands.set(name, options);
+    },
+    on(event: string, handler: (event: any, ctx: any) => unknown) {
+      const current = handlers.get(event) ?? [];
+      current.push(handler);
+      handlers.set(event, current);
+    },
+  } as unknown as ExtensionAPI;
+  orchestration(pi);
+  return { tools, commands, handlers };
+}
+
 function taskRecord(id: string, status: TaskRecord["status"]): TaskRecord {
   const now = Date.now();
   return {
@@ -129,6 +197,340 @@ function taskRecord(id: string, status: TaskRecord["status"]): TaskRecord {
     updatedAt: now,
   };
 }
+
+test("slash-command firstmate claim makes later turns explicitly supervisory", async () => {
+  await withHerdrSocket(async (requests) => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-firstmate-claim-turn-"));
+    const previousStateDir = process.env.PI_HERDR_STATE_DIR;
+    const previousRole = process.env.PI_FIRST_MATE_ROLE;
+    const previousTaskId = process.env.PI_FIRST_MATE_TASK_ID;
+    const previousRun = nodeCliRunner.run;
+    const calls: string[][] = [];
+    process.env.PI_HERDR_STATE_DIR = directory;
+    delete process.env.PI_FIRST_MATE_ROLE;
+    delete process.env.PI_FIRST_MATE_TASK_ID;
+    nodeCliRunner.run = async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "current")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              workspace_id: "w-owner",
+              tab_id: "w-owner:t1",
+              pane_id: "w-owner:p1",
+            },
+          }),
+        };
+      if (args[0] === "workspace" && args[1] === "get")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              workspace: { workspace_id: "w-owner", focused: true },
+            },
+          }),
+        };
+      return {
+        code: 0,
+        stderr: "",
+        stdout: JSON.stringify({ result: {} }),
+      };
+    };
+    try {
+      const runtime = registeredOrchestrationRuntime();
+      const claim = runtime.commands.get("firstmate")?.handler;
+      const beforeAgentStart = runtime.handlers.get("before_agent_start")?.[0];
+      assert.ok(claim);
+      assert.ok(beforeAgentStart);
+
+      const notifications: string[] = [];
+      const ctx = {
+        cwd: "/repo",
+        mode: "tui",
+        hasUI: true,
+        sessionManager: {
+          getSessionId: () => "first-mate-session",
+        },
+        ui: {
+          notify(message: string) {
+            notifications.push(message);
+          },
+        },
+      };
+
+      await claim!("claim", ctx);
+
+      const promptUpdate = (await beforeAgentStart!(
+        {
+          prompt: "Please fix the repository bug",
+          images: [],
+          systemPrompt: "BASE",
+          systemPromptOptions: {},
+        },
+        ctx,
+      )) as { systemPrompt?: string } | undefined;
+
+      assert.equal(notifications.length, 1);
+      assert.match(
+        notifications[0] ?? "",
+        /First mate claimed by first-mate-session/,
+      );
+      assert.match(promptUpdate?.systemPrompt ?? "", /task_assign/);
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /before inspecting files, acquiring a Treehouse lease, editing code/i,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /Stay in the supervisory first-mate role/,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /Delegated second mates own detailed planning, `~\/xdev\/plans` persistence and updates/i,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /concise decisions and portfolio status; do not write detailed task plans or perform task research yourself/i,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /Do not perform task-specific Linear discovery or writes, including issue creation, description edits, comments, relations, or workflow transitions/i,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /Pass concise user Linear requests and decisions to the owning second mate with task_send; when no second mate owns the work, use task_assign to delegate a short Linear task/i,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /keep the delegated task active or resume it instead of terminally completing it/i,
+      );
+      assert.ok(
+        calls.some(
+          (args) =>
+            args[0] === "workspace" &&
+            args[1] === "rename" &&
+            args[2] === "w-owner" &&
+            args[3] === "firstmate",
+        ),
+      );
+      assert.ok(
+        calls.some(
+          (args) =>
+            args[0] === "tab" &&
+            args[1] === "rename" &&
+            args[2] === "w-owner:t1" &&
+            args[3] === "firstmate",
+        ),
+      );
+      assert.ok(
+        calls.some(
+          (args) =>
+            args[0] === "workspace" &&
+            args[1] === "report-metadata" &&
+            args[2] === "w-owner" &&
+            args.includes("repo=repo"),
+        ),
+      );
+      assert.deepEqual(
+        requests.map((request) => ({
+          method: request.method,
+          params: request.params,
+        })),
+        [
+          {
+            method: "workspace.move",
+            params: { workspace_id: "w-owner", insert_index: 0 },
+          },
+          { method: "pane.focus", params: { pane_id: "w-owner:p1" } },
+        ],
+      );
+
+      const fleet = JSON.parse(
+        await readFile(join(directory, "fleet.json"), "utf8"),
+      ) as {
+        firstMate?: { sessionId?: string };
+      };
+      assert.equal(fleet.firstMate?.sessionId, "first-mate-session");
+    } finally {
+      nodeCliRunner.run = previousRun;
+      if (previousStateDir === undefined) delete process.env.PI_HERDR_STATE_DIR;
+      else process.env.PI_HERDR_STATE_DIR = previousStateDir;
+      if (previousRole === undefined) delete process.env.PI_FIRST_MATE_ROLE;
+      else process.env.PI_FIRST_MATE_ROLE = previousRole;
+      if (previousTaskId === undefined)
+        delete process.env.PI_FIRST_MATE_TASK_ID;
+      else process.env.PI_FIRST_MATE_TASK_ID = previousTaskId;
+    }
+  });
+});
+
+test("tool first_mate_claim renames and reorders the claimed workspace", async () => {
+  await withHerdrSocket(async (requests) => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-firstmate-tool-claim-"));
+    const previousStateDir = process.env.PI_HERDR_STATE_DIR;
+    const previousRole = process.env.PI_FIRST_MATE_ROLE;
+    const previousTaskId = process.env.PI_FIRST_MATE_TASK_ID;
+    const previousRun = nodeCliRunner.run;
+    const calls: string[][] = [];
+    process.env.PI_HERDR_STATE_DIR = directory;
+    delete process.env.PI_FIRST_MATE_ROLE;
+    delete process.env.PI_FIRST_MATE_TASK_ID;
+    nodeCliRunner.run = async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "current")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              workspace_id: "w-owner",
+              tab_id: "w-owner:t1",
+              pane_id: "w-owner:p1",
+            },
+          }),
+        };
+      if (args[0] === "workspace" && args[1] === "get")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              workspace: { workspace_id: "w-owner", focused: true },
+            },
+          }),
+        };
+      return {
+        code: 0,
+        stderr: "",
+        stdout: JSON.stringify({ result: {} }),
+      };
+    };
+    try {
+      const runtime = registeredOrchestrationRuntime();
+      const claim = runtime.tools.get("first_mate_claim");
+      assert.ok(claim);
+      const result = await claim.execute("call-1", {}, undefined, undefined, {
+        cwd: "/repo",
+        mode: "tui",
+        hasUI: true,
+        sessionManager: {
+          getSessionId: () => "first-mate-session",
+        },
+      } as never);
+      assert.match(
+        result.content[0]?.type === "text" ? result.content[0].text : "",
+        /Claimed the machine first-mate role/,
+      );
+      assert.ok(
+        calls.some(
+          (args) =>
+            args[0] === "workspace" &&
+            args[1] === "rename" &&
+            args[2] === "w-owner" &&
+            args[3] === "firstmate",
+        ),
+      );
+      assert.ok(
+        calls.some(
+          (args) =>
+            args[0] === "tab" &&
+            args[1] === "rename" &&
+            args[2] === "w-owner:t1" &&
+            args[3] === "firstmate",
+        ),
+      );
+      assert.deepEqual(
+        requests.map((request) => ({
+          method: request.method,
+          params: request.params,
+        })),
+        [
+          {
+            method: "workspace.move",
+            params: { workspace_id: "w-owner", insert_index: 0 },
+          },
+          { method: "pane.focus", params: { pane_id: "w-owner:p1" } },
+        ],
+      );
+    } finally {
+      nodeCliRunner.run = previousRun;
+      if (previousStateDir === undefined) delete process.env.PI_HERDR_STATE_DIR;
+      else process.env.PI_HERDR_STATE_DIR = previousStateDir;
+      if (previousRole === undefined) delete process.env.PI_FIRST_MATE_ROLE;
+      else process.env.PI_FIRST_MATE_ROLE = previousRole;
+      if (previousTaskId === undefined)
+        delete process.env.PI_FIRST_MATE_TASK_ID;
+      else process.env.PI_FIRST_MATE_TASK_ID = previousTaskId;
+    }
+  });
+});
+
+test("first-mate supervisory prompt skips leaf and second-mate sessions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-firstmate-role-skip-"));
+  const previousStateDir = process.env.PI_HERDR_STATE_DIR;
+  const previousRole = process.env.PI_FIRST_MATE_ROLE;
+  const previousTaskId = process.env.PI_FIRST_MATE_TASK_ID;
+  process.env.PI_HERDR_STATE_DIR = directory;
+  try {
+    await writeFile(
+      join(directory, "fleet.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          firstMate: {
+            sessionId: "owned-session",
+            workspaceId: "w-owner",
+            tabId: "w-owner:t1",
+            paneId: "w-owner:p1",
+            claimedAt: 1,
+            updatedAt: 1,
+          },
+          tasks: [],
+          messages: [],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    for (const scenario of [
+      { role: "leaf", taskId: undefined },
+      { role: "second-mate", taskId: "TASK-1" },
+    ]) {
+      process.env.PI_FIRST_MATE_ROLE = scenario.role;
+      if (scenario.taskId === undefined)
+        delete process.env.PI_FIRST_MATE_TASK_ID;
+      else process.env.PI_FIRST_MATE_TASK_ID = scenario.taskId;
+      const runtime = registeredOrchestrationRuntime();
+      const beforeAgentStart = runtime.handlers.get("before_agent_start")?.[0];
+      assert.ok(beforeAgentStart);
+      const result = await beforeAgentStart!(
+        {
+          prompt: "Please fix the repository bug",
+          images: [],
+          systemPrompt: "BASE",
+          systemPromptOptions: {},
+        },
+        {
+          sessionManager: {
+            getSessionId: () => "owned-session",
+          },
+        },
+      );
+      assert.equal(result, undefined);
+    }
+  } finally {
+    if (previousStateDir === undefined) delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousStateDir;
+    if (previousRole === undefined) delete process.env.PI_FIRST_MATE_ROLE;
+    else process.env.PI_FIRST_MATE_ROLE = previousRole;
+    if (previousTaskId === undefined) delete process.env.PI_FIRST_MATE_TASK_ID;
+    else process.env.PI_FIRST_MATE_TASK_ID = previousTaskId;
+  }
+});
 
 test("completed background notifications collapse to one line", () => {
   const message = {

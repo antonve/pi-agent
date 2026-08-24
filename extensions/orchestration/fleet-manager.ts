@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
+import { promisify } from "node:util";
 import type { ReasoningLevel } from "./domain.ts";
 import {
   type FleetMessage,
@@ -10,6 +12,8 @@ import {
 } from "./fleet.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import type { OrchestrationManager } from "./manager.ts";
+
+const execFileAsync = promisify(execFile);
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const TERMINAL_STATES = new Set<FleetTaskState>([
@@ -40,6 +44,25 @@ const LINEAR_ISSUE_URL =
 
 function cleanTitle(title: string) {
   return title.replace(/\s+/g, " ").trim().slice(0, 80) || "task";
+}
+
+async function repositoryBasename(cwd: string) {
+  try {
+    const result = await execFileAsync(
+      "git",
+      ["rev-parse", "--show-toplevel"],
+      {
+        cwd,
+        timeout: 5_000,
+        env: process.env,
+      },
+    );
+    const root = result.stdout.trim();
+    if (root) return basename(root);
+  } catch {
+    /* Fall back to the current working directory basename. */
+  }
+  return basename(resolve(cwd));
 }
 
 function mateAgentName(taskId: string) {
@@ -119,13 +142,17 @@ ${task.brief.trim()}${buildLinearSyncPrompt(task)}
 
 Ownership rules:
 - Own this task through planning, delegation, verification, and final reporting.
-- Keep detailed task and worker context in this session.
+- Own the detailed plan, including creating and updating any \`~/xdev/plans\` file needed for this task.
+- Keep detailed task and worker context in this session and preserve the implementation context needed for follow-through.
+- Own detailed Linear ticket context and task-specific Linear discovery and writes; report upward only concise issue identifiers and outcomes.
 - Use headless leaf workers for self-contained delegated work.
 - Do not create other second mates or task workspaces.
 - Raise only captain-level decisions, material risks, scope changes, and unrecoverable blockers to the first mate.
 - Do not copy worker transcripts upward; send concise decisions, risks, and outcomes.
 - Ensure all long-running commands are managed jobs and stop task-owned services before completion.
-- Call complete_task or fail_task exactly once when the task reaches a terminal outcome.`;
+- For repository-changing work, verify the change, commit it, push it, open a review-ready PR unless explicitly told to stay local-only, include the PR URL in complete_task, and retain the Treehouse lease for review follow-up.
+- If user decisions still leave expected implementation or follow-up work, keep the task active or resume it rather than terminally completing it and losing ownership/context.
+- Call complete_task or fail_task exactly once when the task truly reaches a terminal outcome.`;
 }
 
 export function formatFleetMessage(message: FleetMessage) {
@@ -153,11 +180,34 @@ export class FleetManager {
     this.orchestration = orchestration;
   }
 
+  private async preserveFocus<T>(
+    owner:
+      | {
+          workspaceId: string;
+          paneId: string;
+        }
+      | undefined,
+    operation: () => Promise<T>,
+  ) {
+    const shouldRestore = owner
+      ? await this.herdr
+          .workspaceIsFocused(owner.workspaceId)
+          .catch(() => false)
+      : false;
+    try {
+      return await operation();
+    } finally {
+      if (shouldRestore && owner)
+        await this.herdr.focusPane(owner.paneId).catch(() => undefined);
+    }
+  }
+
   async claimFirstMate(options: {
     sessionId: string;
     workspaceId: string;
     tabId: string;
     paneId: string;
+    cwd: string;
   }) {
     const current = await this.store.getFirstMate();
     if (current && current.sessionId !== options.sessionId) {
@@ -171,10 +221,22 @@ export class FleetManager {
         );
     }
     const lease = await this.store.claimFirstMate({
-      ...options,
+      sessionId: options.sessionId,
+      workspaceId: options.workspaceId,
+      tabId: options.tabId,
+      paneId: options.paneId,
       expectedSessionId: current?.sessionId,
     });
-    await this.refreshMetadata();
+    await this.preserveFocus(
+      { workspaceId: options.workspaceId, paneId: options.paneId },
+      async () => {
+        await this.herdr.renameWorkspace(lease.workspaceId, "firstmate");
+        await this.herdr.renameTab(lease.tabId, "firstmate");
+        await this.herdr.moveWorkspace(lease.workspaceId, 0);
+        await this.publishFirstMateMetadata(lease.workspaceId, options.cwd);
+        await this.refreshMetadata();
+      },
+    );
     return lease;
   }
 
@@ -207,7 +269,7 @@ export class FleetManager {
   }
 
   async assignTask(options: AssignTaskOptions) {
-    await this.requireFirstMate(options.ownerSessionId);
+    const lease = await this.requireFirstMate(options.ownerSessionId);
     if (!TASK_ID.test(options.id))
       throw new Error(
         "Task ID must start with a letter or number and contain at most 64 letters, numbers, dots, underscores, or hyphens.",
@@ -220,81 +282,92 @@ export class FleetManager {
       brief: options.brief,
     });
     const cwd = resolve(options.cwd);
+    const repoBasename = await repositoryBasename(cwd);
     let task = await this.store.createTask({
       id: options.id,
       title,
       brief: options.brief.trim(),
       linearIssue,
       cwd,
+      repoBasename,
       state: "assigning",
       ownerSessionId: options.ownerSessionId,
       ownerPaneId: options.ownerPaneId,
     });
     let workspaceId: string | undefined;
-    try {
-      const workspace = await this.herdr.createTaskWorkspace(
-        cwd,
-        buildWorkspaceLabel(task),
-        {
-          PI_FIRST_MATE_ROLE: "second-mate",
-          PI_FIRST_MATE_TASK_ID: task.id,
-          PI_FIRST_MATE_OWNER_SESSION_ID: options.ownerSessionId,
-        },
-      );
-      workspaceId = workspace.workspaceId;
-      const agentName = mateAgentName(task.id);
-      task = await this.store.updateTask(task.id, {
-        workspaceId: workspace.workspaceId,
-        mateTabId: workspace.tabId,
-        matePaneId: workspace.paneId,
-        mateAgentName: agentName,
-      });
-      await this.publishMetadata(task);
-      const assignment = await this.store.enqueue({
-        taskId: task.id,
-        type: "TASK_ASSIGNED",
-        fromSessionId: options.ownerSessionId,
-        toTaskMate: true,
-        payload: {
-          title: task.title,
-          brief: task.brief,
-          linearIssue: task.linearIssue,
-          cwd: task.cwd,
-        },
-      });
-      const args = [
-        "--session-id",
-        randomUUID(),
-        "--name",
-        `${task.id} second mate`,
-        ...(options.model ? ["--model", options.model] : []),
-        ...(options.reasoning ? ["--thinking", options.reasoning] : []),
-        "--exclude-tools",
-        "first_mate_claim,first_mate_status,task_assign,task_list,task_send,task_cancel,mate_register,workflow",
-      ];
-      await this.herdr.startAgent(agentName, "pi", workspace.paneId, args);
-      await this.herdr.deliverInitialPrompt({
-        name: agentName,
-        harness: "pi",
-        paneId: workspace.paneId,
-        launchArgs: args,
-        prompt: `${buildSecondMatePrompt(task)}\n\nAssignment envelope: ${assignment.id}`,
-      });
-      const registered = await this.store.getTask(task.id);
-      task = await this.store.updateTask(task.id, {
-        state: registered?.mateSessionId ? "active" : "assigned",
-      });
-      await this.publishMetadata(task);
-      return task;
-    } catch (error) {
-      task = await this.store.updateTask(task.id, {
-        state: "failed",
-        error: error instanceof Error ? error.message : String(error),
-      });
-      if (workspaceId)
-        await this.herdr.closeWorkspace(workspaceId).catch(() => undefined);
-      throw error;
-    }
+    return this.preserveFocus(
+      {
+        workspaceId: lease.workspaceId,
+        paneId: options.ownerPaneId ?? lease.paneId,
+      },
+      async () => {
+        try {
+          const workspace = await this.herdr.createTaskWorkspace(
+            cwd,
+            buildWorkspaceLabel(task),
+            {
+              PI_FIRST_MATE_ROLE: "second-mate",
+              PI_FIRST_MATE_TASK_ID: task.id,
+              PI_FIRST_MATE_OWNER_SESSION_ID: options.ownerSessionId,
+            },
+          );
+          workspaceId = workspace.workspaceId;
+          await this.herdr.renameTab(workspace.tabId, "secondmate");
+          const agentName = mateAgentName(task.id);
+          task = await this.store.updateTask(task.id, {
+            workspaceId: workspace.workspaceId,
+            mateTabId: workspace.tabId,
+            matePaneId: workspace.paneId,
+            mateAgentName: agentName,
+          });
+          await this.publishMetadata(task);
+          const assignment = await this.store.enqueue({
+            taskId: task.id,
+            type: "TASK_ASSIGNED",
+            fromSessionId: options.ownerSessionId,
+            toTaskMate: true,
+            payload: {
+              title: task.title,
+              brief: task.brief,
+              linearIssue: task.linearIssue,
+              cwd: task.cwd,
+            },
+          });
+          const args = [
+            "--session-id",
+            randomUUID(),
+            "--name",
+            `${task.id} second mate`,
+            ...(options.model ? ["--model", options.model] : []),
+            ...(options.reasoning ? ["--thinking", options.reasoning] : []),
+            "--exclude-tools",
+            "first_mate_claim,first_mate_status,task_assign,task_list,task_send,task_cancel,mate_register,workflow",
+          ];
+          await this.herdr.startAgent(agentName, "pi", workspace.paneId, args);
+          await this.herdr.deliverInitialPrompt({
+            name: agentName,
+            harness: "pi",
+            paneId: workspace.paneId,
+            launchArgs: args,
+            prompt: `${buildSecondMatePrompt(task)}\n\nAssignment envelope: ${assignment.id}`,
+          });
+          const registered = await this.store.getTask(task.id);
+          task = await this.store.updateTask(task.id, {
+            state: registered?.mateSessionId ? "active" : "assigned",
+          });
+          await this.publishMetadata(task);
+          return task;
+        } catch (error) {
+          task = await this.store.updateTask(task.id, {
+            state: "failed",
+            error: error instanceof Error ? error.message : String(error),
+          });
+          if (workspaceId)
+            await this.herdr.closeWorkspace(workspaceId).catch(() => undefined);
+          throw error;
+        }
+      },
+    );
   }
 
   async registerMate(options: {
@@ -310,6 +383,7 @@ export class FleetManager {
       throw new Error(
         `Task ${task.id} belongs to Herdr workspace ${task.workspaceId}, not ${options.workspaceId}.`,
       );
+    await this.herdr.renameTab(options.tabId, "secondmate");
     const updated = await this.store.updateTask(task.id, {
       mateSessionId: options.sessionId,
       workspaceId: options.workspaceId,
@@ -370,6 +444,7 @@ export class FleetManager {
         tabId: options.tabId,
         paneId: options.paneId,
       });
+    const cwd = resolve(options.cwd);
     const task = await this.store.createTask({
       id: options.taskId,
       title: cleanTitle(options.title),
@@ -380,7 +455,8 @@ export class FleetManager {
         title: options.title,
         brief: options.brief,
       }),
-      cwd: resolve(options.cwd),
+      cwd,
+      repoBasename: await repositoryBasename(cwd),
       state: "active",
       ownerSessionId: options.ownerSessionId,
       mateSessionId: options.mateSessionId,
@@ -390,8 +466,9 @@ export class FleetManager {
     });
     await this.herdr.renameWorkspace(
       options.workspaceId,
-      `${task.id} ${task.title}`,
+      buildWorkspaceLabel(task),
     );
+    await this.herdr.renameTab(options.tabId, "secondmate");
     await this.publishMetadata(task);
     await this.store.enqueue({
       taskId: task.id,
@@ -561,6 +638,14 @@ export class FleetManager {
     );
   }
 
+  private async publishFirstMateMetadata(workspaceId: string, cwd: string) {
+    await this.herdr
+      .reportWorkspaceMetadata(workspaceId, "pi-first-mate", {
+        repo: await repositoryBasename(cwd),
+      })
+      .catch(() => undefined);
+  }
+
   private async publishMetadata(task: FleetTask) {
     if (!task.workspaceId) return;
     const status = task.state.replace("-", " ");
@@ -581,6 +666,7 @@ export class FleetManager {
     );
     await this.herdr
       .reportWorkspaceMetadata(task.workspaceId, "pi-first-mate", {
+        repo: task.repoBasename ?? basename(resolve(task.cwd)),
         task_status: status,
         mate_state: status,
         active_leaves: String(

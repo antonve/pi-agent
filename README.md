@@ -11,6 +11,7 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 - `/workflows` — list workflow run artifacts.
 - To opt into run recaps, load `./extensions/summaries/index.ts` explicitly; that also provides `/summary-model` for storing a private summary-model override under `~/.config/pi-herdr`.
 - `/firstmate status` inspects the machine-wide singleton first mate; `/firstmate claim` explicitly claims it or reclaims it from a dead owner.
+- Claimed first-mate turns stay supervisory: new repo-changing work must be delegated with `task_assign` before direct investigation or edits.
 - `first_mate_claim` and `first_mate_status` expose the same lifecycle to the model.
 - First-mate tools create one Herdr Space per task, with a persistent Pi second mate in the first tab and active headless leaves in later tabs.
 - `task_assign`, `task_list`, `task_send`, and `task_cancel` manage the durable task portfolio after the role is claimed.
