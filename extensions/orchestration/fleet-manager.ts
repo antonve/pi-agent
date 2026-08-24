@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
+import { promisify } from "node:util";
 import type { ReasoningLevel } from "./domain.ts";
 import {
   type FleetMessage,
@@ -10,6 +12,8 @@ import {
 } from "./fleet.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import type { OrchestrationManager } from "./manager.ts";
+
+const execFileAsync = promisify(execFile);
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const TERMINAL_STATES = new Set<FleetTaskState>([
@@ -37,6 +41,25 @@ function cleanTitle(title: string) {
   return title.replace(/\s+/g, " ").trim().slice(0, 80) || "task";
 }
 
+async function repositoryBasename(cwd: string) {
+  try {
+    const result = await execFileAsync(
+      "git",
+      ["rev-parse", "--show-toplevel"],
+      {
+        cwd,
+        timeout: 5_000,
+        env: process.env,
+      },
+    );
+    const root = result.stdout.trim();
+    if (root) return basename(root);
+  } catch {
+    /* Fall back to the current working directory basename. */
+  }
+  return basename(resolve(cwd));
+}
+
 function mateAgentName(taskId: string) {
   const clean = taskId
     .toLowerCase()
@@ -62,6 +85,7 @@ Ownership rules:
 - Raise only captain-level decisions, material risks, scope changes, and unrecoverable blockers to the first mate.
 - Do not copy worker transcripts upward; send concise decisions, risks, and outcomes.
 - Ensure all long-running commands are managed jobs and stop task-owned services before completion.
+- For repository-changing work, verify the change, commit it, push it, open a review-ready PR unless explicitly told to stay local-only, include the PR URL in complete_task, and retain the Treehouse lease for review follow-up.
 - Call complete_task or fail_task exactly once when the task reaches a terminal outcome.`;
 }
 
@@ -95,6 +119,7 @@ export class FleetManager {
     workspaceId: string;
     tabId: string;
     paneId: string;
+    cwd: string;
   }) {
     const current = await this.store.getFirstMate();
     if (current && current.sessionId !== options.sessionId) {
@@ -108,9 +133,15 @@ export class FleetManager {
         );
     }
     const lease = await this.store.claimFirstMate({
-      ...options,
+      sessionId: options.sessionId,
+      workspaceId: options.workspaceId,
+      tabId: options.tabId,
+      paneId: options.paneId,
       expectedSessionId: current?.sessionId,
     });
+    await this.herdr.renameWorkspace(lease.workspaceId, "firstmate");
+    await this.herdr.moveWorkspace(lease.workspaceId, 0);
+    await this.publishFirstMateMetadata(lease.workspaceId, options.cwd);
     await this.refreshMetadata();
     return lease;
   }
@@ -151,11 +182,13 @@ export class FleetManager {
       );
     const title = cleanTitle(options.title);
     const cwd = resolve(options.cwd);
+    const repoBasename = await repositoryBasename(cwd);
     let task = await this.store.createTask({
       id: options.id,
       title,
       brief: options.brief.trim(),
       cwd,
+      repoBasename,
       state: "assigning",
       ownerSessionId: options.ownerSessionId,
       ownerPaneId: options.ownerPaneId,
@@ -298,11 +331,13 @@ export class FleetManager {
         tabId: options.tabId,
         paneId: options.paneId,
       });
+    const cwd = resolve(options.cwd);
     const task = await this.store.createTask({
       id: options.taskId,
       title: cleanTitle(options.title),
       brief: options.brief.trim(),
-      cwd: resolve(options.cwd),
+      cwd,
+      repoBasename: await repositoryBasename(cwd),
       state: "active",
       ownerSessionId: options.ownerSessionId,
       mateSessionId: options.mateSessionId,
@@ -483,6 +518,14 @@ export class FleetManager {
     );
   }
 
+  private async publishFirstMateMetadata(workspaceId: string, cwd: string) {
+    await this.herdr
+      .reportWorkspaceMetadata(workspaceId, "pi-first-mate", {
+        repo: await repositoryBasename(cwd),
+      })
+      .catch(() => undefined);
+  }
+
   private async publishMetadata(task: FleetTask) {
     if (!task.workspaceId) return;
     const status = task.state.replace("-", " ");
@@ -503,6 +546,7 @@ export class FleetManager {
     );
     await this.herdr
       .reportWorkspaceMetadata(task.workspaceId, "pi-first-mate", {
+        repo: task.repoBasename ?? basename(resolve(task.cwd)),
         task_status: status,
         mate_state: status,
         active_leaves: String(

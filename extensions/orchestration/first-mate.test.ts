@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import type { CliRunner } from "./cli.ts";
-import { FleetManager } from "./fleet-manager.ts";
+import { buildSecondMatePrompt, FleetManager } from "./fleet-manager.ts";
 import { FleetStore } from "./fleet.ts";
 import {
   buildHeadlessScript,
@@ -40,6 +41,44 @@ function artifacts(): HeadlessRunArtifacts {
     pidPath: "/state/run/pid",
     scriptPath: "/state/run/run.mjs",
   };
+}
+
+async function withHerdrSocket<T>(
+  run: (requests: Array<Record<string, unknown>>) => Promise<T>,
+) {
+  const directory = await mkdtemp(join(tmpdir(), "pi-herdr-socket-"));
+  const socketPath = join(directory, "herdr.sock");
+  const requests: Array<Record<string, unknown>> = [];
+  const server = createServer((connection) => {
+    let buffer = "";
+    connection.on("data", (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const request = JSON.parse(line) as Record<string, unknown>;
+        requests.push(request);
+        connection.write(
+          `${JSON.stringify({ id: request.id, result: { ok: true } })}\n`,
+        );
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => resolve());
+  });
+  const previousSocketPath = process.env.HERDR_SOCKET_PATH;
+  process.env.HERDR_SOCKET_PATH = socketPath;
+  try {
+    return await run(requests);
+  } finally {
+    if (previousSocketPath === undefined) delete process.env.HERDR_SOCKET_PATH;
+    else process.env.HERDR_SOCKET_PATH = previousSocketPath;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await unlink(socketPath).catch(() => undefined);
+  }
 }
 
 test("all leaf harnesses use explicit headless subcommands", () => {
@@ -193,6 +232,28 @@ test("leaf reports distinguish questions and capture harness sessions", () => {
   );
 });
 
+test("second-mate prompts require verification and review-ready PR delivery", () => {
+  const prompt = buildSecondMatePrompt({
+    id: "TASK-1",
+    title: "Example",
+    brief: "Implement the example",
+    cwd: "/repo",
+    state: "assigned",
+    ownerSessionId: "captain-session",
+    createdAt: 1,
+    updatedAt: 1,
+    version: 1,
+    nextSequence: 1,
+  });
+  assert.match(prompt, /verify the change, commit it, push it/i);
+  assert.match(
+    prompt,
+    /review-ready PR unless explicitly told to stay local-only/i,
+  );
+  assert.match(prompt, /include the PR URL in complete_task/i);
+  assert.match(prompt, /retain the Treehouse lease for review follow-up/i);
+});
+
 test("fleet messages are sequenced, replayed, and acknowledged durably", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-first-mate-"));
   const store = new FleetStore(join(directory, "fleet.json"));
@@ -244,204 +305,250 @@ test("fleet messages are sequenced, replayed, and acknowledged durably", async (
 });
 
 test("task assignment creates one Space with the second mate in its root tab", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-fleet-assignment-"));
-  const calls: string[][] = [];
-  let ownerAlive = true;
-  const runner: CliRunner = {
-    async run(_command, args) {
-      calls.push([...args]);
-      if (args[0] === "workspace" && args[1] === "create")
+  await withHerdrSocket(async (requests) => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-fleet-assignment-"));
+    const calls: string[][] = [];
+    let ownerAlive = true;
+    const runner: CliRunner = {
+      async run(_command, args) {
+        calls.push([...args]);
+        if (args[0] === "workspace" && args[1] === "create")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspace: { workspace_id: "w-task" },
+                tab: { tab_id: "w-task:t1" },
+                root_pane: { pane_id: "w-task:p1" },
+              },
+            }),
+          };
+        if (
+          args[0] === "agent" &&
+          args[1] === "get" &&
+          args[2] === "w-owner:p1" &&
+          !ownerAlive
+        )
+          return {
+            code: 1,
+            stderr: "",
+            stdout: JSON.stringify({
+              error: {
+                code: "agent_not_found",
+                message: "agent target w-owner:p1 not found",
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "get")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-task:p1",
+                agent_status: "idle",
+                agent: "pi",
+                name: "mate-task-1",
+                state_change_seq: 1,
+                interactive_ready: true,
+                launch_pending: false,
+                agent_session: { value: "mate-session" },
+              },
+            }),
+          };
+        if (args[0] === "agent" && args[1] === "prompt")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                pane_id: "w-task:p1",
+                agent_status: "working",
+                agent: "pi",
+                name: "mate-task-1",
+                state_change_seq: 2,
+                interactive_ready: true,
+                launch_pending: false,
+              },
+            }),
+          };
         return {
           code: 0,
           stderr: "",
-          stdout: JSON.stringify({
-            result: {
-              workspace: { workspace_id: "w-task" },
-              tab: { tab_id: "w-task:t1" },
-              root_pane: { pane_id: "w-task:p1" },
-            },
-          }),
+          stdout: JSON.stringify({ result: {} }),
         };
-      if (
-        args[0] === "agent" &&
-        args[1] === "get" &&
-        args[2] === "w-owner:p1" &&
-        !ownerAlive
-      )
-        return {
-          code: 1,
-          stderr: "",
-          stdout: JSON.stringify({
-            error: {
-              code: "agent_not_found",
-              message: "agent target w-owner:p1 not found",
-            },
-          }),
-        };
-      if (args[0] === "agent" && args[1] === "get")
-        return {
-          code: 0,
-          stderr: "",
-          stdout: JSON.stringify({
-            result: {
-              pane_id: "w-task:p1",
-              agent_status: "idle",
-              agent: "pi",
-              name: "mate-task-1",
-              state_change_seq: 1,
-              interactive_ready: true,
-              launch_pending: false,
-              agent_session: { value: "mate-session" },
-            },
-          }),
-        };
-      if (args[0] === "agent" && args[1] === "prompt")
-        return {
-          code: 0,
-          stderr: "",
-          stdout: JSON.stringify({
-            result: {
-              pane_id: "w-task:p1",
-              agent_status: "working",
-              agent: "pi",
-              name: "mate-task-1",
-              state_change_seq: 2,
-              interactive_ready: true,
-              launch_pending: false,
-            },
-          }),
-        };
-      return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
-    },
-  };
-  const herdr = new HerdrClient(runner, {
-    promptReadyPollMs: 1,
-    promptReadyConsecutiveReads: 1,
-  });
-  const orchestration = new OrchestrationManager(
-    herdr,
-    new TreehouseClient(runner),
-    new TaskRegistry(join(directory, "registry.json")),
-    { onComplete() {} },
-  );
-  await assert.rejects(
-    () =>
-      orchestration.startBackground({
-        command: "server",
-        label: "server",
-        cwd: "/repo",
-        placement: "tab",
-        jobKind: "service",
-      }),
-    /require a readiness pattern/,
-  );
-  const store = new FleetStore(join(directory, "fleet.json"));
-  const fleet = new FleetManager(store, herdr, orchestration);
-  await assert.rejects(
-    () => fleet.requireFirstMate("first-mate-session"),
-    /no first mate/,
-  );
-  await fleet.claimFirstMate({
-    sessionId: "first-mate-session",
-    workspaceId: "w-owner",
-    tabId: "w-owner:t1",
-    paneId: "w-owner:p1",
-  });
-  await assert.rejects(
-    () => fleet.requireFirstMate("other-session"),
-    /owned by session first-mate-session/,
-  );
-  const task = await fleet.assignTask({
-    id: "TASK-1",
-    title: "Example task",
-    brief: "Implement the example",
-    cwd: "/repo",
-    ownerSessionId: "first-mate-session",
-  });
-  assert.equal(task.state, "assigned");
-  assert.equal(task.workspaceId, "w-task");
-  assert.equal(task.mateTabId, "w-task:t1");
-  assert.equal(
-    calls.some((args) => args[0] === "tab" && args[1] === "create"),
-    false,
-  );
-  assert.equal(
-    (await store.messagesForTask(task.id))[0]?.type,
-    "TASK_ASSIGNED",
-  );
-  await fleet.registerMate({
-    taskId: task.id,
-    sessionId: "mate-session",
-    workspaceId: "w-task",
-    tabId: "w-task:t1",
-    paneId: "w-task:p1",
-  });
-  await fleet.sendToFirstMate({
-    taskId: task.id,
-    type: "DECISION_REQUEST",
-    fromSessionId: "mate-session",
-    payload: { question: "Use the current API?" },
-  });
-  assert.equal((await store.getTask(task.id))?.state, "waiting-decision");
-  await fleet.sendToMate({
-    taskId: task.id,
-    type: "DECISION_RESPONSE",
-    fromSessionId: "first-mate-session",
-    payload: { answer: "yes" },
-  });
-  await fleet.sendToFirstMate({
-    taskId: task.id,
-    type: "TASK_COMPLETED",
-    fromSessionId: "mate-session",
-    payload: { summary: "Verified" },
-  });
-  assert.equal((await store.getTask(task.id))?.state, "completed");
-  const completion = (await store.messagesForTask(task.id)).find(
-    (message) => message.type === "TASK_COMPLETED",
-  );
-  assert.ok(completion);
-  await store.acknowledge(completion.id, "first-mate-session");
-  await assert.rejects(
-    () =>
-      fleet.claimFirstMate({
-        sessionId: "replacement-session",
-        workspaceId: "w-replacement",
-        tabId: "w-replacement:t1",
-        paneId: "w-replacement:p1",
-      }),
-    /already owned by live session/,
-  );
-  ownerAlive = false;
-  await assert.rejects(
-    () =>
-      fleet.claimFirstMate({
-        sessionId: "replacement-session",
-        workspaceId: "w-replacement",
-        tabId: "w-replacement:t1",
-        paneId: "w-replacement:p1",
-      }),
-    /already owned by live session/,
-  );
-  const staleState = JSON.parse(await readFile(store.path, "utf8")) as {
-    firstMate: { updatedAt: number };
-  };
-  staleState.firstMate.updatedAt = 0;
-  await writeFile(store.path, `${JSON.stringify(staleState, null, 2)}\n`);
-  await fleet.claimFirstMate({
-    sessionId: "replacement-session",
-    workspaceId: "w-replacement",
-    tabId: "w-replacement:t1",
-    paneId: "w-replacement:p1",
-  });
-  assert.equal(
-    (await store.getTask(task.id))?.ownerSessionId,
-    "replacement-session",
-  );
-  assert.ok(
-    (await store.pendingFor("replacement-session")).some(
+      },
+    };
+    const herdr = new HerdrClient(runner, {
+      promptReadyPollMs: 1,
+      promptReadyConsecutiveReads: 1,
+    });
+    const orchestration = new OrchestrationManager(
+      herdr,
+      new TreehouseClient(runner),
+      new TaskRegistry(join(directory, "registry.json")),
+      { onComplete() {} },
+    );
+    await assert.rejects(
+      () =>
+        orchestration.startBackground({
+          command: "server",
+          label: "server",
+          cwd: "/repo",
+          placement: "tab",
+          jobKind: "service",
+        }),
+      /require a readiness pattern/,
+    );
+    const store = new FleetStore(join(directory, "fleet.json"));
+    const fleet = new FleetManager(store, herdr, orchestration);
+    await assert.rejects(
+      () => fleet.requireFirstMate("first-mate-session"),
+      /no first mate/,
+    );
+    await fleet.claimFirstMate({
+      sessionId: "first-mate-session",
+      workspaceId: "w-owner",
+      tabId: "w-owner:t1",
+      paneId: "w-owner:p1",
+      cwd: "/repo",
+    });
+    await assert.rejects(
+      () => fleet.requireFirstMate("other-session"),
+      /owned by session first-mate-session/,
+    );
+    const task = await fleet.assignTask({
+      id: "TASK-1",
+      title: "Example task",
+      brief: "Implement the example",
+      cwd: "/repo",
+      ownerSessionId: "first-mate-session",
+    });
+    assert.equal(task.state, "assigned");
+    assert.equal(task.workspaceId, "w-task");
+    assert.equal(task.mateTabId, "w-task:t1");
+    assert.equal(
+      calls.some((args) => args[0] === "tab" && args[1] === "create"),
+      false,
+    );
+    assert.equal(
+      (await store.messagesForTask(task.id))[0]?.type,
+      "TASK_ASSIGNED",
+    );
+    await fleet.registerMate({
+      taskId: task.id,
+      sessionId: "mate-session",
+      workspaceId: "w-task",
+      tabId: "w-task:t1",
+      paneId: "w-task:p1",
+    });
+    await fleet.sendToFirstMate({
+      taskId: task.id,
+      type: "DECISION_REQUEST",
+      fromSessionId: "mate-session",
+      payload: { question: "Use the current API?" },
+    });
+    assert.equal((await store.getTask(task.id))?.state, "waiting-decision");
+    await fleet.sendToMate({
+      taskId: task.id,
+      type: "DECISION_RESPONSE",
+      fromSessionId: "first-mate-session",
+      payload: { answer: "yes" },
+    });
+    await fleet.sendToFirstMate({
+      taskId: task.id,
+      type: "TASK_COMPLETED",
+      fromSessionId: "mate-session",
+      payload: { summary: "Verified" },
+    });
+    assert.equal((await store.getTask(task.id))?.state, "completed");
+    const completion = (await store.messagesForTask(task.id)).find(
       (message) => message.type === "TASK_COMPLETED",
-    ),
-  );
+    );
+    assert.ok(completion);
+    await store.acknowledge(completion.id, "first-mate-session");
+    await assert.rejects(
+      () =>
+        fleet.claimFirstMate({
+          sessionId: "replacement-session",
+          workspaceId: "w-replacement",
+          tabId: "w-replacement:t1",
+          paneId: "w-replacement:p1",
+          cwd: "/repo",
+        }),
+      /already owned by live session/,
+    );
+    ownerAlive = false;
+    await assert.rejects(
+      () =>
+        fleet.claimFirstMate({
+          sessionId: "replacement-session",
+          workspaceId: "w-replacement",
+          tabId: "w-replacement:t1",
+          paneId: "w-replacement:p1",
+          cwd: "/repo",
+        }),
+      /already owned by live session/,
+    );
+    const staleState = JSON.parse(await readFile(store.path, "utf8")) as {
+      firstMate: { updatedAt: number };
+    };
+    staleState.firstMate.updatedAt = 0;
+    await writeFile(store.path, `${JSON.stringify(staleState, null, 2)}\n`);
+    await fleet.claimFirstMate({
+      sessionId: "replacement-session",
+      workspaceId: "w-replacement",
+      tabId: "w-replacement:t1",
+      paneId: "w-replacement:p1",
+      cwd: "/repo",
+    });
+    assert.equal(
+      (await store.getTask(task.id))?.ownerSessionId,
+      "replacement-session",
+    );
+    assert.ok(
+      (await store.pendingFor("replacement-session")).some(
+        (message) => message.type === "TASK_COMPLETED",
+      ),
+    );
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === "workspace" &&
+          args[1] === "rename" &&
+          args[2] === "w-owner" &&
+          args[3] === "firstmate",
+      ),
+    );
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === "workspace" &&
+          args[1] === "report-metadata" &&
+          args[2] === "w-owner" &&
+          args.includes("repo=repo"),
+      ),
+    );
+    assert.ok(
+      calls.some(
+        (args) =>
+          args[0] === "workspace" &&
+          args[1] === "report-metadata" &&
+          args[2] === "w-task" &&
+          args.includes("repo=repo"),
+      ),
+    );
+    assert.deepEqual(
+      requests
+        .filter((request) => request.method === "workspace.move")
+        .map((request) => request.params),
+      [
+        { workspace_id: "w-owner", insert_index: 0 },
+        { workspace_id: "w-replacement", insert_index: 0 },
+      ],
+    );
+  });
 });
 
 test("manager starts leaves through the headless tab path without agent UI commands", async () => {

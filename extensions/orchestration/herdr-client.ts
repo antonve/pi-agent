@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { createConnection } from "node:net";
 import type { CliRunner } from "./cli.ts";
 import { decodeJson, findNumber, findObjects, findString } from "./cli.ts";
 import type {
@@ -181,6 +183,74 @@ export class HerdrClient {
   private readonly runner: CliRunner;
   private readonly timing: HerdrTiming;
 
+  private async socketJson<T>(
+    method: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const socketPath = process.env.HERDR_SOCKET_PATH;
+    if (!socketPath)
+      throw new Error(
+        `HERDR_SOCKET_PATH is unset; Herdr socket API ${method} is unavailable.`,
+      );
+    return new Promise<T>((resolve, reject) => {
+      const requestId = randomUUID();
+      const socket = createConnection(socketPath);
+      let settled = false;
+      let buffer = "";
+      const complete = (error?: unknown, value?: T) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        socket.destroy();
+        if (error) reject(error);
+        else resolve(value as T);
+      };
+      const timeout = setTimeout(() => {
+        complete(
+          new Error(`Timed out waiting for Herdr socket API ${method}.`),
+        );
+      }, 10_000);
+      const abort = () => complete(signal?.reason ?? new Error("cancelled"));
+      const cleanup = () => {
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", abort);
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) return abort();
+      socket.on("error", (error) => complete(error));
+      socket.on("connect", () => {
+        socket.write(`${JSON.stringify({ id: requestId, method, params })}\n`);
+      });
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const value = decodeJson(line, `Herdr socket API ${method}`) as {
+            id?: string;
+            result?: T;
+            error?: { code?: string; message?: string };
+          };
+          if (value.id !== requestId) continue;
+          if (value.error)
+            return complete(
+              new HerdrCommandError(
+                `Herdr socket API ${method} failed: ${value.error.message ?? line}`,
+                value.error.code,
+              ),
+            );
+          if (value.result === undefined)
+            return complete(
+              new Error(`Herdr socket API ${method} returned no result.`),
+            );
+          return complete(undefined, value.result);
+        }
+      });
+    });
+  }
+
   constructor(runner: CliRunner, timing: Partial<HerdrTiming> = {}) {
     this.runner = runner;
     this.timing = { ...DEFAULT_TIMING, ...timing };
@@ -301,6 +371,21 @@ export class HerdrClient {
 
   async renameWorkspace(workspaceId: string, label: string) {
     return this.json(["workspace", "rename", workspaceId, label]);
+  }
+
+  async moveWorkspace(
+    workspaceId: string,
+    insertIndex: number,
+    signal?: AbortSignal,
+  ) {
+    return this.socketJson(
+      "workspace.move",
+      {
+        workspace_id: workspaceId,
+        insert_index: insertIndex,
+      },
+      signal,
+    );
   }
 
   async closeWorkspace(workspaceId: string) {

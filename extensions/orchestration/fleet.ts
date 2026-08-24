@@ -59,6 +59,7 @@ export interface FleetTask {
   title: string;
   brief: string;
   cwd: string;
+  repoBasename?: string;
   state: FleetTaskState;
   ownerSessionId: string;
   ownerPaneId?: string;
