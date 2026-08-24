@@ -20,6 +20,7 @@ export const REASONING_LEVELS = [
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
 export type TaskKind = "background" | "subagent" | "workflow-child";
+export type ExecutionMode = "interactive" | "headless";
 export const AUTO_CLOSE_MS = 30_000;
 export const UNKNOWN_AGENT_GRACE_MS = 5 * 60_000;
 export const CLOSED_RECORD_RETENTION_MS = 7 * 24 * 60 * 60_000;
@@ -31,14 +32,16 @@ export type TaskStatus =
   | "failed"
   | "blocked"
   | "cancelled"
-  | "interrupted";
+  | "interrupted"
+  | "timed-out";
 
 export function isAutoCloseStatus(status: TaskStatus) {
   return (
     status === "done" ||
     status === "failed" ||
     status === "cancelled" ||
-    status === "interrupted"
+    status === "interrupted" ||
+    status === "timed-out"
   );
 }
 
@@ -65,6 +68,22 @@ export interface TaskRecord {
   createdPane: boolean;
   agentName?: string;
   promptStateChangeSeq?: number;
+  executionMode?: ExecutionMode;
+  harnessSessionId?: string;
+  runDirectory?: string;
+  promptPath?: string;
+  outputPath?: string;
+  exitStatusPath?: string;
+  lastMessagePath?: string;
+  turn?: number;
+  pinned?: boolean;
+  ownerTaskId?: string;
+  jobKind?: "finite" | "service";
+  deadlineAt?: number;
+  readinessPattern?: string;
+  readinessDeadlineAt?: number;
+  readinessAt?: number;
+  stopPolicy?: "parent" | "task";
   harness?: Harness;
   model?: string;
   reasoning?: ReasoningLevel;
@@ -112,6 +131,12 @@ export interface CreatedResource {
   createdPane: boolean;
 }
 
+export interface CreatedTaskWorkspace {
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+}
+
 export interface SpawnAgentOptions {
   prompt: string;
   label: string;
@@ -122,6 +147,7 @@ export interface SpawnAgentOptions {
   isolation: Isolation;
   placement: Placement;
   parentSession?: string;
+  ownerTaskId?: string;
   parentModel?: string;
   parentReasoning?: ReasoningLevel;
   kind?: "subagent" | "workflow-child";

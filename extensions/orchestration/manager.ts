@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import {
@@ -19,6 +19,15 @@ import type {
   TaskRecord,
 } from "./domain.ts";
 import { buildHarnessLaunch } from "./harnesses.ts";
+import {
+  hasHeadlessActivity,
+  HEADLESS_STARTUP_TIMEOUT_MS,
+  parseLeafOutcome,
+  prepareHeadlessRun,
+  readHeadlessExit,
+  readHeadlessOutput,
+  type HeadlessRunArtifacts,
+} from "./headless-runner.ts";
 import { HerdrClient, type HerdrAgent } from "./herdr-client.ts";
 import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry, stateDirectory } from "./registry.ts";
@@ -75,7 +84,7 @@ export function buildBackgroundScript(
   sentinel: string,
   snapshotMarker: string,
 ) {
-  return `export ${BACKGROUND_SNAPSHOT_VARIABLE}='${snapshotMarker}'\n${command}\nstatus=$?\nprintf '\\n${sentinel}:%s\\n' "$status"`;
+  return `export ${BACKGROUND_SNAPSHOT_VARIABLE}='${snapshotMarker}'\n(\n${command}\n) < /dev/null\nstatus=$?\nprintf '\\n${sentinel}:%s\\n' "$status"`;
 }
 
 export function extractFinalBackgroundSnapshot(
@@ -117,7 +126,7 @@ export function buildChildPrompt(options: {
 }) {
   const ending =
     options.kind === "subagent"
-      ? `- End with a concise report for the parent agent between these exact marker lines:\n${PARENT_REPORT_START}\n<report>\n${PARENT_REPORT_END}`
+      ? `- End with exactly one JSON report between these exact marker lines:\n${PARENT_REPORT_START}\n<json-report>\n${PARENT_REPORT_END}\n- The JSON report must contain status (done, question, or failed), summary, changes, verification, risks, question, options, recommendation, and artifacts. Use status question instead of waiting in an interactive prompt.`
       : "- End with a concise report for the parent agent.";
   return `${options.prompt.trim()}\n\nOrchestration constraints:\n- Do not spawn subagents or workflows.\n- Work only in ${options.cwd}.\n${options.lease ? `- This is Treehouse lease ${options.lease.leaseId} held by ${options.lease.holder}; do not return or force-clean it.` : "- This task intentionally uses the supplied shared checkout."}\n${ending}`;
 }
@@ -214,6 +223,7 @@ export class OrchestrationManager {
     cwd: string;
     placement: Placement;
     parentSession?: string;
+    ownerTaskId?: string;
     isolated?: boolean;
     harness?: TaskRecord["harness"];
     model?: string;
@@ -227,25 +237,20 @@ export class OrchestrationManager {
       isolated: options.isolated,
       expectedLong: true,
     });
-    const resource = await this.herdr.createResource(
-      parent,
-      placement,
-      options.cwd,
-      options.label,
-    );
     const now = Date.now();
-    const task: TaskRecord = {
+    const provisional: TaskRecord = {
       id: options.taskId,
       label: options.label,
       kind: options.kind,
       parentSession: options.parentSession,
+      ownerTaskId: options.ownerTaskId,
       parentWorkspaceId: parent.workspaceId,
       parentTabId: parent.tabId,
       parentPaneId: parent.paneId,
-      tabId: resource.tabId,
-      paneId: resource.paneId,
-      createdTab: resource.createdTab,
-      createdPane: resource.createdPane,
+      tabId: parent.tabId,
+      paneId: parent.paneId,
+      createdTab: false,
+      createdPane: false,
       harness: options.harness,
       model: options.model,
       reasoning: options.reasoning,
@@ -256,9 +261,26 @@ export class OrchestrationManager {
       updatedAt: now,
       lease: options.lease,
     };
-    await this.registry.put(task);
-    this.callbacks.onChange?.();
-    return task;
+    await this.registry.put(provisional);
+    try {
+      const resource = await this.herdr.createResource(
+        parent,
+        placement,
+        options.cwd,
+        options.label,
+      );
+      const task = await this.registry.update(provisional.id, {
+        tabId: resource.tabId,
+        paneId: resource.paneId,
+        createdTab: resource.createdTab,
+        createdPane: resource.createdPane,
+      });
+      this.callbacks.onChange?.();
+      return task;
+    } catch (error) {
+      await this.markFailed(provisional.id, error);
+      throw error;
+    }
   }
 
   async startBackground(options: {
@@ -267,10 +289,26 @@ export class OrchestrationManager {
     cwd: string;
     placement: Placement;
     parentSession?: string;
+    ownerTaskId?: string;
+    jobKind?: "finite" | "service";
+    timeoutMs?: number;
+    readyPattern?: string;
+    readinessTimeoutMs?: number;
   }) {
     this.assertAvailable();
     const command = options.command.trim();
     if (!command) throw new Error("bg_start command must not be empty.");
+    const jobKind = options.jobKind ?? "finite";
+    const readyPattern = options.readyPattern?.trim();
+    if (jobKind === "service" && !readyPattern)
+      throw new Error("Managed services require a readiness pattern.");
+    if (jobKind === "finite" && readyPattern)
+      throw new Error(
+        "Readiness patterns are only valid for managed services.",
+      );
+    if (readyPattern) new RegExp(readyPattern);
+    const ownerTaskId =
+      options.ownerTaskId ?? process.env.PI_FIRST_MATE_TASK_ID;
     const taskId = id("bg");
     const label = cleanLabel(options.label);
     const cwd = resolve(options.cwd);
@@ -282,13 +320,27 @@ export class OrchestrationManager {
       placement: options.placement,
       parentSession: options.parentSession,
     });
+    await this.registry.update(task.id, {
+      ownerTaskId,
+      jobKind,
+      deadlineAt:
+        options.timeoutMs === undefined
+          ? undefined
+          : Date.now() + options.timeoutMs,
+      readinessPattern: readyPattern,
+      readinessDeadlineAt:
+        jobKind === "service"
+          ? Date.now() + (options.readinessTimeoutMs ?? 60_000)
+          : undefined,
+      stopPolicy: ownerTaskId ? "task" : "parent",
+    });
     const sentinel = `__PI_HERDR_DONE_${randomBytes(12).toString("hex")}__`;
     const snapshotMarker = `__PI_HERDR_SNAPSHOT_${randomBytes(12).toString("hex")}__`;
     try {
       const script = buildBackgroundScript(command, sentinel, snapshotMarker);
       await this.herdr.runInPane(task.paneId, "sh", ["-lc", script]);
       await this.registry.update(task.id, {
-        status: "running",
+        status: readyPattern ? "starting" : "running",
         sentinel,
         snapshotMarker,
       });
@@ -311,8 +363,28 @@ export class OrchestrationManager {
     void (async () => {
       try {
         while (!controller.signal.aborted) {
-          const task = await this.registry.get(taskId);
-          if (!task || task.status !== "running") return;
+          let task = await this.registry.get(taskId);
+          if (
+            !task ||
+            (task.status !== "starting" && task.status !== "running")
+          )
+            return;
+          if (task.deadlineAt !== undefined && task.deadlineAt <= Date.now()) {
+            await this.herdr.sendKeys(task.paneId, ["ctrl+c"]);
+            await sleep(100);
+            const timeoutMessage = `The managed ${task.jobKind ?? "finite"} job exceeded its configured runtime.`;
+            const captured = await this.herdr
+              .readPane(task.paneId, DEFAULT_MAX_LINES)
+              .catch(() => "");
+            await this.settle(
+              task.id,
+              "timed-out",
+              captured ? `${captured}\n\n${timeoutMessage}` : timeoutMessage,
+              {},
+              ["starting", "running"],
+            );
+            return;
+          }
           let output: string;
           try {
             output = await this.herdr.readPane(
@@ -332,6 +404,33 @@ export class OrchestrationManager {
             }
             throw error;
           }
+          if (
+            task.status === "starting" &&
+            task.readinessDeadlineAt !== undefined &&
+            task.readinessDeadlineAt <= Date.now()
+          ) {
+            await this.herdr.sendKeys(task.paneId, ["ctrl+c"]);
+            const error = `Managed service did not match readiness pattern ${JSON.stringify(task.readinessPattern)} before its deadline.`;
+            await this.settle(
+              task.id,
+              "timed-out",
+              `${output}\n\n${error}`.trim(),
+              { error },
+              ["starting"],
+            );
+            return;
+          }
+          if (
+            task.status === "starting" &&
+            task.readinessPattern &&
+            new RegExp(task.readinessPattern).test(output)
+          ) {
+            task = await this.registry.update(task.id, {
+              status: "running",
+              readinessAt: Date.now(),
+            });
+            this.callbacks.onChange?.();
+          }
           const match = output.match(
             new RegExp(`${escapeRegExp(sentinel)}:(\\d+)`),
           );
@@ -347,13 +446,27 @@ export class OrchestrationManager {
               cleaned,
               snapshotMarker,
             );
+            const unexpectedServiceExit = task.jobKind === "service";
+            const serviceError =
+              "Managed service exited before its owner stopped it.";
+            const captured = stripBackgroundSnapshotMarkers(
+              cleaned,
+              snapshotMarker,
+            );
             await this.settle(
               taskId,
-              exitCode === 0 ? "done" : "failed",
-              stripBackgroundSnapshotMarkers(cleaned, snapshotMarker),
-              { exitCode },
+              unexpectedServiceExit || exitCode !== 0 ? "failed" : "done",
+              unexpectedServiceExit
+                ? `${captured}\n\n${serviceError}`.trim()
+                : captured,
+              {
+                exitCode,
+                ...(unexpectedServiceExit ? { error: serviceError } : {}),
+              },
               ["starting", "running"],
-              report,
+              unexpectedServiceExit
+                ? `${report}\n\n${serviceError}`.trim()
+                : report,
             );
             return;
           }
@@ -362,6 +475,227 @@ export class OrchestrationManager {
               taskId,
               "interrupted",
               "The tracked Herdr pane closed before the command reported an exit status.",
+            );
+            return;
+          }
+          await sleep(POLL_MS, controller.signal);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted)
+          await this.settle(
+            taskId,
+            "failed",
+            error instanceof Error ? error.message : String(error),
+          );
+      } finally {
+        if (this.monitors.get(taskId) === controller)
+          this.monitors.delete(taskId);
+      }
+    })();
+  }
+
+  async spawnLeaf(options: SpawnAgentOptions) {
+    this.assertAvailable();
+    await this.herdr.preflightHarness(options.harness);
+    const taskId = id(options.kind === "workflow-child" ? "wf" : "sa");
+    const label = cleanLabel(options.label);
+    const isolation = resolveIsolation(options.isolation, options.prompt);
+    const holder = `${taskId}-${label
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 32)}`;
+    const lease =
+      isolation === "treehouse"
+        ? await this.treehouse.acquire(options.cwd, holder)
+        : undefined;
+    const cwd = lease?.path ?? resolve(options.cwd);
+    const resolvedLaunch = buildHarnessLaunch({
+      harness: options.harness,
+      model: options.model,
+      reasoning: options.reasoning,
+      parentModel: options.parentModel,
+      parentReasoning: options.parentReasoning,
+    });
+    let task: TaskRecord | undefined;
+    try {
+      task = await this.createRecord({
+        taskId,
+        label,
+        kind: options.kind ?? "subagent",
+        cwd,
+        placement: "tab",
+        parentSession: options.parentSession,
+        ownerTaskId: options.ownerTaskId ?? process.env.PI_FIRST_MATE_TASK_ID,
+        isolated: isolation === "treehouse",
+        harness: options.harness,
+        model: resolvedLaunch.model,
+        reasoning: resolvedLaunch.reasoning,
+        lease,
+      });
+      task = await this.registry.update(task.id, {
+        executionMode: "headless",
+        harnessSessionId: options.harness === "pi" ? randomUUID() : undefined,
+        turn: 0,
+      });
+      const childPrompt = buildChildPrompt({
+        prompt: options.prompt,
+        cwd,
+        kind: task.kind,
+        lease,
+      });
+      return await this.startHeadlessTurn(task, childPrompt);
+    } catch (error) {
+      if (task) await this.markFailed(task.id, error);
+      else if (lease) await this.treehouse.returnLease(lease);
+      throw error;
+    }
+  }
+
+  private async startHeadlessTurn(task: TaskRecord, prompt: string) {
+    if (!task.harness)
+      throw new Error(`Headless task ${task.id} has no harness.`);
+    const turn = (task.turn ?? 0) + 1;
+    const { artifacts } = await prepareHeadlessRun({
+      taskId: task.id,
+      turn,
+      prompt,
+      harness: {
+        harness: task.harness,
+        model: task.model,
+        reasoning: task.reasoning,
+        sessionId: task.harnessSessionId,
+        resume: turn > 1,
+      },
+    });
+    await this.registry.update(task.id, {
+      executionMode: "headless",
+      status: "starting",
+      turn,
+      runDirectory: artifacts.directory,
+      promptPath: artifacts.promptPath,
+      outputPath: artifacts.outputPath,
+      exitStatusPath: artifacts.exitStatusPath,
+      lastMessagePath: artifacts.lastMessagePath,
+      settledAt: undefined,
+      autoCloseAt: undefined,
+      autoCloseCancelled: false,
+      resourceClosedAt: undefined,
+      completionResultPath: undefined,
+      completionReport: undefined,
+      error: undefined,
+      exitCode: undefined,
+    });
+    await this.herdr.runInPane(task.paneId, process.execPath, [
+      artifacts.scriptPath,
+    ]);
+
+    const deadline = Date.now() + HEADLESS_STARTUP_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (await hasHeadlessActivity(artifacts, task.harness)) {
+        const running = await this.registry.update(task.id, {
+          status: "running",
+        });
+        this.monitorHeadless(running.id, artifacts);
+        return running;
+      }
+      const exitCode = await readHeadlessExit(artifacts);
+      if (exitCode !== undefined) {
+        const output = await readHeadlessOutput(artifacts);
+        const outcome = parseLeafOutcome({
+          harness: task.harness,
+          output,
+          exitCode,
+        });
+        const error = `Headless ${task.harness} worker exited with code ${exitCode} before producing prompt-acceptance activity.`;
+        return this.settle(
+          task.id,
+          "failed",
+          output || error,
+          {
+            error,
+            exitCode,
+            harnessSessionId: outcome.sessionId ?? task.harnessSessionId,
+          },
+          ["starting"],
+          outcome.report || error,
+        );
+      }
+      if (!(await this.herdr.paneExists(task.paneId))) {
+        const error = `Headless ${task.harness} worker tab closed during startup.`;
+        return this.settle(
+          task.id,
+          "interrupted",
+          error,
+          { error },
+          ["starting"],
+          error,
+        );
+      }
+      await sleep(200);
+    }
+    await this.herdr.sendKeys(task.paneId, ["ctrl+c"]).catch(() => undefined);
+    const output = await readHeadlessOutput(artifacts);
+    const partial = parseLeafOutcome({
+      harness: task.harness,
+      output,
+      exitCode: 1,
+    });
+    const uncertain = partial.sessionId !== undefined;
+    const error = `Headless ${task.harness} worker produced no prompt-acceptance activity within ${HEADLESS_STARTUP_TIMEOUT_MS / 1_000} seconds.`;
+    return this.settle(
+      task.id,
+      uncertain ? "blocked" : "failed",
+      output || error,
+      {
+        error,
+        harnessSessionId: partial.sessionId ?? task.harnessSessionId,
+      },
+      ["starting"],
+      partial.report || error,
+    );
+  }
+
+  private monitorHeadless(taskId: string, artifacts: HeadlessRunArtifacts) {
+    if (this.monitors.has(taskId)) return;
+    const controller = new AbortController();
+    this.monitors.set(taskId, controller);
+    void (async () => {
+      try {
+        while (!controller.signal.aborted) {
+          const task = await this.registry.get(taskId);
+          if (
+            !task ||
+            (task.status !== "starting" && task.status !== "running")
+          )
+            return;
+          const exitCode = await readHeadlessExit(artifacts);
+          if (exitCode !== undefined) {
+            const output = await readHeadlessOutput(artifacts);
+            const outcome = parseLeafOutcome({
+              harness: task.harness!,
+              output,
+              exitCode,
+              fallbackSessionId: task.harnessSessionId,
+            });
+            await this.settle(
+              task.id,
+              outcome.status,
+              output,
+              {
+                exitCode,
+                harnessSessionId: outcome.sessionId,
+              },
+              ["starting", "running"],
+              outcome.report,
+            );
+            return;
+          }
+          if (!(await this.herdr.paneExists(task.paneId))) {
+            await this.settle(
+              task.id,
+              "interrupted",
+              "The tracked headless worker tab closed before the process reported an exit status.",
             );
             return;
           }
@@ -412,6 +746,7 @@ export class OrchestrationManager {
         cwd,
         placement: options.placement,
         parentSession: options.parentSession,
+        ownerTaskId: options.ownerTaskId ?? process.env.PI_FIRST_MATE_TASK_ID,
         isolated: isolation === "treehouse",
         harness: options.harness,
         model: launch.model,
@@ -597,23 +932,9 @@ export class OrchestrationManager {
     return task;
   }
 
-  private async markFailed(taskId: string, error: unknown) {
-    const settledAt = Date.now();
-    const task = await this.registry.transition(
-      taskId,
-      ["starting", "running"],
-      {
-        status: "failed",
-        error: error instanceof Error ? error.message : String(error),
-        settledAt,
-        autoCloseCancelled: false,
-        autoCloseAt: settledAt + AUTO_CLOSE_MS,
-      },
-    );
-    if (!task) return this.require(taskId);
-    this.callbacks.onChange?.();
-    this.scheduleClose(task.id, AUTO_CLOSE_MS);
-    return task;
+  private markFailed(taskId: string, error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return this.settle(taskId, "failed", message, { error: message });
   }
 
   async enableAutoClose(taskId: string) {
@@ -642,12 +963,24 @@ export class OrchestrationManager {
     const task = await this.registry.get(taskId);
     if (
       !task ||
+      task.pinned === true ||
       !isAutoCloseStatus(task.status) ||
       task.resourceClosedAt !== undefined ||
       !task.autoCloseAt ||
       task.autoCloseAt > Date.now()
     )
       return;
+    if (task.createdTab && task.tabId) {
+      const focused = await this.herdr
+        .tabIsFocused(task.tabId)
+        .catch(() => false);
+      if (focused) {
+        const autoCloseAt = Date.now() + AUTO_CLOSE_MS;
+        await this.registry.update(task.id, { autoCloseAt });
+        this.scheduleClose(task.id, AUTO_CLOSE_MS);
+        return;
+      }
+    }
     try {
       await this.herdr.closeResource(task);
     } catch {
@@ -678,12 +1011,30 @@ export class OrchestrationManager {
     const tasks = await this.registry.list();
     for (const task of tasks) {
       if (parentSession && task.parentSession !== parentSession) continue;
-      if (task.status === "running") {
-        if (task.kind === "background" && task.sentinel)
+      if (task.status === "running" || task.status === "starting") {
+        if (
+          task.executionMode === "headless" &&
+          task.runDirectory &&
+          task.promptPath &&
+          task.outputPath &&
+          task.exitStatusPath &&
+          task.lastMessagePath
+        )
+          this.monitorHeadless(task.id, {
+            directory: task.runDirectory,
+            promptPath: task.promptPath,
+            outputPath: task.outputPath,
+            exitStatusPath: task.exitStatusPath,
+            lastMessagePath: task.lastMessagePath,
+            pidPath: `${task.runDirectory}/pid`,
+            scriptPath: `${task.runDirectory}/run.sh`,
+          });
+        else if (task.kind === "background" && task.sentinel)
           this.monitorBackground(task.id, task.sentinel, task.snapshotMarker);
         else if (task.agentName)
           this.monitorAgent(task.id, task.promptStateChangeSeq);
       } else if (
+        task.pinned !== true &&
         isAutoCloseStatus(task.status) &&
         task.resourceClosedAt === undefined
       ) {
@@ -725,9 +1076,11 @@ export class OrchestrationManager {
       }
     }
     if (task.error) return task.error;
-    const output = task.agentName
-      ? await this.herdr.readAgent(task.agentName)
-      : await this.herdr.readPane(task.paneId);
+    const output = task.outputPath
+      ? await readFile(task.outputPath, "utf8").catch(() => "")
+      : task.agentName
+        ? await this.herdr.readAgent(task.agentName)
+        : await this.herdr.readPane(task.paneId);
     return (await this.boundedOutput(task.id, output)).text;
   }
 
@@ -745,6 +1098,13 @@ export class OrchestrationManager {
 
   async send(idValue: string, text: string) {
     const task = await this.interact(idValue);
+    if (task.executionMode === "headless") {
+      if (task.resourceClosedAt !== undefined)
+        throw new Error(
+          `Headless worker ${task.id} has already closed; spawn a recovery worker instead.`,
+        );
+      return this.startHeadlessTurn(task, text);
+    }
     if (task.agentName) {
       const prompted = await this.herdr.promptAgent(task.agentName, text);
       await this.registry.update(task.id, {
@@ -793,6 +1153,24 @@ export class OrchestrationManager {
     return updated;
   }
 
+  async setPinned(idValue: string, pinned: boolean) {
+    const task = await this.require(idValue);
+    const timer = this.closeTimers.get(task.id);
+    if (timer) clearTimeout(timer);
+    this.closeTimers.delete(task.id);
+    const updated = await this.registry.update(task.id, {
+      pinned,
+      ...(pinned
+        ? { autoCloseAt: undefined }
+        : isAutoCloseStatus(task.status)
+          ? { autoCloseAt: Date.now() + AUTO_CLOSE_MS }
+          : {}),
+    });
+    if (!pinned && isAutoCloseStatus(updated.status))
+      this.scheduleClose(updated.id, AUTO_CLOSE_MS);
+    return updated;
+  }
+
   async close(idValue: string) {
     const task = await this.require(idValue);
     this.monitors.get(task.id)?.abort();
@@ -831,7 +1209,11 @@ export class OrchestrationManager {
     const timer = this.closeTimers.get(task.id);
     if (timer) clearTimeout(timer);
     this.closeTimers.delete(task.id);
-    if (!isAutoCloseStatus(task.status) || task.resourceClosedAt !== undefined)
+    if (
+      task.pinned === true ||
+      !isAutoCloseStatus(task.status) ||
+      task.resourceClosedAt !== undefined
+    )
       return task;
     const autoCloseAt = Date.now() + AUTO_CLOSE_MS;
     const updated = await this.registry.update(task.id, {

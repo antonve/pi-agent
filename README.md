@@ -10,15 +10,20 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 - `/subagents` — list, inspect, focus, prompt, interrupt, close, or attach to children.
 - `/workflows` — list workflow run artifacts.
 - `/summary-model` — store a private summary-model override under `~/.config/pi-herdr`.
+- First-mate tools create one Herdr Space per task, with a persistent Pi second mate in the first tab and active headless leaves in later tabs.
+- `task_assign`, `task_list`, `task_send`, and `task_cancel` manage the durable task portfolio.
+- `mate_register`, `raise_decision`, `complete_task`, and `fail_task` support task-scoped second mates, including independently opened Pi sessions.
 - Linear tools cover routine issue search/read/create/update/comment workflows, with unrestricted GraphQL as a fallback. Set `LINEAR_API_KEY` in `~/.config/agentbox/secrets.env`.
 - `github-dark-default` and warm yellow-orange `gruvbox-dark` themes are included.
 - State, results, workflow artifacts, and lease ownership live under `~/.local/state/pi-herdr`.
 - `systemctl --user status pi-herdr-janitor.timer` — inspect durable cleanup.
 - `journalctl --user -u pi-herdr-janitor.service` — inspect cleanup errors.
 
-Completed, failed, cancelled, and interrupted resources close automatically after 30 seconds; focusing or interacting with one postpones cleanup by another 30 seconds. Blocked resources stay open for input. Working agents have no runtime limit, while agents that remain unknown or detached for five minutes are interrupted and cleaned up. Captured output remains on disk after terminal cleanup, and closed registry records are pruned after seven days. Guarded Treehouse return never uses `--force`; dirty leases remain visible in the registry and `treehouse status`.
+Completed, failed, cancelled, interrupted, and timed-out resources close automatically after 30 seconds; focusing or interacting with one postpones cleanup by another 30 seconds. Only explicit pinning retains a settled resource. Blocked leaf turns stay available for a headless resume. Captured output remains on disk after terminal cleanup, and closed registry records are pruned after seven days. Guarded Treehouse return never uses `--force`; dirty leases remain visible in the registry and `treehouse status`.
 
-Subagent spawn returns `running` only after Herdr reports the expected harness as interactively ready in the created pane and observes post-submission `working` or `blocked` activity. Startup replacement and prompt delivery are retried within fixed bounds; an unacknowledged initial prompt records a failed task instead of leaving an empty running agent.
+Leaf workers use process-per-turn headless Pi, Claude Code, Codex, or OpenCode invocations. A no-shell wrapper supplies prompts through stdin or process arguments at startup, structured activity acknowledges delivery, and follow-ups resume the same harness session. Leaves cannot launch nested agents or control Herdr/Treehouse resources. Herdr hosts visible task tabs but does not type prompts or simulate Enter for leaves.
+
+Fleet state and acknowledged control messages live under `~/.local/state/pi-herdr/fleet.json`. The extension deterministically checks this inbox without model polling and wakes sessions only for decisions, material risks, failures, cancellations, and final outcomes. The janitor reconciles terminal task workspaces after their outcome is acknowledged.
 
 ## Calm tool output
 

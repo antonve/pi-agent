@@ -1121,6 +1121,7 @@ test("all settled resources except blocked ones are eligible for auto-close", ()
   assert.equal(isAutoCloseStatus("failed"), true);
   assert.equal(isAutoCloseStatus("cancelled"), true);
   assert.equal(isAutoCloseStatus("interrupted"), true);
+  assert.equal(isAutoCloseStatus("timed-out"), true);
   assert.equal(isAutoCloseStatus("blocked"), false);
 });
 
