@@ -246,6 +246,7 @@ test("fleet messages are sequenced, replayed, and acknowledged durably", async (
 test("task assignment creates one Space with the second mate in its root tab", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-fleet-assignment-"));
   const calls: string[][] = [];
+  let ownerAlive = true;
   const runner: CliRunner = {
     async run(_command, args) {
       calls.push([...args]);
@@ -258,6 +259,22 @@ test("task assignment creates one Space with the second mate in its root tab", a
               workspace: { workspace_id: "w-task" },
               tab: { tab_id: "w-task:t1" },
               root_pane: { pane_id: "w-task:p1" },
+            },
+          }),
+        };
+      if (
+        args[0] === "agent" &&
+        args[1] === "get" &&
+        args[2] === "w-owner:p1" &&
+        !ownerAlive
+      )
+        return {
+          code: 1,
+          stderr: "",
+          stdout: JSON.stringify({
+            error: {
+              code: "agent_not_found",
+              message: "agent target w-owner:p1 not found",
             },
           }),
         };
@@ -320,6 +337,20 @@ test("task assignment creates one Space with the second mate in its root tab", a
   );
   const store = new FleetStore(join(directory, "fleet.json"));
   const fleet = new FleetManager(store, herdr, orchestration);
+  await assert.rejects(
+    () => fleet.requireFirstMate("first-mate-session"),
+    /no first mate/,
+  );
+  await fleet.claimFirstMate({
+    sessionId: "first-mate-session",
+    workspaceId: "w-owner",
+    tabId: "w-owner:t1",
+    paneId: "w-owner:p1",
+  });
+  await assert.rejects(
+    () => fleet.requireFirstMate("other-session"),
+    /owned by session first-mate-session/,
+  );
   const task = await fleet.assignTask({
     id: "TASK-1",
     title: "Example task",
@@ -365,6 +396,52 @@ test("task assignment creates one Space with the second mate in its root tab", a
     payload: { summary: "Verified" },
   });
   assert.equal((await store.getTask(task.id))?.state, "completed");
+  const completion = (await store.messagesForTask(task.id)).find(
+    (message) => message.type === "TASK_COMPLETED",
+  );
+  assert.ok(completion);
+  await store.acknowledge(completion.id, "first-mate-session");
+  await assert.rejects(
+    () =>
+      fleet.claimFirstMate({
+        sessionId: "replacement-session",
+        workspaceId: "w-replacement",
+        tabId: "w-replacement:t1",
+        paneId: "w-replacement:p1",
+      }),
+    /already owned by live session/,
+  );
+  ownerAlive = false;
+  await assert.rejects(
+    () =>
+      fleet.claimFirstMate({
+        sessionId: "replacement-session",
+        workspaceId: "w-replacement",
+        tabId: "w-replacement:t1",
+        paneId: "w-replacement:p1",
+      }),
+    /already owned by live session/,
+  );
+  const staleState = JSON.parse(await readFile(store.path, "utf8")) as {
+    firstMate: { updatedAt: number };
+  };
+  staleState.firstMate.updatedAt = 0;
+  await writeFile(store.path, `${JSON.stringify(staleState, null, 2)}\n`);
+  await fleet.claimFirstMate({
+    sessionId: "replacement-session",
+    workspaceId: "w-replacement",
+    tabId: "w-replacement:t1",
+    paneId: "w-replacement:p1",
+  });
+  assert.equal(
+    (await store.getTask(task.id))?.ownerSessionId,
+    "replacement-session",
+  );
+  assert.ok(
+    (await store.pendingFor("replacement-session")).some(
+      (message) => message.type === "TASK_COMPLETED",
+    ),
+  );
 });
 
 test("manager starts leaves through the headless tab path without agent UI commands", async () => {

@@ -4,6 +4,10 @@ import {
   CLOSED_RECORD_RETENTION_MS,
   isAutoCloseStatus,
 } from "./extensions/orchestration/domain.ts";
+import {
+  FIRST_MATE_HEARTBEAT_STALE_MS,
+  FIRST_MATE_RECLAIM_GRACE_MS,
+} from "./extensions/orchestration/fleet-manager.ts";
 import { FleetStore } from "./extensions/orchestration/fleet.ts";
 import { HerdrClient } from "./extensions/orchestration/herdr-client.ts";
 import { TaskRegistry } from "./extensions/orchestration/registry.ts";
@@ -93,6 +97,22 @@ async function managedAgentExists(paneId: string) {
 }
 
 const fleet = new FleetStore();
+let firstMate = await fleet.getFirstMate();
+let firstMateGoneBeyondGrace = false;
+if (firstMate) {
+  const heartbeatFresh =
+    now - firstMate.updatedAt < FIRST_MATE_HEARTBEAT_STALE_MS;
+  const alive = heartbeatFresh || (await managedAgentExists(firstMate.paneId));
+  if (alive) {
+    firstMate = await fleet.clearFirstMateLost(firstMate.sessionId, now);
+  } else {
+    firstMate = await fleet.markFirstMateLost(firstMate.sessionId, now);
+    firstMateGoneBeyondGrace =
+      firstMate?.lostAt !== undefined &&
+      now - firstMate.lostAt >= FIRST_MATE_RECLAIM_GRACE_MS;
+  }
+}
+
 for (const original of await fleet.listTasks()) {
   let task = original;
   const terminal =
@@ -100,9 +120,12 @@ for (const original of await fleet.listTasks()) {
     task.state === "failed" ||
     task.state === "cancelled";
   if (!terminal) {
-    const ownerGone = task.ownerPaneId
-      ? !(await managedAgentExists(task.ownerPaneId))
-      : false;
+    const ownerGone =
+      firstMate?.sessionId === task.ownerSessionId
+        ? firstMateGoneBeyondGrace
+        : task.ownerPaneId
+          ? !(await managedAgentExists(task.ownerPaneId))
+          : false;
     const mateGone = task.matePaneId
       ? !(await managedAgentExists(task.matePaneId))
       : false;

@@ -357,6 +357,7 @@ export default function orchestration(pi: ExtensionAPI) {
     if (!sessionId || fleetPollRunning) return;
     fleetPollRunning = true;
     try {
+      await fleet.heartbeatFirstMate(sessionId);
       const messages = await fleet.pendingFor(sessionId, mateTaskId);
       for (const message of messages) {
         if (deliveredFleetMessages.has(message.id)) {
@@ -437,6 +438,23 @@ export default function orchestration(pi: ExtensionAPI) {
           )
         : undefined,
     );
+  }
+
+  async function claimCurrentFirstMate(ctx: ExtensionContext) {
+    if (mateTaskId)
+      throw new Error(
+        `This session is already the second mate for ${mateTaskId} and cannot become first mate.`,
+      );
+    const location = await herdr.current();
+    const lease = await fleet.claimFirstMate({
+      sessionId: ctx.sessionManager.getSessionId(),
+      workspaceId: location.workspaceId,
+      tabId: location.tabId,
+      paneId: location.paneId,
+    });
+    await pollFleetInbox();
+    const tasks = await fleet.list(lease.sessionId);
+    return { lease, tasks };
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -535,6 +553,50 @@ export default function orchestration(pi: ExtensionAPI) {
   pi.registerMessageRenderer("herdr-task-result", renderHerdrTaskResult);
 
   pi.registerTool({
+    name: "first_mate_claim",
+    label: "Claim Machine First Mate",
+    description:
+      "Explicitly claim the singleton first-mate role for this machine. Refuses while another live first mate owns it; reclaims all tasks and pending outcomes from a dead owner.",
+    parameters: Type.Object({}),
+    async execute(_call, _params, _signal, _update, ctx) {
+      const { lease, tasks } = await claimCurrentFirstMate(ctx);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Claimed the machine first-mate role for session ${lease.sessionId} in workspace ${lease.workspaceId}. ${tasks.length} task${tasks.length === 1 ? "" : "s"} now belong to this session.`,
+          },
+        ],
+        details: { lease, tasks },
+      };
+    },
+    ...compactSubagentRendering(() => "first mate claim"),
+  });
+
+  pi.registerTool({
+    name: "first_mate_status",
+    label: "Inspect Machine First Mate",
+    description:
+      "Show which Pi session owns the singleton machine first-mate role and whether its Herdr agent is alive.",
+    parameters: Type.Object({}),
+    async execute() {
+      const status = await fleet.firstMateStatus();
+      return {
+        content: [
+          {
+            type: "text",
+            text: status.lease
+              ? `First mate: ${status.lease.sessionId} · workspace ${status.lease.workspaceId} · ${status.alive ? "alive" : "stale/reclaimable"}`
+              : "This machine has no first mate. Use first_mate_claim to claim it.",
+          },
+        ],
+        details: status,
+      };
+    },
+    ...compactSubagentRendering(() => "first mate status"),
+  });
+
+  pi.registerTool({
     name: "task_assign",
     label: "Assign Task to Second Mate",
     description:
@@ -585,7 +647,9 @@ export default function orchestration(pi: ExtensionAPI) {
       "List tasks owned by this first-mate session with their second-mate and Herdr workspace state.",
     parameters: Type.Object({}),
     async execute(_call, _params, _signal, _update, ctx) {
-      const tasks = await fleet.list(ctx.sessionManager.getSessionId());
+      const currentSessionId = ctx.sessionManager.getSessionId();
+      await fleet.requireFirstMate(currentSessionId);
+      const tasks = await fleet.list(currentSessionId);
       return {
         content: [
           {
@@ -706,6 +770,8 @@ export default function orchestration(pi: ExtensionAPI) {
           .getActiveTools()
           .filter(
             (name) =>
+              name !== "first_mate_claim" &&
+              name !== "first_mate_status" &&
               name !== "task_assign" &&
               name !== "task_list" &&
               name !== "task_send" &&
@@ -1341,6 +1407,39 @@ export default function orchestration(pi: ExtensionAPI) {
       await manager.attach(taskId);
     else ctx.ui.notify(commandHelp(kind), "warning");
   }
+
+  pi.registerCommand("firstmate", {
+    description: "Claim, reclaim, or inspect the machine first-mate role",
+    handler: async (args, ctx) => {
+      try {
+        const action = args.trim() || "status";
+        if (action === "claim") {
+          const { lease, tasks } = await claimCurrentFirstMate(ctx);
+          ctx.ui.notify(
+            `First mate claimed by ${lease.sessionId}; adopted ${tasks.length} task${tasks.length === 1 ? "" : "s"}.`,
+            "info",
+          );
+          return;
+        }
+        if (action === "status") {
+          const status = await fleet.firstMateStatus();
+          ctx.ui.notify(
+            status.lease
+              ? `First mate ${status.lease.sessionId} in ${status.lease.workspaceId} is ${status.alive ? "alive" : "stale and reclaimable"}.`
+              : "No first mate is claimed. Run /firstmate claim.",
+            "info",
+          );
+          return;
+        }
+        ctx.ui.notify("Usage: /firstmate [status|claim]", "warning");
+      } catch (error) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : String(error),
+          "warning",
+        );
+      }
+    },
+  });
 
   pi.registerCommand("ps", {
     description: "Inspect and interact with tracked Herdr background tasks",

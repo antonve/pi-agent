@@ -19,6 +19,8 @@ const TERMINAL_STATES = new Set<FleetTaskState>([
 ]);
 
 export const TASK_WORKSPACE_CLOSE_MS = 30_000;
+export const FIRST_MATE_HEARTBEAT_STALE_MS = 15_000;
+export const FIRST_MATE_RECLAIM_GRACE_MS = 5 * 60_000;
 
 export interface AssignTaskOptions {
   id: string;
@@ -88,7 +90,61 @@ export class FleetManager {
     this.orchestration = orchestration;
   }
 
+  async claimFirstMate(options: {
+    sessionId: string;
+    workspaceId: string;
+    tabId: string;
+    paneId: string;
+  }) {
+    const current = await this.store.getFirstMate();
+    if (current && current.sessionId !== options.sessionId) {
+      const heartbeatFresh =
+        Date.now() - current.updatedAt < FIRST_MATE_HEARTBEAT_STALE_MS;
+      const alive =
+        heartbeatFresh || (await this.herdr.agentExists(current.paneId));
+      if (alive)
+        throw new Error(
+          `First mate is already owned by live session ${current.sessionId} in workspace ${current.workspaceId}.`,
+        );
+    }
+    const lease = await this.store.claimFirstMate({
+      ...options,
+      expectedSessionId: current?.sessionId,
+    });
+    await this.refreshMetadata();
+    return lease;
+  }
+
+  async firstMateStatus() {
+    const lease = await this.store.getFirstMate();
+    if (!lease) return { lease: undefined, alive: false };
+    const heartbeatFresh =
+      Date.now() - lease.updatedAt < FIRST_MATE_HEARTBEAT_STALE_MS;
+    const alive =
+      heartbeatFresh ||
+      (await this.herdr.agentExists(lease.paneId).catch(() => true));
+    return { lease, alive };
+  }
+
+  heartbeatFirstMate(sessionId: string) {
+    return this.store.touchFirstMate(sessionId);
+  }
+
+  async requireFirstMate(sessionId: string) {
+    const lease = await this.store.getFirstMate();
+    if (!lease)
+      throw new Error(
+        "This machine has no first mate. Claim it with first_mate_claim before managing tasks.",
+      );
+    if (lease.sessionId !== sessionId)
+      throw new Error(
+        `First mate is owned by session ${lease.sessionId}; this session must not manage its portfolio.`,
+      );
+    return lease;
+  }
+
   async assignTask(options: AssignTaskOptions) {
+    await this.requireFirstMate(options.ownerSessionId);
     if (!TASK_ID.test(options.id))
       throw new Error(
         "Task ID must start with a letter or number and contain at most 64 letters, numbers, dots, underscores, or hyphens.",
@@ -143,7 +199,7 @@ export class FleetManager {
         ...(options.model ? ["--model", options.model] : []),
         ...(options.reasoning ? ["--thinking", options.reasoning] : []),
         "--exclude-tools",
-        "task_assign,task_list,task_send,task_cancel,mate_register,workflow",
+        "first_mate_claim,first_mate_status,task_assign,task_list,task_send,task_cancel,mate_register,workflow",
       ];
       await this.herdr.startAgent(agentName, "pi", workspace.paneId, args);
       await this.herdr.deliverInitialPrompt({
@@ -232,6 +288,7 @@ export class FleetManager {
     tabId: string;
     paneId: string;
   }) {
+    await this.requireFirstMate(options.ownerSessionId);
     const existing = await this.store.getTask(options.taskId);
     if (existing)
       return this.registerMate({
@@ -282,6 +339,7 @@ export class FleetManager {
     fromSessionId: string;
     payload: Record<string, unknown>;
   }) {
+    await this.requireFirstMate(options.fromSessionId);
     const task = await this.requireOwnedTask(
       options.taskId,
       options.fromSessionId,

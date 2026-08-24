@@ -44,6 +44,16 @@ export type FleetTaskState =
   | "failed"
   | "cancelled";
 
+export interface FirstMateLease {
+  sessionId: string;
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+  claimedAt: number;
+  updatedAt: number;
+  lostAt?: number;
+}
+
 export interface FleetTask {
   id: string;
   title: string;
@@ -86,6 +96,7 @@ export interface FleetMessage {
 
 interface FleetState {
   version: 1;
+  firstMate?: FirstMateLease;
   tasks: FleetTask[];
   messages: FleetMessage[];
 }
@@ -93,6 +104,15 @@ interface FleetState {
 function emptyState(): FleetState {
   return { version: 1, tasks: [], messages: [] };
 }
+
+const FIRST_MATE_INBOUND_TYPES = new Set<FleetMessageType>([
+  "TASK_ACCEPTED",
+  "DECISION_REQUEST",
+  "MATERIAL_RISK",
+  "TASK_BLOCKED",
+  "TASK_COMPLETED",
+  "TASK_FAILED",
+]);
 
 function isErrno(error: unknown, code: string) {
   return (
@@ -185,6 +205,132 @@ export class FleetStore {
     const result = this.queue.then(locked, locked);
     this.queue = result.catch(() => undefined);
     return result;
+  }
+
+  getFirstMate() {
+    return this.serialize(async () => (await this.readUnlocked()).firstMate);
+  }
+
+  claimFirstMate(options: {
+    sessionId: string;
+    workspaceId: string;
+    tabId: string;
+    paneId: string;
+    expectedSessionId?: string;
+  }) {
+    return this.serialize(async () => {
+      const state = await this.readUnlocked();
+      if (state.firstMate?.sessionId !== options.expectedSessionId)
+        throw new Error("First-mate ownership changed while claiming it.");
+      const now = Date.now();
+      const previousOwners = new Set(
+        state.tasks.map((task) => task.ownerSessionId),
+      );
+      const sameSession = state.firstMate?.sessionId === options.sessionId;
+      const replayIds = new Set<string>();
+      if (!sameSession) {
+        for (const task of state.tasks) {
+          const replayType: FleetMessageType | undefined =
+            task.state === "waiting-decision"
+              ? "DECISION_REQUEST"
+              : task.state === "blocked"
+                ? "TASK_BLOCKED"
+                : task.state === "failed"
+                  ? "TASK_FAILED"
+                  : task.state === "completed"
+                    ? "TASK_COMPLETED"
+                    : task.state === "active"
+                      ? "MATERIAL_RISK"
+                      : undefined;
+          if (!replayType) continue;
+          const latest = [...state.messages]
+            .reverse()
+            .find(
+              (message) =>
+                message.taskId === task.id && message.type === replayType,
+            );
+          if (latest) replayIds.add(latest.id);
+        }
+      }
+      const lease: FirstMateLease = {
+        sessionId: options.sessionId,
+        workspaceId: options.workspaceId,
+        tabId: options.tabId,
+        paneId: options.paneId,
+        claimedAt: sameSession ? state.firstMate!.claimedAt : now,
+        updatedAt: now,
+      };
+      state.firstMate = lease;
+      state.tasks = state.tasks.map((task) => ({
+        ...task,
+        ownerSessionId: options.sessionId,
+        ownerPaneId: options.paneId,
+        version: task.version + 1,
+        updatedAt: now,
+      }));
+      state.messages = state.messages.map((message) => {
+        const inboundForPreviousOwner =
+          message.toSessionId !== undefined &&
+          previousOwners.has(message.toSessionId) &&
+          FIRST_MATE_INBOUND_TYPES.has(message.type);
+        if (
+          !inboundForPreviousOwner ||
+          (message.acknowledgedAt !== undefined && !replayIds.has(message.id))
+        )
+          return message;
+        return {
+          ...message,
+          toSessionId: options.sessionId,
+          acknowledgedAt: undefined,
+          acknowledgedBy: undefined,
+          disposition: undefined,
+          rejectionReason: undefined,
+        };
+      });
+      await this.writeUnlocked(state);
+      return lease;
+    });
+  }
+
+  touchFirstMate(sessionId: string, now = Date.now()) {
+    return this.serialize(async () => {
+      const state = await this.readUnlocked();
+      if (!state.firstMate || state.firstMate.sessionId !== sessionId)
+        return state.firstMate;
+      if (now - state.firstMate.updatedAt < 5_000) return state.firstMate;
+      const { lostAt: _lostAt, ...lease } = state.firstMate;
+      state.firstMate = { ...lease, updatedAt: now };
+      await this.writeUnlocked(state);
+      return state.firstMate;
+    });
+  }
+
+  markFirstMateLost(sessionId: string, now = Date.now()) {
+    return this.serialize(async () => {
+      const state = await this.readUnlocked();
+      if (!state.firstMate || state.firstMate.sessionId !== sessionId)
+        return state.firstMate;
+      if (state.firstMate.lostAt !== undefined) return state.firstMate;
+      state.firstMate = { ...state.firstMate, lostAt: now, updatedAt: now };
+      await this.writeUnlocked(state);
+      return state.firstMate;
+    });
+  }
+
+  clearFirstMateLost(sessionId: string, now = Date.now()) {
+    return this.serialize(async () => {
+      const state = await this.readUnlocked();
+      if (
+        !state.firstMate ||
+        state.firstMate.sessionId !== sessionId ||
+        state.firstMate.lostAt === undefined
+      )
+        return state.firstMate;
+      const { lostAt: _lostAt, ...lease } = state.firstMate;
+      state.firstMate = { ...lease, updatedAt: now };
+      await this.writeUnlocked(state);
+      return state.firstMate;
+    });
   }
 
   listTasks() {

@@ -1,7 +1,7 @@
 import type { Harness, ReasoningLevel } from "./domain.ts";
 
 const CHILD_DISABLED_TOOLS =
-  "background_wait,bg_start,bg_status,bg_list,bg_kill,subagent_spawn,subagent_wait,subagent_check,subagent_list,subagent_cancel,subagent_send,resource_pin,worker_spawn,worker_wait,worker_check,worker_list,worker_cancel,worker_send,workflow,ask_user,task_assign,task_list,task_send,task_cancel,mate_register,raise_decision,complete_task,fail_task";
+  "background_wait,bg_start,bg_status,bg_list,bg_kill,subagent_spawn,subagent_wait,subagent_check,subagent_list,subagent_cancel,subagent_send,resource_pin,worker_spawn,worker_wait,worker_check,worker_list,worker_cancel,worker_send,workflow,ask_user,first_mate_claim,first_mate_status,task_assign,task_list,task_send,task_cancel,mate_register,raise_decision,complete_task,fail_task";
 
 export interface HarnessOptions {
   harness: Harness;
