@@ -26,12 +26,17 @@ export interface AssignTaskOptions {
   id: string;
   title: string;
   brief: string;
+  linearIssue?: string;
   cwd: string;
   ownerSessionId: string;
   ownerPaneId?: string;
   model?: string;
   reasoning?: ReasoningLevel;
 }
+
+const LINEAR_ISSUE_IDENTIFIER = /\b([A-Z][A-Z0-9]+-\d+)\b/;
+const LINEAR_ISSUE_URL =
+  /\bhttps:\/\/(?:app\.)?linear\.app\/[^\s/]+\/issue\/([A-Z][A-Z0-9]+-\d+)(?:\b|\/[^\s]*)/i;
 
 function cleanTitle(title: string) {
   return title.replace(/\s+/g, " ").trim().slice(0, 80) || "task";
@@ -46,13 +51,71 @@ function mateAgentName(taskId: string) {
   return `mate-${clean || randomUUID().slice(0, 8)}`;
 }
 
+export function parseLinearIssueReference(value: string) {
+  const urlMatch = value.match(LINEAR_ISSUE_URL);
+  if (urlMatch?.[1]) return urlMatch[1].toUpperCase();
+  const identifierMatch = value.match(LINEAR_ISSUE_IDENTIFIER);
+  if (identifierMatch?.[1]) return identifierMatch[1].toUpperCase();
+  return undefined;
+}
+
+function resolveLinearIssueReference(options: {
+  linearIssue?: string;
+  taskId?: string;
+  title: string;
+  brief: string;
+}) {
+  if (options.linearIssue) {
+    const explicit = parseLinearIssueReference(options.linearIssue.trim());
+    if (!explicit)
+      throw new Error(
+        `Linear issue must be an identifier like ENG-123 or a Linear issue URL; received ${options.linearIssue}.`,
+      );
+    return explicit;
+  }
+  return parseLinearIssueReference(
+    `${options.taskId ?? ""}\n${options.title}\n${options.brief}`,
+  );
+}
+
+export function buildManagedLinearPlanCommentMarker(
+  task: Pick<FleetTask, "id" | "linearIssue">,
+) {
+  if (!task.linearIssue)
+    throw new Error("Managed Linear plan comments require a Linear issue.");
+  return `<!-- pi-linear-sync task=${task.id} issue=${task.linearIssue} -->`;
+}
+
+function buildWorkspaceLabel(
+  task: Pick<FleetTask, "id" | "title" | "linearIssue">,
+) {
+  return `${task.linearIssue ?? task.id} ${task.title}`;
+}
+
+function buildLinearSyncPrompt(task: FleetTask) {
+  if (!task.linearIssue) return "";
+  return `
+
+Linear synchronization:
+- This task is linked to Linear issue ${task.linearIssue}.
+- Before planning, read the issue with linear_get_issue.
+- When work begins, move the issue to the team’s started workflow state.
+- Preserve the issue description and any human-authored content.
+- Maintain exactly one managed living-plan comment whose first line is ${buildManagedLinearPlanCommentMarker(task)}.
+- If that managed comment already exists, update it instead of creating another; create it once with linear_add_comment, then use linear_graphql to edit that same comment when the plan or checkbox progress changes.
+- Add concise material decisions, blockers, and outcome context to that same managed comment.
+- Prefer linear_get_issue, linear_list_resources, linear_update_issue, and linear_add_comment; use linear_graphql only as the fallback for editing the managed comment.
+- Leave blocked or failed work open with an explanatory update.
+- Move the issue to completed only after verified success and immediately before complete_task.`;
+}
+
 export function buildSecondMatePrompt(task: FleetTask) {
   return `You are the second mate responsible for exactly one task.
 
 Task: ${task.id} — ${task.title}
 Working directory: ${task.cwd}
 
-${task.brief.trim()}
+${task.brief.trim()}${buildLinearSyncPrompt(task)}
 
 Ownership rules:
 - Own this task through planning, delegation, verification, and final reporting.
@@ -150,11 +213,18 @@ export class FleetManager {
         "Task ID must start with a letter or number and contain at most 64 letters, numbers, dots, underscores, or hyphens.",
       );
     const title = cleanTitle(options.title);
+    const linearIssue = resolveLinearIssueReference({
+      taskId: options.id,
+      linearIssue: options.linearIssue,
+      title: options.title,
+      brief: options.brief,
+    });
     const cwd = resolve(options.cwd);
     let task = await this.store.createTask({
       id: options.id,
       title,
       brief: options.brief.trim(),
+      linearIssue,
       cwd,
       state: "assigning",
       ownerSessionId: options.ownerSessionId,
@@ -164,7 +234,7 @@ export class FleetManager {
     try {
       const workspace = await this.herdr.createTaskWorkspace(
         cwd,
-        `${task.id} ${title}`,
+        buildWorkspaceLabel(task),
         {
           PI_FIRST_MATE_ROLE: "second-mate",
           PI_FIRST_MATE_TASK_ID: task.id,
@@ -188,6 +258,7 @@ export class FleetManager {
         payload: {
           title: task.title,
           brief: task.brief,
+          linearIssue: task.linearIssue,
           cwd: task.cwd,
         },
       });
@@ -281,6 +352,7 @@ export class FleetManager {
     taskId: string;
     title: string;
     brief: string;
+    linearIssue?: string;
     cwd: string;
     ownerSessionId: string;
     mateSessionId: string;
@@ -302,6 +374,12 @@ export class FleetManager {
       id: options.taskId,
       title: cleanTitle(options.title),
       brief: options.brief.trim(),
+      linearIssue: resolveLinearIssueReference({
+        taskId: options.taskId,
+        linearIssue: options.linearIssue,
+        title: options.title,
+        brief: options.brief,
+      }),
       cwd: resolve(options.cwd),
       state: "active",
       ownerSessionId: options.ownerSessionId,
