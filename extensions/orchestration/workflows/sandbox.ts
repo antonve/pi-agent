@@ -17,6 +17,8 @@ export interface SandboxAgentOptions {
   model?: unknown;
   provider?: unknown;
   effort?: unknown;
+  role?: unknown;
+  reviewTargetModel?: unknown;
   harness?: unknown;
   isolation?: unknown;
   sharedLease?: unknown;
@@ -73,6 +75,10 @@ function sanitizeAgentOptions(value: unknown): SandboxAgentOptions {
     ...(value.model !== undefined ? { model: value.model } : {}),
     ...(value.provider !== undefined ? { provider: value.provider } : {}),
     ...(value.effort !== undefined ? { effort: value.effort } : {}),
+    ...(value.role !== undefined ? { role: value.role } : {}),
+    ...(value.reviewTargetModel !== undefined
+      ? { reviewTargetModel: value.reviewTargetModel }
+      : {}),
     ...(value.harness !== undefined ? { harness: value.harness } : {}),
     ...(value.isolation !== undefined ? { isolation: value.isolation } : {}),
     ...(value.sharedLease !== undefined

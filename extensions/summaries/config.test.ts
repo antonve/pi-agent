@@ -2,27 +2,32 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DEFAULT_SUMMARY_CONFIG, parseSummaryConfig } from "./src/config.ts";
 
-test("summary config defaults to Codex Luna at medium reasoning", () => {
+test("summary config defaults to direct Codex Luna at high reasoning", () => {
   assert.deepEqual(parseSummaryConfig(undefined), DEFAULT_SUMMARY_CONFIG);
   assert.deepEqual(DEFAULT_SUMMARY_CONFIG, {
     provider: "openai-codex",
     model: "gpt-5.6-luna",
-    reasoning: "medium",
+    reasoning: "high",
   });
 });
 
-test("summary config accepts valid private overrides and rejects partial corruption", () => {
+test("summary config accepts only the approved fixed route", () => {
   assert.deepEqual(
     parseSummaryConfig({
-      provider: " anthropic ",
-      model: " claude-sonnet ",
+      provider: " openai-codex ",
+      model: " gpt-5.6-luna ",
       reasoning: "high",
     }),
-    {
-      provider: "anthropic",
-      model: "claude-sonnet",
-      reasoning: "high",
-    },
+    DEFAULT_SUMMARY_CONFIG,
+  );
+  assert.throws(
+    () =>
+      parseSummaryConfig({
+        provider: "openrouter",
+        model: "openai/gpt-5.6-luna",
+        reasoning: "high",
+      }),
+    /Model policy violation/,
   );
 
   assert.deepEqual(

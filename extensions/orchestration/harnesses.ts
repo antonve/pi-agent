@@ -1,3 +1,4 @@
+import { APPROVED_MODELS } from "../shared/model-policy.ts";
 import type { Harness, ReasoningLevel } from "./domain.ts";
 
 const CHILD_DISABLED_TOOLS =
@@ -7,8 +8,6 @@ export interface HarnessOptions {
   harness: Harness;
   model?: string;
   reasoning?: ReasoningLevel;
-  parentModel?: string;
-  parentReasoning?: ReasoningLevel;
 }
 
 export interface HarnessLaunch {
@@ -33,13 +32,13 @@ export interface HeadlessHarnessLaunch extends HarnessLaunch {
 function resolvedHarness(options: HarnessOptions) {
   if (options.harness === "pi") {
     return {
-      model: options.model ?? options.parentModel,
-      reasoning: options.reasoning ?? options.parentReasoning,
+      model: options.model ?? APPROVED_MODELS.sol,
+      reasoning: options.reasoning ?? "high",
     };
   }
   if (options.harness === "claude") {
     return {
-      model: options.model ?? "fable",
+      model: options.model ?? APPROVED_MODELS.fable,
       reasoning: options.reasoning ?? "high",
     };
   }

@@ -12,6 +12,7 @@ import {
 } from "./fleet.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import type { OrchestrationManager } from "./manager.ts";
+import { resolveSecondMatePolicy } from "../shared/model-policy.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -146,6 +147,9 @@ Ownership rules:
 - Keep detailed task and worker context in this session and preserve the implementation context needed for follow-through.
 - Own detailed Linear ticket context and task-specific Linear discovery and writes; report upward only concise issue identifiers and outcomes.
 - Use headless leaf workers for self-contained delegated work.
+- Give every leaf a narrow written scope and expected output, actively monitor its progress, and redirect or cancel drift.
+- Reject leaf suggestions that expand the assigned scope; escalate material scope changes to the first mate instead.
+- Mark review workers with the review role and state the reviewed model so different-family enforcement and the strict review scope guard apply.
 - Do not create other second mates or task workspaces.
 - Raise only captain-level decisions, material risks, scope changes, and unrecoverable blockers to the first mate.
 - Do not copy worker transcripts upward; send concise decisions, risks, and outcomes.
@@ -282,6 +286,10 @@ export class FleetManager {
       brief: options.brief,
     });
     const cwd = resolve(options.cwd);
+    const modelPolicy = resolveSecondMatePolicy({
+      model: options.model,
+      reasoning: options.reasoning,
+    });
     const repoBasename = await repositoryBasename(cwd);
     let task = await this.store.createTask({
       id: options.id,
@@ -338,8 +346,10 @@ export class FleetManager {
             randomUUID(),
             "--name",
             `${task.id} second mate`,
-            ...(options.model ? ["--model", options.model] : []),
-            ...(options.reasoning ? ["--thinking", options.reasoning] : []),
+            "--model",
+            modelPolicy.model,
+            "--thinking",
+            modelPolicy.reasoning,
             "--exclude-tools",
             "first_mate_claim,first_mate_status,task_assign,task_list,task_send,task_cancel,mate_register,workflow",
           ];

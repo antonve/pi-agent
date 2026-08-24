@@ -32,6 +32,10 @@ import { HerdrClient, type HerdrAgent } from "./herdr-client.ts";
 import { resolveIsolation, resolvePlacement } from "./placement.ts";
 import { TaskRegistry, stateDirectory } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
+import {
+  resolveWorkerPolicy,
+  REVIEW_SCOPE_GUARD,
+} from "../shared/model-policy.ts";
 
 const POLL_MS = 1_000;
 export const CANCEL_CLOSE_MS = 2_000;
@@ -122,13 +126,16 @@ export function buildChildPrompt(options: {
   prompt: string;
   cwd: string;
   kind: TaskRecord["kind"];
+  role?: TaskRecord["role"];
   lease?: { leaseId: string; holder: string };
 }) {
   const ending =
     options.kind === "subagent"
       ? `- End with exactly one JSON report between these exact marker lines:\n${PARENT_REPORT_START}\n<json-report>\n${PARENT_REPORT_END}\n- The JSON report must contain status (done, question, or failed), summary, changes, verification, risks, question, options, recommendation, and artifacts. Use status question instead of waiting in an interactive prompt.`
       : "- End with a concise report for the parent agent.";
-  return `${options.prompt.trim()}\n\nOrchestration constraints:\n- Do not spawn subagents or workflows.\n- Work only in ${options.cwd}.\n${options.lease ? `- This is Treehouse lease ${options.lease.leaseId} held by ${options.lease.holder}; do not return or force-clean it.` : "- This task intentionally uses the supplied shared checkout."}\n${ending}`;
+  const scopeGuard =
+    options.role === "review" ? `\n\n${REVIEW_SCOPE_GUARD}` : "";
+  return `${options.prompt.trim()}${scopeGuard}\n\nOrchestration constraints:\n- Do not spawn subagents or workflows.\n- Work only in ${options.cwd}.\n${options.lease ? `- This is Treehouse lease ${options.lease.leaseId} held by ${options.lease.holder}; do not return or force-clean it.` : "- This task intentionally uses the supplied shared checkout."}\n${ending}`;
 }
 
 export function buildAgentName(taskId: string, label: string) {
@@ -226,6 +233,7 @@ export class OrchestrationManager {
     ownerTaskId?: string;
     isolated?: boolean;
     harness?: TaskRecord["harness"];
+    role?: TaskRecord["role"];
     model?: string;
     reasoning?: TaskRecord["reasoning"];
     lease?: TaskRecord["lease"];
@@ -252,6 +260,7 @@ export class OrchestrationManager {
       createdTab: false,
       createdPane: false,
       harness: options.harness,
+      role: options.role,
       model: options.model,
       reasoning: options.reasoning,
       cwd: options.cwd,
@@ -496,6 +505,13 @@ export class OrchestrationManager {
 
   async spawnLeaf(options: SpawnAgentOptions) {
     this.assertAvailable();
+    const policy = resolveWorkerPolicy({
+      role: options.role,
+      harness: options.harness,
+      model: options.model,
+      reasoning: options.reasoning,
+      reviewTargetModel: options.reviewTargetModel,
+    });
     await this.herdr.preflightHarness(options.harness);
     const taskId = id(options.kind === "workflow-child" ? "wf" : "sa");
     const label = cleanLabel(options.label);
@@ -512,10 +528,8 @@ export class OrchestrationManager {
     const cwd = lease?.path ?? resolve(options.cwd);
     const resolvedLaunch = buildHarnessLaunch({
       harness: options.harness,
-      model: options.model,
-      reasoning: options.reasoning,
-      parentModel: options.parentModel,
-      parentReasoning: options.parentReasoning,
+      model: policy.model,
+      reasoning: policy.reasoning,
     });
     let task: TaskRecord | undefined;
     try {
@@ -529,6 +543,7 @@ export class OrchestrationManager {
         ownerTaskId: options.ownerTaskId ?? process.env.PI_FIRST_MATE_TASK_ID,
         isolated: isolation === "treehouse",
         harness: options.harness,
+        role: policy.role,
         model: resolvedLaunch.model,
         reasoning: resolvedLaunch.reasoning,
         lease,
@@ -542,6 +557,7 @@ export class OrchestrationManager {
         prompt: options.prompt,
         cwd,
         kind: task.kind,
+        role: task.role,
         lease,
       });
       return await this.startHeadlessTurn(task, childPrompt);
@@ -717,6 +733,13 @@ export class OrchestrationManager {
 
   async spawnAgent(options: SpawnAgentOptions) {
     this.assertAvailable();
+    const policy = resolveWorkerPolicy({
+      role: options.role,
+      harness: options.harness,
+      model: options.model,
+      reasoning: options.reasoning,
+      reviewTargetModel: options.reviewTargetModel,
+    });
     const taskId = id(options.kind === "workflow-child" ? "wf" : "sa");
     const label = cleanLabel(options.label);
     const isolation = resolveIsolation(options.isolation, options.prompt);
@@ -732,10 +755,8 @@ export class OrchestrationManager {
     const cwd = lease?.path ?? resolve(options.cwd);
     const launch = buildHarnessLaunch({
       harness: options.harness,
-      model: options.model,
-      reasoning: options.reasoning,
-      parentModel: options.parentModel,
-      parentReasoning: options.parentReasoning,
+      model: policy.model,
+      reasoning: policy.reasoning,
     });
     let task: TaskRecord | undefined;
     try {
@@ -749,6 +770,7 @@ export class OrchestrationManager {
         ownerTaskId: options.ownerTaskId ?? process.env.PI_FIRST_MATE_TASK_ID,
         isolated: isolation === "treehouse",
         harness: options.harness,
+        role: policy.role,
         model: launch.model,
         reasoning: launch.reasoning,
         lease,
@@ -765,6 +787,7 @@ export class OrchestrationManager {
         prompt: options.prompt,
         cwd,
         kind: task.kind,
+        role: task.role,
         lease,
       });
       const prompted = await this.herdr.deliverInitialPrompt({
