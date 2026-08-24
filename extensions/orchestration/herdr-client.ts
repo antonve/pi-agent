@@ -2,6 +2,7 @@ import type { CliRunner } from "./cli.ts";
 import { decodeJson, findNumber, findObjects, findString } from "./cli.ts";
 import type {
   CreatedResource,
+  CreatedTaskWorkspace,
   Harness,
   ParentLocation,
   ResolvedPlacement,
@@ -205,6 +206,17 @@ export class HerdrClient {
     return result.stdout;
   }
 
+  async preflightHarness(harness: Harness, signal?: AbortSignal) {
+    const result = await this.runner.run(harness, ["--version"], {
+      signal,
+      timeoutMs: 10_000,
+    });
+    if (result.code !== 0)
+      throw new Error(
+        `${harness} headless worker preflight failed: ${result.stderr || result.stdout}`,
+      );
+  }
+
   async current(signal?: AbortSignal): Promise<ParentLocation> {
     const value = await this.json(["pane", "current", "--current"], { signal });
     const workspaceId = findString(value, ["workspace_id"]);
@@ -215,6 +227,93 @@ export class HerdrClient {
         "Herdr did not report the current workspace/tab/pane IDs.",
       );
     return { workspaceId, tabId, paneId };
+  }
+
+  async createTaskWorkspace(
+    cwd: string,
+    label: string,
+    environment: Record<string, string> = {},
+    signal?: AbortSignal,
+  ): Promise<CreatedTaskWorkspace> {
+    const envArgs = Object.entries(environment).flatMap(([key, value]) => [
+      "--env",
+      `${key}=${value}`,
+    ]);
+    const created = await this.json(
+      [
+        "workspace",
+        "create",
+        "--cwd",
+        cwd,
+        "--label",
+        label,
+        ...envArgs,
+        "--no-focus",
+      ],
+      { signal },
+    );
+    const workspaceId = findString(created, ["workspace_id"]);
+    const tabId = findString(created, ["tab_id"]);
+    const paneId = findString(created, ["pane_id"]);
+    if (!workspaceId || !tabId || !paneId)
+      throw new Error(
+        "Herdr created a task workspace but did not return its workspace, tab, and root pane IDs.",
+      );
+    return { workspaceId, tabId, paneId };
+  }
+
+  async reportWorkspaceMetadata(
+    workspaceId: string,
+    source: string,
+    tokens: Record<string, string>,
+    options: { sequence?: number; ttlMs?: number } = {},
+  ) {
+    const args = [
+      "workspace",
+      "report-metadata",
+      workspaceId,
+      "--source",
+      source,
+      ...Object.entries(tokens).flatMap(([key, value]) => [
+        "--token",
+        `${key}=${value}`,
+      ]),
+      ...(options.sequence === undefined
+        ? []
+        : ["--seq", String(options.sequence)]),
+      ...(options.ttlMs === undefined
+        ? []
+        : ["--ttl-ms", String(options.ttlMs)]),
+    ];
+    return this.json(args);
+  }
+
+  async workspaceIsFocused(workspaceId: string) {
+    const value = await this.json(["workspace", "get", workspaceId], {
+      timeoutMs: 5_000,
+    });
+    const workspace = findObjects(
+      value,
+      (candidate) => candidate.workspace_id === workspaceId,
+    )[0];
+    return workspace?.focused === true;
+  }
+
+  async renameWorkspace(workspaceId: string, label: string) {
+    return this.json(["workspace", "rename", workspaceId, label]);
+  }
+
+  async closeWorkspace(workspaceId: string) {
+    try {
+      await this.json(["workspace", "close", workspaceId]);
+    } catch (error) {
+      if (
+        error instanceof HerdrCommandError &&
+        error.code === "workspace_not_found"
+      )
+        return;
+      throw error;
+    }
   }
 
   async createResource(
@@ -313,6 +412,17 @@ export class HerdrClient {
         `herdr pane read failed: ${result.stderr || result.stdout}`,
       );
     return result.stdout;
+  }
+
+  async tabIsFocused(tabId: string) {
+    const value = await this.json(["tab", "get", tabId], {
+      timeoutMs: 5_000,
+    });
+    const tab = findObjects(
+      value,
+      (candidate) => candidate.tab_id === tabId,
+    )[0];
+    return tab?.focused === true;
   }
 
   async paneExists(paneId: string) {
@@ -614,6 +724,20 @@ export class HerdrClient {
       timeoutMs: 10_000,
     });
     return decodeAgent(value);
+  }
+
+  async agentExists(target: string) {
+    try {
+      await this.getAgent(target);
+      return true;
+    } catch (error) {
+      if (
+        error instanceof HerdrCommandError &&
+        error.code === "agent_not_found"
+      )
+        return false;
+      throw error;
+    }
   }
   async readAgent(name: string, lines = 600) {
     const result = await this.runner.run(

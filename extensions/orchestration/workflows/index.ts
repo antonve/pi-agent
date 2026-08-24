@@ -202,7 +202,7 @@ export function registerWorkflow(
           schema === undefined
             ? ""
             : `\n\nStructured result requirement: end your response with exactly one JSON value matching this JSON Schema, with no text after it:\n${JSON.stringify(schema)}`;
-        const task = await manager.spawnAgent({
+        const task = await manager.spawnLeaf({
           prompt: `${prompt}${structuredInstruction}`,
           label,
           harness,

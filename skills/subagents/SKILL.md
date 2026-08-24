@@ -1,18 +1,20 @@
 ---
 name: subagents
-description: Delegate work to subagents or multiple agents and coordinate cross-agent work through visible Herdr tabs/panes. Use for delegation, subagents, multiple-agent tasks, cross-agent communication, or explicit Herdr requests.
+description: Delegate self-contained work to headless Pi, Claude Code, Codex, or OpenCode leaf workers shown in Herdr tabs.
 ---
 
-# Herdr subagents
+# Headless leaf workers through Herdr
 
-All child lifecycle, prompts, communication, inspection, and takeover go through Herdr. Children cannot recursively call subagent or workflow tools.
+All leaf lifecycle, prompts, follow-ups, output, cancellation, and cleanup go through the orchestration tools. Leaves cannot recursively call subagent, workflow, first-mate, or Herdr-control tools.
 
 - Choose `pi`, `claude`, `codex`, or `opencode` deliberately.
 - Pi inherits the parent model/reasoning by default. Grok runs through Pi with high reasoning; never silently route Grok through OpenCode.
 - Claude defaults to latest Fable at high reasoning. Codex defaults to `gpt-5.6-sol` at high reasoning. OpenCode uses its configured default unless overridden.
-- Give a complete standalone prompt with relevant paths, constraints, expected output, and Treehouse context.
+- Give a complete standalone prompt with paths, constraints, and expected structured output.
 - Mutation-capable tasks use `isolation: auto` or `treehouse`; read-only review may use `shared`. When uncertain, isolate.
-- Durable agents and Treehouse leases use tabs. Panes are only for brief, directly relevant work.
-- A successful spawn means Herdr observed child activity after submitting the initial prompt; startup or delivery exhaustion is reported as a failed spawn instead of an empty running child.
-- Continue parent work after spawning. Use `subagent_wait` only when blocked; it ends the current parent turn, waits in the background, and automatically starts a new turn with one combined result after all requested children settle. Use `subagent_send` for follow-ups.
-- `/subagents` and the subagent tools inspect, focus, attach/take over, cancel, and report lease cleanup state. Settled resources close automatically after the cleanup grace period; interaction postpones cleanup.
+- Every leaf gets a tab in its owning task workspace. The harness runs headlessly with the initial prompt supplied during process startup; never create an empty interactive TUI or simulate Enter.
+- A successful spawn means structured process activity was observed. Startup without activity is bounded and fails instead of leaving an empty worker.
+- A question is a settled headless turn. Answer it with `subagent_send`, which resumes the same harness session in the same tab.
+- Continue parent work after spawning. Use `subagent_wait` only when blocked; it ends the current parent turn and resumes with one combined result.
+- `/subagents` and subagent tools inspect, focus, prompt, interrupt, pin, unpin, close, and report lease cleanup state.
+- Completed and failed leaves persist their report and close after the grace period. Focusing postpones cleanup; explicit pinning retains a tab.
