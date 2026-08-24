@@ -228,11 +228,19 @@ export class HerdrClient {
         buffer = lines.pop() ?? "";
         for (const line of lines) {
           if (!line.trim()) continue;
-          const value = decodeJson(line, `Herdr socket API ${method}`) as {
+          let value: {
             id?: string;
             result?: T;
             error?: { code?: string; message?: string };
           };
+          try {
+            value = decodeJson(
+              line,
+              `Herdr socket API ${method}`,
+            ) as typeof value;
+          } catch (error) {
+            return complete(error);
+          }
           if (value.id !== requestId) continue;
           if (value.error)
             return complete(

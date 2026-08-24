@@ -382,6 +382,7 @@ export class FleetManager {
       throw new Error(
         `Task ${task.id} belongs to Herdr workspace ${task.workspaceId}, not ${options.workspaceId}.`,
       );
+    await this.herdr.renameTab(options.tabId, "secondmate");
     const updated = await this.store.updateTask(task.id, {
       mateSessionId: options.sessionId,
       workspaceId: options.workspaceId,
@@ -466,6 +467,7 @@ export class FleetManager {
       options.workspaceId,
       buildWorkspaceLabel(task),
     );
+    await this.herdr.renameTab(options.tabId, "secondmate");
     await this.publishMetadata(task);
     await this.store.enqueue({
       taskId: task.id,

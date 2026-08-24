@@ -50,6 +50,7 @@ function artifacts(): HeadlessRunArtifacts {
 
 async function withHerdrSocket<T>(
   run: (requests: Array<Record<string, unknown>>) => Promise<T>,
+  response?: (request: Record<string, unknown>) => string,
 ) {
   const directory = await mkdtemp(join(tmpdir(), "pi-herdr-socket-"));
   const socketPath = join(directory, "herdr.sock");
@@ -65,7 +66,8 @@ async function withHerdrSocket<T>(
         const request = JSON.parse(line) as Record<string, unknown>;
         requests.push(request);
         connection.write(
-          `${JSON.stringify({ id: request.id, result: { ok: true } })}\n`,
+          response?.(request) ??
+            `${JSON.stringify({ id: request.id, result: { ok: true } })}\n`,
         );
       }
     });
@@ -314,6 +316,104 @@ test("second-mate prompts require verification, plan ownership, and review-ready
   assert.match(
     prompt,
     /Call complete_task or fail_task exactly once when the task truly reaches a terminal outcome/i,
+  );
+});
+
+test("malformed Herdr socket responses reject without escaping the request promise", async () => {
+  await withHerdrSocket(
+    async () => {
+      const runner: CliRunner = {
+        async run() {
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({ result: {} }),
+          };
+        },
+      };
+      await assert.rejects(
+        () => new HerdrClient(runner).moveWorkspace("w-owner", 0),
+        /invalid JSON/i,
+      );
+    },
+    () => "{invalid\n",
+  );
+});
+
+test("independent and re-registered second mates use the exact secondmate tab label", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-independent-mate-"));
+  const calls: string[][] = [];
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push([...args]);
+      return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+    },
+  };
+  const store = new FleetStore(join(directory, "fleet.json"));
+  await store.claimFirstMate({
+    sessionId: "first-mate-session",
+    workspaceId: "w-owner",
+    tabId: "w-owner:t1",
+    paneId: "w-owner:p1",
+  });
+  const herdr = new HerdrClient(runner);
+  const fleet = new FleetManager(
+    store,
+    herdr,
+    new OrchestrationManager(
+      herdr,
+      new TreehouseClient(runner),
+      new TaskRegistry(join(directory, "registry.json")),
+      { onComplete() {} },
+    ),
+  );
+
+  await fleet.registerIndependent({
+    taskId: "TASK-1",
+    title: "Detailed task title",
+    brief: "Implement the example",
+    cwd: directory,
+    ownerSessionId: "first-mate-session",
+    mateSessionId: "mate-session",
+    workspaceId: "w-task",
+    tabId: "w-task:t1",
+    paneId: "w-task:p1",
+  });
+
+  assert.ok(
+    calls.some(
+      (args) =>
+        args[0] === "workspace" &&
+        args[1] === "rename" &&
+        args[2] === "w-task" &&
+        args[3] === "TASK-1 Detailed task title",
+    ),
+  );
+  assert.ok(
+    calls.some(
+      (args) =>
+        args[0] === "tab" &&
+        args[1] === "rename" &&
+        args[2] === "w-task:t1" &&
+        args[3] === "secondmate",
+    ),
+  );
+
+  await fleet.registerMate({
+    taskId: "TASK-1",
+    sessionId: "replacement-mate-session",
+    workspaceId: "w-task",
+    tabId: "w-task:t2",
+    paneId: "w-task:p2",
+  });
+  assert.ok(
+    calls.some(
+      (args) =>
+        args[0] === "tab" &&
+        args[1] === "rename" &&
+        args[2] === "w-task:t2" &&
+        args[3] === "secondmate",
+    ),
   );
 });
 
