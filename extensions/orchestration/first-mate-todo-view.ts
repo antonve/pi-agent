@@ -111,7 +111,7 @@ function applyPromptEdit(prompt: PromptState, data: string) {
         prompt.value.slice(prompt.cursor + 1),
     };
   }
-  if (data.length === 1 && data >= " " && data !== "\u007f") {
+  if (data.length > 0 && !/[\u0000-\u001f\u007f]/u.test(data)) {
     return {
       ...prompt,
       value:

@@ -220,9 +220,7 @@ test("rendering stays within width and input flow supports add/edit/snooze", () 
   let state: TodoUiState = { showHelp: false };
   state = handleTodoKey(view, state, "a").state;
   assert.equal(state.prompt?.action, "add");
-  state = handleTodoKey(view, state, "N").state;
-  state = handleTodoKey(view, state, "e").state;
-  state = handleTodoKey(view, state, "w").state;
+  state = handleTodoKey(view, state, "New").state;
   const added = handleTodoKey(view, state, "\r");
   assert.deepEqual(added.command, { type: "add-manual", title: "New" });
 
@@ -247,6 +245,54 @@ test("rendering stays within width and input flow supports add/edit/snooze", () 
   );
   assert.ok(lines.every((line) => visibleWidth(line) <= 28));
   assert.ok(lines.some((line) => line.includes("Manual")));
+});
+
+test("generated item controls emit refresh, resolution, focus, and open commands", () => {
+  const item = {
+    id: "review:TASK-1:message:pr",
+    kind: "review" as const,
+    title: "Review PR",
+    source: "generated" as const,
+    taskId: "TASK-1",
+    workspaceId: "w-task",
+    tabId: "w-task:t1",
+    prUrl: "https://github.com/antonve/pi-agent/pull/99",
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const view: TodoBoardView = {
+    items: [item],
+    generatedCount: 1,
+    manualCount: 0,
+    snoozedCount: 0,
+    hiddenCount: 0,
+    trackedPrUrls: [item.prUrl],
+  };
+  const state: TodoUiState = { showHelp: false, selectedId: item.id };
+
+  assert.deepEqual(handleTodoKey(view, state, "r").command, {
+    type: "refresh",
+  });
+  assert.deepEqual(handleTodoKey(view, state, "d").command, {
+    type: "set-done",
+    itemId: item.id,
+  });
+  assert.deepEqual(handleTodoKey(view, state, "x").command, {
+    type: "dismiss",
+    itemId: item.id,
+  });
+  assert.deepEqual(handleTodoKey(view, state, "f").command, {
+    type: "focus",
+    item,
+  });
+  assert.deepEqual(handleTodoKey(view, state, "o").command, {
+    type: "open",
+    item,
+  });
+  assert.deepEqual(handleTodoKey(view, state, "\r").command, {
+    type: "open",
+    item,
+  });
 });
 
 test("rendering keeps the selected item and controls visible in a short pane", () => {
