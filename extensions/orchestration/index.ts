@@ -52,6 +52,16 @@ const SECOND_MATE_ESCALATIONS = [
 ] as const;
 const JOB_KINDS = ["finite", "service"] as const;
 const TAB_PLACEMENTS = ["auto", "tab"] as const;
+const FIRST_MATE_SUPERVISORY_PROMPT = `IMPORTANT: This session owns the singleton first-mate role for this machine.
+- Stay in the supervisory first-mate role.
+- For any new repo-changing request, call task_assign before inspecting files, acquiring a Treehouse lease, editing code, or making other repository changes yourself.
+- After assignment, coordinate through task_list, task_send, and task_cancel instead of taking over the repository work directly.
+- Delegated second mates own detailed planning, \`~/xdev/plans\` persistence and updates, implementation context, and follow-through for their tasks.
+- Keep first-mate notes limited to concise decisions and portfolio status; do not write detailed task plans or perform task research yourself.
+- Do not perform task-specific Linear discovery or writes, including issue creation, description edits, comments, relations, or workflow transitions.
+- Pass concise user Linear requests and decisions to the owning second mate with task_send; when no second mate owns the work, use task_assign to delegate a short Linear task instead of handling it yourself.
+- If a design task still has expected implementation work after a user decision, keep the delegated task active or resume it instead of terminally completing it and losing ownership/context.
+- You may answer non-repository questions or summarize task status directly when no delegated repo work is required.`;
 
 function renderResultText(result: AgentToolResult<unknown>, theme: Theme) {
   const content = result.content.find((block) => block.type === "text");
@@ -445,7 +455,8 @@ export default function orchestration(pi: ExtensionAPI) {
       },
     },
   );
-  const fleet = new FleetManager(new FleetStore(), herdr, manager);
+  const fleetStore = new FleetStore();
+  const fleet = new FleetManager(fleetStore, herdr, manager);
   fleetForCallbacks = fleet;
   let fleetPoll: ReturnType<typeof setInterval> | undefined;
   let fleetPollRunning = false;
@@ -555,6 +566,7 @@ export default function orchestration(pi: ExtensionAPI) {
       workspaceId: location.workspaceId,
       tabId: location.tabId,
       paneId: location.paneId,
+      cwd: ctx.cwd,
     });
     await pollFleetInbox();
     const tasks = await fleet.list(lease.sessionId);
@@ -620,6 +632,15 @@ export default function orchestration(pi: ExtensionAPI) {
     pi.setActiveTools(
       pi.getActiveTools().filter((name) => !disabled.has(name)),
     );
+  });
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (orchestrationRole === "leaf" || mateTaskId) return;
+    const lease = await fleetStore.getFirstMate();
+    if (lease?.sessionId !== ctx.sessionManager.getSessionId()) return;
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${FIRST_MATE_SUPERVISORY_PROMPT}`,
+    };
   });
 
   pi.on("tool_call", (event) => {
