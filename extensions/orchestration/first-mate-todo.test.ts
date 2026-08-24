@@ -13,6 +13,7 @@ import {
 import {
   renderTodoPane,
   handleTodoKey,
+  sanitizeTodoText,
   type TodoUiState,
 } from "./first-mate-todo-view.ts";
 import {
@@ -345,6 +346,38 @@ test("board state persists and rejects malformed JSON without overwriting it", a
     () => store.update((current) => current),
     /Invalid first-mate to-do state/,
   );
+});
+
+test("fleet and persisted text cannot inject terminal controls", () => {
+  const malicious =
+    "before\u001b]52;c;Y2xpcGJvYXJk\u0007after\u001b[31mred\u001b[0m\u0001";
+  assert.equal(sanitizeTodoText(malicious), "beforeafterred");
+  const view: TodoBoardView = {
+    items: [
+      {
+        id: "manual:1",
+        kind: "manual",
+        title: malicious,
+        detail: malicious,
+        source: "manual",
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+    generatedCount: 0,
+    manualCount: 1,
+    snoozedCount: 0,
+    hiddenCount: 0,
+    trackedPrUrls: [],
+  };
+  const lines = renderTodoPane(
+    view,
+    { showHelp: false, status: malicious },
+    80,
+    10,
+  );
+  assert.equal(lines.join("\n").includes("\u001b]52"), false);
+  assert.equal(lines.join("\n").includes("\u001b[31m"), false);
 });
 
 test("snooze parser accepts bounded duration shortcuts", () => {

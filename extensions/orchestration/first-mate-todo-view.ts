@@ -1,6 +1,24 @@
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import type { TodoBoardView, TodoItem } from "./first-mate-todo-model.ts";
 
+// Remove terminal controls from fleet, GitHub, and persisted user text before
+// applying this view's trusted styling.
+// eslint-disable-next-line no-control-regex
+const OSC_PATTERN =
+  /(?:\u001b\]|\u009d)(?:[^\u0007\u001b\u009c]|\u001b(?!\\))*(?:\u0007|\u001b\\|\u009c)/g;
+// eslint-disable-next-line no-control-regex
+const CSI_PATTERN = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g;
+// eslint-disable-next-line no-control-regex
+const ESCAPE_PATTERN = /\u001b(?:[()][0-2A-Z]|[ -/]*[@-~])/g;
+
+export function sanitizeTodoText(text: string) {
+  return text
+    .replace(OSC_PATTERN, "")
+    .replace(CSI_PATTERN, "")
+    .replace(ESCAPE_PATTERN, "")
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+}
+
 const ansi = {
   bold: (value: string) => `\u001b[1m${value}\u001b[22m`,
   dim: (value: string) => `\u001b[2m${value}\u001b[22m`,
@@ -111,7 +129,7 @@ function applyPromptEdit(prompt: PromptState, data: string) {
         prompt.value.slice(prompt.cursor + 1),
     };
   }
-  if (data.length > 0 && !/[\u0000-\u001f\u007f]/u.test(data)) {
+  if (data.length > 0 && !/[\u0000-\u001f\u007f-\u009f]/u.test(data)) {
     return {
       ...prompt,
       value:
@@ -325,15 +343,13 @@ function renderPrompt(prompt: PromptState, width: number) {
     edit: "Edit: ",
     snooze: "Snooze (30m/1h/1d): ",
   } as const;
-  const text = labels[prompt.action] + prompt.value;
-  const beforeCursor = text.slice(
-    0,
-    labels[prompt.action].length + prompt.cursor,
-  );
-  const atCursor = text[labels[prompt.action].length + prompt.cursor] ?? " ";
-  const afterCursor = text.slice(
-    labels[prompt.action].length + prompt.cursor + 1,
-  );
+  const beforeCursor =
+    labels[prompt.action] +
+    sanitizeTodoText(prompt.value.slice(0, prompt.cursor));
+  const atCursor =
+    sanitizeTodoText(prompt.value.slice(prompt.cursor, prompt.cursor + 1)) ||
+    " ";
+  const afterCursor = sanitizeTodoText(prompt.value.slice(prompt.cursor + 1));
   return truncateToWidth(
     beforeCursor + ansi.inverse(atCursor) + afterCursor,
     width,
@@ -342,10 +358,12 @@ function renderPrompt(prompt: PromptState, width: number) {
 
 function renderItem(item: TodoItem, selected: boolean, width: number) {
   const prefix = selected ? ansi.inverse(">") : " ";
-  const title = `${prefix} ${ansi.bold(kindTag(item))} ${item.title}`;
+  const title = `${prefix} ${ansi.bold(kindTag(item))} ${sanitizeTodoText(item.title)}`;
   const lines = [truncateToWidth(title, width)];
   if (item.detail)
-    lines.push(truncateToWidth(`  ${ansi.dim(item.detail)}`, width));
+    lines.push(
+      truncateToWidth(`  ${ansi.dim(sanitizeTodoText(item.detail))}`, width),
+    );
   return lines;
 }
 
@@ -363,7 +381,9 @@ export function renderTodoPane(
     ),
   ];
   if (normalized.status)
-    header.push(truncateToWidth(ansi.dim(normalized.status), width));
+    header.push(
+      truncateToWidth(ansi.dim(sanitizeTodoText(normalized.status)), width),
+    );
   else if (view.snoozedCount > 0)
     header.push(
       truncateToWidth(
