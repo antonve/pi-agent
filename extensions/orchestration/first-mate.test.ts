@@ -918,6 +918,26 @@ test("task assignment failure closes the workspace and restores first-mate focus
     const runner: CliRunner = {
       async run(_command, args) {
         calls.push([...args]);
+        if (args[0] === "workspace" && args[1] === "list")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                workspaces: [{ workspace_id: "w-owner", focused: true }],
+              },
+            }),
+          };
+        if (args[0] === "pane" && args[1] === "list")
+          return {
+            code: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              result: {
+                panes: [{ pane_id: "w-owner:p1", focused: true }],
+              },
+            }),
+          };
         if (args[0] === "workspace" && args[1] === "get")
           return {
             code: 0,
@@ -926,7 +946,7 @@ test("task assignment failure closes the workspace and restores first-mate focus
               result: {
                 workspace: {
                   workspace_id: args[2],
-                  focused: workspaceReads++ === 0,
+                  focused: workspaceReads++ !== 1,
                 },
               },
             }),

@@ -514,7 +514,31 @@ export class HerdrClient {
     };
   }
 
+  private async focusedPane() {
+    const listed = await this.json(["workspace", "list"], { timeoutMs: 5_000 });
+    const workspace = findObjects(
+      listed,
+      (candidate) =>
+        typeof candidate.workspace_id === "string" &&
+        candidate.focused === true,
+    )[0];
+    if (!workspace) return undefined;
+    const workspaceId = String(workspace.workspace_id);
+    const panes = await this.json(
+      ["pane", "list", "--workspace", workspaceId],
+      { timeoutMs: 5_000 },
+    );
+    const pane = findObjects(
+      panes,
+      (candidate) =>
+        typeof candidate.pane_id === "string" && candidate.focused === true,
+    )[0];
+    if (!pane) return undefined;
+    return { workspaceId, paneId: String(pane.pane_id) };
+  }
+
   async closeWorkspace(workspaceId: string) {
+    const focused = await this.focusedPane().catch(() => undefined);
     try {
       await this.json(["workspace", "close", workspaceId]);
     } catch (error) {
@@ -524,6 +548,13 @@ export class HerdrClient {
       )
         return;
       throw error;
+    }
+    if (focused && focused.workspaceId !== workspaceId) {
+      const stillFocused = await this.workspaceIsFocused(
+        focused.workspaceId,
+      ).catch(() => false);
+      if (!stillFocused)
+        await this.focusPane(focused.paneId).catch(() => undefined);
     }
   }
 
