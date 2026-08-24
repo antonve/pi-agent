@@ -43,6 +43,28 @@ export interface HerdrAgent {
   launchPending?: boolean;
 }
 
+export interface HerdrPaneRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface HerdrPaneLayout {
+  workspaceId: string;
+  tabId: string;
+  panes: Array<{
+    paneId: string;
+    focused: boolean;
+    rect: HerdrPaneRect;
+  }>;
+}
+
+export interface HerdrPaneProcessInfo {
+  paneId: string;
+  foregroundCommandLine?: string;
+}
+
 export class HerdrCommandError extends Error {
   readonly code?: string;
 
@@ -404,6 +426,94 @@ export class HerdrClient {
     return this.socketJson("pane.focus", { pane_id: paneId }, signal);
   }
 
+  async renamePane(paneId: string, label: string, signal?: AbortSignal) {
+    return this.json(["pane", "rename", paneId, label], { signal });
+  }
+
+  async layout(paneId: string, signal?: AbortSignal): Promise<HerdrPaneLayout> {
+    const value = await this.json(["pane", "layout", "--pane", paneId], {
+      signal,
+      timeoutMs: 5_000,
+    });
+    const layout = findObjects(
+      value,
+      (candidate) =>
+        typeof candidate.workspace_id === "string" &&
+        typeof candidate.tab_id === "string" &&
+        Array.isArray(candidate.panes),
+    )[0];
+    if (!layout)
+      throw new Error(`Herdr returned no layout for pane ${paneId}.`);
+    return {
+      workspaceId: String(layout.workspace_id),
+      tabId: String(layout.tab_id),
+      panes: Array.isArray(layout.panes)
+        ? layout.panes
+            .map((pane) => {
+              if (!pane || typeof pane !== "object") return undefined;
+              const record = pane as Record<string, unknown>;
+              const rect =
+                record.rect && typeof record.rect === "object"
+                  ? (record.rect as Record<string, unknown>)
+                  : undefined;
+              if (
+                typeof record.pane_id !== "string" ||
+                !rect ||
+                typeof rect.x !== "number" ||
+                typeof rect.y !== "number" ||
+                typeof rect.width !== "number" ||
+                typeof rect.height !== "number"
+              )
+                return undefined;
+              return {
+                paneId: record.pane_id,
+                focused: record.focused === true,
+                rect: {
+                  x: rect.x,
+                  y: rect.y,
+                  width: rect.width,
+                  height: rect.height,
+                },
+              };
+            })
+            .filter((pane) => pane !== undefined)
+        : [],
+    };
+  }
+
+  async processInfo(
+    paneId: string,
+    signal?: AbortSignal,
+  ): Promise<HerdrPaneProcessInfo> {
+    const value = await this.json(["pane", "process-info", "--pane", paneId], {
+      signal,
+      timeoutMs: 5_000,
+    });
+    const info = findObjects(
+      value,
+      (candidate) =>
+        typeof candidate.pane_id === "string" &&
+        Array.isArray(candidate.foreground_processes),
+    )[0];
+    if (!info)
+      throw new Error(`Herdr returned no process info for pane ${paneId}.`);
+    const commandLine = Array.isArray(info.foreground_processes)
+      ? info.foreground_processes.find(
+          (process) =>
+            process &&
+            typeof process === "object" &&
+            typeof (process as Record<string, unknown>).cmdline === "string",
+        )
+      : undefined;
+    return {
+      paneId: String(info.pane_id),
+      foregroundCommandLine:
+        commandLine && typeof commandLine === "object"
+          ? String((commandLine as Record<string, unknown>).cmdline)
+          : undefined,
+    };
+  }
+
   async closeWorkspace(workspaceId: string) {
     try {
       await this.json(["workspace", "close", workspaceId]);
@@ -415,6 +525,49 @@ export class HerdrClient {
         return;
       throw error;
     }
+  }
+
+  async swapPanes(sourcePaneId: string, targetPaneId: string) {
+    return this.json([
+      "pane",
+      "swap",
+      "--source-pane",
+      sourcePaneId,
+      "--target-pane",
+      targetPaneId,
+    ]);
+  }
+
+  async splitPane(
+    paneId: string,
+    cwd: string,
+    options: {
+      direction: "right" | "down";
+      ratio: number;
+      noFocus?: boolean;
+    },
+    signal?: AbortSignal,
+  ) {
+    const created = await this.json(
+      [
+        "pane",
+        "split",
+        "--pane",
+        paneId,
+        "--direction",
+        options.direction,
+        "--ratio",
+        String(options.ratio),
+        "--cwd",
+        cwd,
+        ...(options.noFocus ? ["--no-focus"] : []),
+      ],
+      { signal },
+    );
+    const createdPaneId = findString(created, ["pane_id"]);
+    if (!createdPaneId)
+      throw new Error("Herdr created a pane but returned no pane ID.");
+    return { paneId: createdPaneId };
   }
 
   async createResource(
@@ -531,6 +684,16 @@ export class HerdrClient {
       timeoutMs: 5_000,
     });
     return result.code === 0;
+  }
+
+  async closePane(paneId: string) {
+    try {
+      await this.json(["pane", "close", paneId]);
+    } catch (error) {
+      if (error instanceof HerdrCommandError && error.code === "pane_not_found")
+        return;
+      throw error;
+    }
   }
 
   async closeResource(task: {

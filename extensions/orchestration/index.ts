@@ -26,6 +26,7 @@ import { FleetManager, formatFleetMessage } from "./fleet-manager.ts";
 import { FleetStore, type FleetMessage } from "./fleet.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import { OrchestrationManager } from "./manager.ts";
+import { FirstMateTodoPaneController } from "./first-mate-todo-pane.ts";
 import { compileFleetReports } from "./report-compiler.ts";
 import { TaskRegistry } from "./registry.ts";
 import { TreehouseClient } from "./treehouse-client.ts";
@@ -440,6 +441,7 @@ export default function orchestration(pi: ExtensionAPI) {
   const executeBackgroundWait = registerBackgroundWaitTool(pi, backgroundWaits);
   let context: ExtensionContext | undefined;
   const herdr = new HerdrClient(nodeCliRunner);
+  const firstMateTodoPane = new FirstMateTodoPaneController(herdr);
   let fleetForCallbacks: FleetManager | undefined;
   const manager = new OrchestrationManager(
     herdr,
@@ -459,6 +461,7 @@ export default function orchestration(pi: ExtensionAPI) {
   const fleet = new FleetManager(fleetStore, herdr, manager);
   fleetForCallbacks = fleet;
   let fleetPoll: ReturnType<typeof setInterval> | undefined;
+  let firstMateTodoPoll: ReturnType<typeof setInterval> | undefined;
   let fleetPollRunning = false;
   let deliveredFleetMessages = new Set<string>();
   let sessionId: string | undefined;
@@ -555,6 +558,19 @@ export default function orchestration(pi: ExtensionAPI) {
     );
   }
 
+  async function syncFirstMateTodoPane(ctx: ExtensionContext) {
+    if (mateTaskId || process.env.HERDR_ENV !== "1") return;
+    const status = await fleet.firstMateStatus();
+    if (status.lease?.sessionId !== ctx.sessionManager.getSessionId()) return;
+    const location = await herdr.current();
+    await firstMateTodoPane.ensure({
+      workspaceId: location.workspaceId,
+      tabId: location.tabId,
+      paneId: location.paneId,
+      cwd: ctx.cwd,
+    });
+  }
+
   async function claimCurrentFirstMate(ctx: ExtensionContext) {
     if (mateTaskId)
       throw new Error(
@@ -568,6 +584,7 @@ export default function orchestration(pi: ExtensionAPI) {
       paneId: location.paneId,
       cwd: ctx.cwd,
     });
+    await syncFirstMateTodoPane(ctx).catch(() => undefined);
     await pollFleetInbox();
     const tasks = await fleet.list(lease.sessionId);
     return { lease, tasks };
@@ -601,7 +618,12 @@ export default function orchestration(pi: ExtensionAPI) {
       void pollFleetInbox().catch(() => undefined);
     }, 1_000);
     fleetPoll.unref?.();
+    firstMateTodoPoll = setInterval(() => {
+      void syncFirstMateTodoPane(ctx).catch(() => undefined);
+    }, 5_000);
+    firstMateTodoPoll.unref?.();
     void pollFleetInbox().catch(() => undefined);
+    void syncFirstMateTodoPane(ctx).catch(() => undefined);
     void manager
       .reconcile(ctx.sessionManager.getSessionId())
       .then(async () => {
@@ -669,7 +691,9 @@ export default function orchestration(pi: ExtensionAPI) {
     context = undefined;
     sessionId = undefined;
     if (fleetPoll) clearInterval(fleetPoll);
+    if (firstMateTodoPoll) clearInterval(firstMateTodoPoll);
     fleetPoll = undefined;
+    firstMateTodoPoll = undefined;
     manager.dispose();
     backgroundWaits.dispose();
     if (ctx.hasUI) ctx.ui.setStatus("herdr-orchestration", undefined);
