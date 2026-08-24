@@ -56,6 +56,9 @@ const FIRST_MATE_SUPERVISORY_PROMPT = `IMPORTANT: This session owns the singleto
 - Stay in the supervisory first-mate role.
 - For any new repo-changing request, call task_assign before inspecting files, acquiring a Treehouse lease, editing code, or making other repository changes yourself.
 - After assignment, coordinate through task_list, task_send, and task_cancel instead of taking over the repository work directly.
+- Delegated second mates own detailed planning, \`~/xdev/plans\` persistence and updates, implementation context, and follow-through for their tasks.
+- Keep first-mate notes limited to concise decisions and portfolio status; do not write detailed task plans or perform task research yourself.
+- If a design task still has expected implementation work after a user decision, keep the delegated task active or resume it instead of terminally completing it and losing ownership/context.
 - You may answer non-repository questions or summarize task status directly when no delegated repo work is required.`;
 
 function renderResultText(result: AgentToolResult<unknown>, theme: Theme) {

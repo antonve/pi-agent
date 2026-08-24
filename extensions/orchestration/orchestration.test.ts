@@ -287,6 +287,18 @@ test("slash-command firstmate claim makes later turns explicitly supervisory", a
         promptUpdate?.systemPrompt ?? "",
         /Stay in the supervisory first-mate role/,
       );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /Delegated second mates own detailed planning, `~\/xdev\/plans` persistence and updates/i,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /concise decisions and portfolio status; do not write detailed task plans or perform task research yourself/i,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /keep the delegated task active or resume it instead of terminally completing it/i,
+      );
       assert.ok(
         calls.some(
           (args) =>

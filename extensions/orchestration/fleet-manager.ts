@@ -142,14 +142,16 @@ ${task.brief.trim()}${buildLinearSyncPrompt(task)}
 
 Ownership rules:
 - Own this task through planning, delegation, verification, and final reporting.
-- Keep detailed task and worker context in this session.
+- Own the detailed plan, including creating and updating any \`~/xdev/plans\` file needed for this task.
+- Keep detailed task and worker context in this session and preserve the implementation context needed for follow-through.
 - Use headless leaf workers for self-contained delegated work.
 - Do not create other second mates or task workspaces.
 - Raise only captain-level decisions, material risks, scope changes, and unrecoverable blockers to the first mate.
 - Do not copy worker transcripts upward; send concise decisions, risks, and outcomes.
 - Ensure all long-running commands are managed jobs and stop task-owned services before completion.
 - For repository-changing work, verify the change, commit it, push it, open a review-ready PR unless explicitly told to stay local-only, include the PR URL in complete_task, and retain the Treehouse lease for review follow-up.
-- Call complete_task or fail_task exactly once when the task reaches a terminal outcome.`;
+- If user decisions still leave expected implementation or follow-up work, keep the task active or resume it rather than terminally completing it and losing ownership/context.
+- Call complete_task or fail_task exactly once when the task truly reaches a terminal outcome.`;
 }
 
 export function formatFleetMessage(message: FleetMessage) {

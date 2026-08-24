@@ -279,7 +279,7 @@ test("second-mate prompts make Linear synchronization explicit", () => {
   );
 });
 
-test("second-mate prompts require verification and review-ready PR delivery", () => {
+test("second-mate prompts require verification, plan ownership, and review-ready PR delivery", () => {
   const prompt = buildSecondMatePrompt({
     id: "TASK-1",
     title: "Example",
@@ -292,6 +292,18 @@ test("second-mate prompts require verification and review-ready PR delivery", ()
     version: 1,
     nextSequence: 1,
   });
+  assert.match(
+    prompt,
+    /creating and updating any `~\/xdev\/plans` file needed for this task/i,
+  );
+  assert.match(
+    prompt,
+    /preserve the implementation context needed for follow-through/i,
+  );
+  assert.match(
+    prompt,
+    /keep the task active or resume it rather than terminally completing it/i,
+  );
   assert.match(prompt, /verify the change, commit it, push it/i);
   assert.match(
     prompt,
@@ -299,6 +311,10 @@ test("second-mate prompts require verification and review-ready PR delivery", ()
   );
   assert.match(prompt, /include the PR URL in complete_task/i);
   assert.match(prompt, /retain the Treehouse lease for review follow-up/i);
+  assert.match(
+    prompt,
+    /Call complete_task or fail_task exactly once when the task truly reaches a terminal outcome/i,
+  );
 });
 
 test("fleet messages are sequenced, replayed, and acknowledged durably", async () => {
