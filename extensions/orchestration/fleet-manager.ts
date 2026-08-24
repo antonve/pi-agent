@@ -144,6 +144,7 @@ Ownership rules:
 - Own this task through planning, delegation, verification, and final reporting.
 - Own the detailed plan, including creating and updating any \`~/xdev/plans\` file needed for this task.
 - Keep detailed task and worker context in this session and preserve the implementation context needed for follow-through.
+- Own detailed Linear ticket context and task-specific Linear discovery and writes; report upward only concise issue identifiers and outcomes.
 - Use headless leaf workers for self-contained delegated work.
 - Do not create other second mates or task workspaces.
 - Raise only captain-level decisions, material risks, scope changes, and unrecoverable blockers to the first mate.

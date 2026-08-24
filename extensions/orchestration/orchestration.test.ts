@@ -297,6 +297,14 @@ test("slash-command firstmate claim makes later turns explicitly supervisory", a
       );
       assert.match(
         promptUpdate?.systemPrompt ?? "",
+        /Do not perform task-specific Linear discovery or writes, including issue creation, description edits, comments, relations, or workflow transitions/i,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
+        /Pass concise user Linear requests and decisions to the owning second mate with task_send; when no second mate owns the work, use task_assign to delegate a short Linear task/i,
+      );
+      assert.match(
+        promptUpdate?.systemPrompt ?? "",
         /keep the delegated task active or resume it instead of terminally completing it/i,
       );
       assert.ok(

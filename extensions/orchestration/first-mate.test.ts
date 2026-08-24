@@ -304,6 +304,10 @@ test("second-mate prompts require verification, plan ownership, and review-ready
   );
   assert.match(
     prompt,
+    /Own detailed Linear ticket context and task-specific Linear discovery and writes; report upward only concise issue identifiers and outcomes/i,
+  );
+  assert.match(
+    prompt,
     /keep the task active or resume it rather than terminally completing it/i,
   );
   assert.match(prompt, /verify the change, commit it, push it/i);
