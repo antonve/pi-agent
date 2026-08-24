@@ -603,10 +603,19 @@ export default function orchestration(pi: ExtensionAPI) {
       "Create a Herdr task Space, start a persistent Pi second mate in its first tab, and assign one task through the durable fleet ledger.",
     promptSnippet:
       "Assign one task to a persistent Pi second mate in its own Herdr Space",
+    promptGuidelines: [
+      "When the assignment references a Linear issue, pass linear_issue so the second mate gets explicit sync instructions.",
+    ],
     parameters: Type.Object({
       task_id: Type.String(),
       title: Type.String(),
       brief: Type.String(),
+      linear_issue: Type.Optional(
+        Type.String({
+          description:
+            "Linear issue identifier or URL to synchronize while the task is in progress.",
+        }),
+      ),
       working_dir: Type.Optional(Type.String()),
       model: Type.Optional(Type.String()),
       reasoning_effort: Type.Optional(StringEnum(REASONING_LEVELS)),
@@ -618,6 +627,7 @@ export default function orchestration(pi: ExtensionAPI) {
         id: params.task_id,
         title: params.title,
         brief: params.brief,
+        linearIssue: params.linear_issue,
         cwd: resolvePath(ctx.cwd, params.working_dir ?? "."),
         ownerSessionId: ctx.sessionManager.getSessionId(),
         ownerPaneId: ownerLocation.paneId,
@@ -745,6 +755,12 @@ export default function orchestration(pi: ExtensionAPI) {
       task_id: Type.String(),
       title: Type.String(),
       brief: Type.String(),
+      linear_issue: Type.Optional(
+        Type.String({
+          description:
+            "Linear issue identifier or URL to synchronize while the task is in progress.",
+        }),
+      ),
       first_mate_session_id: Type.String(),
       workspace_dedicated: Type.Literal(true, {
         description:
@@ -757,6 +773,7 @@ export default function orchestration(pi: ExtensionAPI) {
         taskId: params.task_id,
         title: params.title,
         brief: params.brief,
+        linearIssue: params.linear_issue,
         cwd: ctx.cwd,
         ownerSessionId: params.first_mate_session_id,
         mateSessionId: ctx.sessionManager.getSessionId(),

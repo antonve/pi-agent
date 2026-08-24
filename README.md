@@ -14,6 +14,7 @@ This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. 
 - `first_mate_claim` and `first_mate_status` expose the same lifecycle to the model.
 - First-mate tools create one Herdr Space per task, with a persistent Pi second mate in the first tab and active headless leaves in later tabs.
 - `task_assign`, `task_list`, `task_send`, and `task_cancel` manage the durable task portfolio after the role is claimed.
+- `task_assign` and `mate_register` accept `linear_issue`; linked second mates then read the issue before planning, keep one managed living-plan comment updated, move the issue to started when work begins, and complete it only after verified success.
 - `mate_register`, `raise_decision`, `complete_task`, and `fail_task` support task-scoped second mates, including independently opened Pi sessions.
 - Linear tools cover routine issue search/read/create/update/comment workflows, with unrestricted GraphQL as a fallback. Set `LINEAR_API_KEY` in `~/.config/agentbox/secrets.env`.
 - `github-dark-default` and warm yellow-orange `gruvbox-dark` themes are included.
