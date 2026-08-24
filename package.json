@@ -16,7 +16,6 @@
       "extensions/linear",
       "extensions/model-info",
       "extensions/session-aliases",
-      "extensions/summaries",
       "extensions/ui-customization",
       "extensions/orchestration"
     ],
