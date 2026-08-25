@@ -915,6 +915,7 @@ test("task assignment failure closes the workspace and restores first-mate focus
     const directory = await mkdtemp(join(tmpdir(), "pi-fleet-close-focus-"));
     const calls: string[][] = [];
     let workspaceReads = 0;
+    let focusedWorkspace = "w-owner";
     const runner: CliRunner = {
       async run(_command, args) {
         calls.push([...args]);
@@ -924,7 +925,7 @@ test("task assignment failure closes the workspace and restores first-mate focus
             stderr: "",
             stdout: JSON.stringify({
               result: {
-                workspaces: [{ workspace_id: "w-owner", focused: true }],
+                workspaces: [{ workspace_id: focusedWorkspace, focused: true }],
               },
             }),
           };
@@ -934,7 +935,13 @@ test("task assignment failure closes the workspace and restores first-mate focus
             stderr: "",
             stdout: JSON.stringify({
               result: {
-                panes: [{ pane_id: "w-owner:p1", focused: true }],
+                panes: [
+                  {
+                    pane_id: `${focusedWorkspace}:p1`,
+                    tab_id: `${focusedWorkspace}:t1`,
+                    focused: true,
+                  },
+                ],
               },
             }),
           };
@@ -980,7 +987,8 @@ test("task assignment failure closes the workspace and restores first-mate focus
               },
             }),
           };
-        if (args[0] === "agent" && args[1] === "prompt")
+        if (args[0] === "agent" && args[1] === "prompt") {
+          focusedWorkspace = "w-task";
           return {
             code: 0,
             stderr: "",
@@ -996,16 +1004,21 @@ test("task assignment failure closes the workspace and restores first-mate focus
               },
             }),
           };
+        }
         return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
       },
     };
-    const herdr = new HerdrClient(runner, {
-      promptReadyPollMs: 1,
-      promptReadyConsecutiveReads: 1,
-      promptDeliveryAttempts: 2,
-      promptActivityTimeoutMs: 5,
-      promptLateActivityMs: 5,
-    });
+    const herdr = new HerdrClient(
+      runner,
+      {
+        promptReadyPollMs: 1,
+        promptReadyConsecutiveReads: 1,
+        promptDeliveryAttempts: 2,
+        promptActivityTimeoutMs: 5,
+        promptLateActivityMs: 5,
+      },
+      { guardBackgroundFocus: true },
+    );
     const fleet = new FleetManager(
       new FleetStore(join(directory, "fleet.json")),
       herdr,
@@ -1177,7 +1190,7 @@ test("task assignment propagates Linear sync metadata into the second-mate promp
   });
 });
 
-test("workspace labels use the canonical Linear identifier resolved from the brief", async () => {
+test("task assignment never infers a Linear issue from the brief", async () => {
   await withHerdrSocket(async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-fleet-linear-brief-"));
     const calls: string[][] = [];
@@ -1260,7 +1273,7 @@ test("workspace labels use the canonical Linear identifier resolved from the bri
       cwd: "/repo",
       ownerSessionId: "first-mate-session",
     });
-    assert.equal(task.linearIssue, "ENG-456");
+    assert.equal(task.linearIssue, undefined);
     assert.deepEqual(
       calls
         .find((args) => args[0] === "workspace" && args[1] === "create")
@@ -1271,13 +1284,13 @@ test("workspace labels use the canonical Linear identifier resolved from the bri
         "--cwd",
         "/repo",
         "--label",
-        "ENG-456 Implement the sync flow",
+        "task-brief Implement the sync flow",
       ],
     );
   });
 });
 
-test("workspace labels use the canonical Linear identifier resolved from task_id", async () => {
+test("issue-looking task IDs do not enable Linear synchronization implicitly", async () => {
   await withHerdrSocket(async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-fleet-linear-task-id-"));
     const calls: string[][] = [];
@@ -1360,7 +1373,7 @@ test("workspace labels use the canonical Linear identifier resolved from task_id
       cwd: "/repo",
       ownerSessionId: "first-mate-session",
     });
-    assert.equal(task.linearIssue, "ENG-789");
+    assert.equal(task.linearIssue, undefined);
     assert.deepEqual(
       calls
         .find((args) => args[0] === "workspace" && args[1] === "create")
@@ -1374,6 +1387,13 @@ test("workspace labels use the canonical Linear identifier resolved from task_id
         "ENG-789 Implement the sync flow",
       ],
     );
+    const assignment = (await fleet.store.messagesForTask(task.id))[0];
+    assert.equal(assignment?.payload.linearIssue, undefined);
+    const promptCall = calls.find(
+      (args) => args[0] === "agent" && args[1] === "prompt",
+    );
+    assert.ok(promptCall);
+    assert.doesNotMatch(promptCall[3]!, /Linear synchronization:/);
   });
 });
 
