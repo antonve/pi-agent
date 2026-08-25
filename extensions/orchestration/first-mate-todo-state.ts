@@ -37,11 +37,44 @@ export interface PullRequestSnapshot {
   fetchedAt: number;
 }
 
+export type TodoHistoryItemKind =
+  | "review"
+  | "decision"
+  | "risk"
+  | "blocker"
+  | "failure"
+  | "outcome"
+  | "manual";
+
+export type TodoHistoryStatus =
+  | "done"
+  | "dismissed"
+  | "acknowledged"
+  | "completed"
+  | "resolved"
+  | "closed"
+  | "merged";
+
+export interface TodoHistoryItem {
+  id: string;
+  source: "generated" | "manual";
+  kind: TodoHistoryItemKind;
+  title: string;
+  taskId?: string;
+  taskTitle?: string;
+  detail?: string;
+  status: TodoHistoryStatus;
+  prUrl?: string;
+  resolvedAt: number;
+}
+
 export interface TodoBoardState {
   version: 1;
   manualItems: ManualTodoItem[];
   resolutions: Record<string, TodoResolution>;
   pullRequests: Record<string, PullRequestSnapshot>;
+  historyItems?: TodoHistoryItem[];
+  dismissedRiskIds?: string[];
 }
 
 export interface TodoPaneRuntimeState {
@@ -51,6 +84,7 @@ export interface TodoPaneRuntimeState {
   tabId?: string;
   workspaceId?: string;
   startedAt?: number;
+  fingerprint?: string;
 }
 
 function isErrno(error: unknown, code: string) {
@@ -70,7 +104,14 @@ function todoDirectory() {
 }
 
 function emptyBoardState(): TodoBoardState {
-  return { version: 1, manualItems: [], resolutions: {}, pullRequests: {} };
+  return {
+    version: 1,
+    manualItems: [],
+    resolutions: {},
+    pullRequests: {},
+    historyItems: [],
+    dismissedRiskIds: [],
+  };
 }
 
 function emptyRuntimeState(): TodoPaneRuntimeState {
@@ -206,6 +247,53 @@ function normalizeResolution(value: unknown): TodoResolution | undefined {
   };
 }
 
+function normalizeHistoryItem(value: unknown): TodoHistoryItem | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const kinds = new Set<TodoHistoryItemKind>([
+    "review",
+    "decision",
+    "risk",
+    "blocker",
+    "failure",
+    "outcome",
+    "manual",
+  ]);
+  const statuses = new Set<TodoHistoryStatus>([
+    "done",
+    "dismissed",
+    "acknowledged",
+    "completed",
+    "resolved",
+    "closed",
+    "merged",
+  ]);
+  if (
+    typeof record.id !== "string" ||
+    (record.source !== "generated" && record.source !== "manual") ||
+    typeof record.kind !== "string" ||
+    !kinds.has(record.kind as TodoHistoryItemKind) ||
+    typeof record.title !== "string" ||
+    typeof record.status !== "string" ||
+    !statuses.has(record.status as TodoHistoryStatus) ||
+    typeof record.resolvedAt !== "number"
+  )
+    return undefined;
+  return {
+    id: record.id,
+    source: record.source,
+    kind: record.kind as TodoHistoryItemKind,
+    title: record.title,
+    taskId: typeof record.taskId === "string" ? record.taskId : undefined,
+    taskTitle:
+      typeof record.taskTitle === "string" ? record.taskTitle : undefined,
+    detail: typeof record.detail === "string" ? record.detail : undefined,
+    status: record.status as TodoHistoryStatus,
+    prUrl: typeof record.prUrl === "string" ? record.prUrl : undefined,
+    resolvedAt: record.resolvedAt,
+  };
+}
+
 function normalizePullRequest(value: unknown): PullRequestSnapshot | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
@@ -272,7 +360,37 @@ function normalizeBoardState(value: unknown): TodoBoardState {
             ),
         )
       : {};
-  return { version: 1, manualItems, resolutions, pullRequests };
+  const historyItems = Array.isArray(record.historyItems)
+    ? record.historyItems
+        .map((item) => normalizeHistoryItem(item))
+        .filter((item) => item !== undefined)
+    : [];
+  const dismissedRiskIds = new Set(
+    Array.isArray(record.dismissedRiskIds)
+      ? record.dismissedRiskIds.filter(
+          (id): id is string =>
+            typeof id === "string" && id.startsWith("risk:"),
+        )
+      : [],
+  );
+  for (const [id, resolution] of Object.entries(resolutions))
+    if (id.startsWith("risk:") && resolution.state === "dismissed")
+      dismissedRiskIds.add(id);
+  for (const item of historyItems)
+    if (
+      item.kind === "risk" &&
+      item.status === "dismissed" &&
+      item.id.startsWith("risk:")
+    )
+      dismissedRiskIds.add(item.id);
+  return {
+    version: 1,
+    manualItems,
+    resolutions,
+    pullRequests,
+    historyItems,
+    dismissedRiskIds: [...dismissedRiskIds].sort(),
+  };
 }
 
 function normalizeRuntimeState(value: unknown): TodoPaneRuntimeState {
@@ -288,6 +406,8 @@ function normalizeRuntimeState(value: unknown): TodoPaneRuntimeState {
       typeof record.workspaceId === "string" ? record.workspaceId : undefined,
     startedAt:
       typeof record.startedAt === "number" ? record.startedAt : undefined,
+    fingerprint:
+      typeof record.fingerprint === "string" ? record.fingerprint : undefined,
   };
 }
 

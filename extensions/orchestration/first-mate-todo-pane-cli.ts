@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { nodeCliRunner } from "./cli.ts";
 import { FleetStore } from "./fleet.ts";
 import {
   buildTodoBoardView,
   parseSnoozeDuration,
+  reconcileTodoBoardState,
   type TodoBoardView,
 } from "./first-mate-todo-model.ts";
 import {
@@ -17,6 +19,7 @@ import {
   renderTodoPane,
   type TodoUiState,
 } from "./first-mate-todo-view.ts";
+import { HerdrClient } from "./herdr-client.ts";
 
 const execFileAsync = promisify(execFile);
 const LOCAL_REFRESH_MS = 2_000;
@@ -34,6 +37,7 @@ interface PrRefreshState {
 
 const stateStore = new TodoBoardStateStore();
 const fleetStore = new FleetStore();
+const herdr = new HerdrClient(nodeCliRunner);
 
 let stopped = false;
 let interactive = false;
@@ -84,18 +88,68 @@ async function ghPullRequest(url: string): Promise<PullRequestSnapshot> {
 async function boardView(now = Date.now()) {
   const state = await stateStore.read();
   const tasks = await fleetStore.listTasks();
-  const messages = await Promise.all(
-    tasks.map(
-      async (task) =>
-        [task.id, await fleetStore.messagesForTask(task.id)] as const,
+  const [messages, focusable] = await Promise.all([
+    Promise.all(
+      tasks.map(
+        async (task) =>
+          [task.id, await fleetStore.messagesForTask(task.id)] as const,
+      ),
     ),
-  );
-  return buildTodoBoardView({
+    Promise.all(
+      tasks.map(async (task) =>
+        task.matePaneId &&
+        task.workspaceClosedAt === undefined &&
+        (task.state === "active" ||
+          task.state === "waiting-decision" ||
+          task.state === "blocked" ||
+          task.state === "failed") &&
+        (await herdr.paneExists(task.matePaneId).catch(() => false))
+          ? task.id
+          : undefined,
+      ),
+    ),
+  ]);
+  const result = buildTodoBoardView({
     boardState: state,
     tasks,
     messagesByTask: new Map(messages),
+    focusableTaskIds: new Set(
+      focusable.filter((taskId): taskId is string => taskId !== undefined),
+    ),
     now,
   });
+  const reconciled = reconcileTodoBoardState(state, result);
+  if (reconciled !== state) {
+    const originalResolutionIds = new Set(Object.keys(state.resolutions));
+    const persisted = await stateStore.update((current) => {
+      const next = reconcileTodoBoardState(current, result);
+      const concurrentResolutions = Object.fromEntries(
+        Object.entries(current.resolutions).filter(
+          ([id, resolution]) =>
+            /^(?:review|decision|risk|blocker|failure|outcome):/.test(id) &&
+            (!originalResolutionIds.has(id) ||
+              JSON.stringify(resolution) !==
+                JSON.stringify(state.resolutions[id])),
+        ),
+      );
+      return Object.keys(concurrentResolutions).length === 0
+        ? next
+        : {
+            ...next,
+            resolutions: { ...next.resolutions, ...concurrentResolutions },
+          };
+    });
+    return buildTodoBoardView({
+      boardState: persisted,
+      tasks,
+      messagesByTask: new Map(messages),
+      focusableTaskIds: new Set(
+        focusable.filter((taskId): taskId is string => taskId !== undefined),
+      ),
+      now,
+    });
+  }
+  return result;
 }
 
 async function maybeRefreshPullRequests(force = false) {
@@ -160,6 +214,10 @@ async function updateResolution(
       ...current.resolutions,
       [itemId]: { ...resolution, at: Date.now() },
     },
+    dismissedRiskIds:
+      itemId.startsWith("risk:") && resolution.state === "dismissed"
+        ? [...new Set([...(current.dismissedRiskIds ?? []), itemId])].sort()
+        : current.dismissedRiskIds,
   }));
 }
 
@@ -224,14 +282,20 @@ async function applyCommand(
       await refresh();
       return;
     case "focus":
-      if (command.item.tabId)
-        await execFileAsync("herdr", ["tab", "focus", command.item.tabId]);
-      else if (command.item.workspaceId)
-        await execFileAsync("herdr", [
-          "workspace",
-          "focus",
-          command.item.workspaceId,
-        ]);
+      if (
+        !command.item.paneId ||
+        !(await herdr.paneExists(command.item.paneId).catch(() => false))
+      ) {
+        setStatus("Task workspace is no longer available.");
+        await refresh();
+        return;
+      }
+      try {
+        await herdr.focusPane(command.item.paneId);
+      } catch {
+        setStatus("Task workspace is no longer available.");
+        await refresh();
+      }
       return;
     case "open":
       if (!command.item.prUrl) return;
