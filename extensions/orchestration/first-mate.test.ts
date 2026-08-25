@@ -910,7 +910,7 @@ test("task assignment creates its workspace without focus churn", async () => {
   });
 });
 
-test("task assignment failure closes the workspace and restores first-mate focus", async () => {
+test("task assignment failure closes the workspace without guessing focus", async () => {
   await withHerdrSocket(async (requests) => {
     const directory = await mkdtemp(join(tmpdir(), "pi-fleet-close-focus-"));
     const calls: string[][] = [];
@@ -1008,17 +1008,13 @@ test("task assignment failure closes the workspace and restores first-mate focus
         return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
       },
     };
-    const herdr = new HerdrClient(
-      runner,
-      {
-        promptReadyPollMs: 1,
-        promptReadyConsecutiveReads: 1,
-        promptDeliveryAttempts: 2,
-        promptActivityTimeoutMs: 5,
-        promptLateActivityMs: 5,
-      },
-      { guardBackgroundFocus: true },
-    );
+    const herdr = new HerdrClient(runner, {
+      promptReadyPollMs: 1,
+      promptReadyConsecutiveReads: 1,
+      promptDeliveryAttempts: 2,
+      promptActivityTimeoutMs: 5,
+      promptLateActivityMs: 5,
+    });
     const fleet = new FleetManager(
       new FleetStore(join(directory, "fleet.json")),
       herdr,
@@ -1059,10 +1055,8 @@ test("task assignment failure closes the workspace and restores first-mate focus
       true,
     );
     assert.deepEqual(
-      requests
-        .filter((request) => request.method === "pane.focus")
-        .map((request) => request.params),
-      [{ pane_id: "w-owner:p1" }],
+      requests.filter((request) => request.method === "pane.focus"),
+      [],
     );
   });
 });

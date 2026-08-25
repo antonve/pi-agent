@@ -65,14 +65,6 @@ export interface HerdrPaneProcessInfo {
   foregroundCommandLine?: string;
 }
 
-interface BackgroundFocusTargets {
-  workspaceIds: string[];
-  tabIds: string[];
-  paneIds: string[];
-}
-
-let backgroundFocusQueue = Promise.resolve();
-
 export class HerdrCommandError extends Error {
   readonly code?: string;
 
@@ -164,66 +156,25 @@ function environmentArguments(args: readonly string[]) {
   );
 }
 
-function backgroundFocusTargets(
-  args: readonly string[],
-): BackgroundFocusTargets | undefined {
+function isBackgroundCommand(args: readonly string[]) {
   const [kind, action] = args;
   if (!kind || !action || action === "focus" || action === "attach")
-    return undefined;
-  const targets: BackgroundFocusTargets = {
-    workspaceIds: [],
-    tabIds: [],
-    paneIds: [],
-  };
-  if (kind === "workspace") {
-    if (action !== "create") {
-      if (["close", "move", "rename"].includes(action) && args[2])
-        targets.workspaceIds.push(args[2]);
-      else return undefined;
-    }
-  } else if (kind === "tab") {
-    if (action !== "create") {
-      if (["close", "move", "rename"].includes(action) && args[2])
-        targets.tabIds.push(args[2]);
-      else return undefined;
-    }
-  } else if (kind === "pane") {
-    if (action === "split") {
-      const paneId = argumentAfter(args, "--pane");
-      if (paneId) targets.paneIds.push(paneId);
-    } else if (action === "swap") {
-      const source = argumentAfter(args, "--source-pane");
-      const target = argumentAfter(args, "--target-pane");
-      if (source) targets.paneIds.push(source);
-      if (target) targets.paneIds.push(target);
-    } else if (action === "resize") {
-      const paneId = argumentAfter(args, "--pane");
-      if (paneId) targets.paneIds.push(paneId);
-    } else if (
-      ["close", "rename", "run", "send-text", "send-keys"].includes(action)
-    ) {
-      if (args[2]) targets.paneIds.push(args[2]);
-    } else return undefined;
-  } else if (kind === "agent") {
-    if (action === "start") {
-      const paneId = argumentAfter(args, "--pane");
-      if (paneId) targets.paneIds.push(paneId);
-    } else if (action !== "prompt" && action !== "rename") return undefined;
-  } else return undefined;
-  return targets;
-}
-
-function resultFocusTargets(output: string) {
-  try {
-    const value = JSON.parse(output);
-    return {
-      workspaceId: findString(value, ["workspace_id"]),
-      tabId: findString(value, ["tab_id"]),
-      paneId: findString(value, ["pane_id"]),
-    };
-  } catch {
-    return {};
-  }
+    return false;
+  if (kind === "workspace")
+    return ["create", "close", "rename"].includes(action);
+  if (kind === "tab") return ["create", "close", "rename"].includes(action);
+  if (kind === "pane")
+    return [
+      "split",
+      "swap",
+      "resize",
+      "close",
+      "rename",
+      "run",
+      "send-text",
+      "send-keys",
+    ].includes(action);
+  return kind === "agent" && ["start", "prompt", "rename"].includes(action);
 }
 
 function isRetryableAgentError(error: unknown) {
@@ -297,7 +248,6 @@ function acknowledgedActivity(agent: HerdrAgent, baseline: HerdrAgent) {
 export class HerdrClient {
   private readonly runner: CliRunner;
   private readonly timing: HerdrTiming;
-  private readonly guardBackgroundFocus: boolean;
 
   private async socketJson<T>(
     method: string,
@@ -376,119 +326,9 @@ export class HerdrClient {
     });
   }
 
-  constructor(
-    runner: CliRunner,
-    timing: Partial<HerdrTiming> = {},
-    options: { guardBackgroundFocus?: boolean } = {},
-  ) {
+  constructor(runner: CliRunner, timing: Partial<HerdrTiming> = {}) {
     this.runner = runner;
     this.timing = { ...DEFAULT_TIMING, ...timing };
-    this.guardBackgroundFocus =
-      options.guardBackgroundFocus ?? runner === nodeCliRunner;
-  }
-
-  private async targetPaneIds(targets: BackgroundFocusTargets) {
-    const paneIds = new Set(targets.paneIds);
-    for (const workspaceId of targets.workspaceIds) {
-      const value = await this.runner
-        .run("herdr", ["pane", "list", "--workspace", workspaceId], {
-          timeoutMs: 5_000,
-        })
-        .catch(() => undefined);
-      if (!value || value.code !== 0) continue;
-      let decoded: unknown;
-      try {
-        decoded = JSON.parse(value.stdout);
-      } catch {
-        continue;
-      }
-      for (const pane of findObjects(
-        decoded,
-        (candidate) =>
-          typeof candidate.pane_id === "string" && candidate.focused === true,
-      ))
-        paneIds.add(String(pane.pane_id));
-    }
-    for (const tabId of targets.tabIds) {
-      const tab = await this.runner
-        .run("herdr", ["tab", "get", tabId], { timeoutMs: 5_000 })
-        .catch(() => undefined);
-      let workspaceId: string | undefined;
-      if (tab?.code === 0)
-        try {
-          workspaceId = findString(JSON.parse(tab.stdout), ["workspace_id"]);
-        } catch {
-          // Treat malformed discovery as an unavailable target location.
-        }
-      if (!workspaceId) continue;
-      const panes = await this.runner
-        .run("herdr", ["pane", "list", "--workspace", workspaceId], {
-          timeoutMs: 5_000,
-        })
-        .catch(() => undefined);
-      if (!panes || panes.code !== 0) continue;
-      let decoded: unknown;
-      try {
-        decoded = JSON.parse(panes.stdout);
-      } catch {
-        continue;
-      }
-      for (const pane of findObjects(
-        decoded,
-        (candidate) =>
-          candidate.tab_id === tabId &&
-          typeof candidate.pane_id === "string" &&
-          candidate.focused === true,
-      ))
-        paneIds.add(String(pane.pane_id));
-    }
-    return paneIds;
-  }
-
-  private async backgroundMutation<T>(
-    targets: BackgroundFocusTargets,
-    operation: () => Promise<T>,
-    output: (result: T) => string,
-  ) {
-    if (!this.guardBackgroundFocus) return operation();
-    const previous = backgroundFocusQueue;
-    let release!: () => void;
-    backgroundFocusQueue = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous.catch(() => undefined);
-    const targetPaneIds = await this.targetPaneIds(targets).catch(
-      () => new Set(targets.paneIds),
-    );
-    const started = await this.focusedPane().catch(() => undefined);
-    let result: T | undefined;
-    try {
-      result = await operation();
-      return result;
-    } finally {
-      try {
-        const current = await this.focusedPane().catch(() => undefined);
-        const dynamic =
-          result === undefined ? {} : resultFocusTargets(output(result));
-        const affected =
-          current !== undefined &&
-          (targetPaneIds.has(current.paneId) ||
-            dynamic.paneId === current.paneId);
-        const changed =
-          started !== undefined &&
-          current !== undefined &&
-          (started.workspaceId !== current.workspaceId ||
-            started.tabId !== current.tabId ||
-            started.paneId !== current.paneId);
-        // An unrelated destination is user navigation, not focus theft. Never
-        // override it. A target destination can only come from this direct
-        // background operation, so restore the exact starting pane.
-        if (affected && changed)
-          await this.focusPane(started.paneId).catch(() => undefined);
-      } finally {
-        release();
-      }
-    }
   }
 
   private async nativeBackgroundCommand(
@@ -625,14 +465,9 @@ export class HerdrClient {
     args: string[],
     options: { signal?: AbortSignal; timeoutMs?: number } = {},
   ) {
-    const targets = backgroundFocusTargets(args);
-    const operation = () =>
-      this.runner === nodeCliRunner && targets
-        ? this.nativeBackgroundCommand(args, options)
-        : this.runner.run("herdr", args, options);
-    return targets
-      ? this.backgroundMutation(targets, operation, (result) => result.stdout)
-      : operation();
+    if (this.runner === nodeCliRunner && isBackgroundCommand(args))
+      return this.nativeBackgroundCommand(args, options);
+    return this.runner.run("herdr", args, options);
   }
 
   private async json(
@@ -761,22 +596,13 @@ export class HerdrClient {
     insertIndex: number,
     signal?: AbortSignal,
   ) {
-    return this.backgroundMutation(
+    return this.socketJson(
+      "workspace.move",
       {
-        workspaceIds: [workspaceId],
-        tabIds: [],
-        paneIds: [],
+        workspace_id: workspaceId,
+        insert_index: insertIndex,
       },
-      () =>
-        this.socketJson(
-          "workspace.move",
-          {
-            workspace_id: workspaceId,
-            insert_index: insertIndex,
-          },
-          signal,
-        ),
-      (result) => JSON.stringify(result),
+      signal,
     );
   }
 
