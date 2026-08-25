@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { stateDirectory } from "./registry.ts";
 import { HerdrClient } from "./herdr-client.ts";
@@ -7,9 +9,30 @@ import {
 } from "./first-mate-todo-state.ts";
 
 const BOARD_PROCESS_MARKER = "first-mate-todo-pane-cli.ts";
+const BOARD_FINGERPRINT_ARGUMENT = "--todo-runtime-fingerprint";
 const BOARD_WIDTH_RATIO = 0.22;
 const BOARD_MAX_WIDTH_RATIO = 0.25;
 const BOARD_RESIZE_ATTEMPTS = 8;
+const BOARD_RESTART_ATTEMPTS = 20;
+const BOARD_RESTART_POLL_MS = 50;
+
+// A Pi /reload evaluates this module again. Changing any long-lived board
+// source changes the marker, so the controller restarts only its owned CLI.
+export const TODO_RUNTIME_FINGERPRINT = createHash("sha256")
+  .update(
+    [
+      "first-mate-todo-pane-cli.ts",
+      "first-mate-todo-model.ts",
+      "first-mate-todo-state.ts",
+      "first-mate-todo-view.ts",
+    ]
+      .map((name) =>
+        readFileSync(new URL(`./${name}`, import.meta.url), "utf8"),
+      )
+      .join("\n--todo-source--\n"),
+  )
+  .digest("hex")
+  .slice(0, 16);
 
 export interface FirstMateTodoPaneLocation {
   workspaceId: string;
@@ -35,6 +58,7 @@ function boardCommand() {
       process.execPath,
       "--experimental-strip-types",
       scriptPath,
+      `${BOARD_FINGERPRINT_ARGUMENT}=${TODO_RUNTIME_FINGERPRINT}`,
     ],
   };
 }
@@ -44,6 +68,31 @@ function processMatchesBoard(commandLine: string | undefined) {
     typeof commandLine === "string" &&
     commandLine.includes(BOARD_PROCESS_MARKER)
   );
+}
+
+function processMatchesCurrentBoard(commandLine: string | undefined) {
+  return (
+    processMatchesBoard(commandLine) &&
+    commandLine!.includes(
+      `${BOARD_FINGERPRINT_ARGUMENT}=${TODO_RUNTIME_FINGERPRINT}`,
+    )
+  );
+}
+
+function processIsIdleShell(commandLine: string | undefined) {
+  if (!commandLine) return true;
+  const command = commandLine.trim().split(/\s+/, 1)[0]?.split("/").at(-1);
+  return (
+    command === "sh" ||
+    command === "bash" ||
+    command === "dash" ||
+    command === "zsh" ||
+    command === "fish"
+  );
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 export class FirstMateTodoPaneController {
@@ -124,6 +173,7 @@ export class FirstMateTodoPaneController {
       tabId: location.tabId,
       workspaceId: location.workspaceId,
       startedAt: Date.now(),
+      fingerprint: TODO_RUNTIME_FINGERPRINT,
     };
     await this.runtime.write(next);
   }
@@ -143,8 +193,16 @@ export class FirstMateTodoPaneController {
       runtime.workspaceId === location.workspaceId &&
       runtime.tabId === location.tabId &&
       (await this.herdr.paneExists(runtime.paneId).catch(() => false))
-    )
-      return runtime.paneId;
+    ) {
+      const process = await this.herdr
+        .processInfo(runtime.paneId)
+        .catch(() => undefined);
+      if (
+        processMatchesBoard(process?.foregroundCommandLine) ||
+        processIsIdleShell(process?.foregroundCommandLine)
+      )
+        return runtime.paneId;
+    }
 
     const layout = await this.herdr
       .layout(location.paneId)
@@ -215,8 +273,25 @@ export class FirstMateTodoPaneController {
   }
 
   private async ensureProcess(paneId: string) {
-    const process = await this.herdr.processInfo(paneId).catch(() => undefined);
-    if (processMatchesBoard(process?.foregroundCommandLine)) return false;
+    let process = await this.herdr.processInfo(paneId).catch(() => undefined);
+    if (processMatchesCurrentBoard(process?.foregroundCommandLine))
+      return false;
+    if (processMatchesBoard(process?.foregroundCommandLine)) {
+      await this.herdr.sendKeys(paneId, ["ctrl+c"]);
+      for (let attempt = 0; attempt < BOARD_RESTART_ATTEMPTS; attempt++) {
+        await delay(BOARD_RESTART_POLL_MS);
+        process = await this.herdr.processInfo(paneId).catch(() => undefined);
+        if (!processMatchesBoard(process?.foregroundCommandLine)) break;
+      }
+      if (processMatchesBoard(process?.foregroundCommandLine))
+        throw new Error(
+          `Timed out stopping outdated first-mate to-do process in ${paneId}.`,
+        );
+    } else if (!processIsIdleShell(process?.foregroundCommandLine)) {
+      throw new Error(
+        `Refusing to replace unrelated process in first-mate to-do pane ${paneId}.`,
+      );
+    }
     const command = boardCommand();
     await this.herdr.runInPane(paneId, command.command, command.args);
     return true;

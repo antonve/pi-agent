@@ -5,7 +5,10 @@ import { join } from "node:path";
 import test from "node:test";
 import type { CliRunner } from "./cli.ts";
 import { HerdrClient } from "./herdr-client.ts";
-import { FirstMateTodoPaneController } from "./first-mate-todo-pane.ts";
+import {
+  FirstMateTodoPaneController,
+  TODO_RUNTIME_FINGERPRINT,
+} from "./first-mate-todo-pane.ts";
 import { TodoPaneRuntimeStore } from "./first-mate-todo-state.ts";
 
 function layout(panes: Array<{ pane_id: string; x: number; width: number }>) {
@@ -22,6 +25,10 @@ function layout(panes: Array<{ pane_id: string; x: number; width: number }>) {
       },
     },
   });
+}
+
+function boardProcess(fingerprint = TODO_RUNTIME_FINGERPRINT) {
+  return `node --experimental-strip-types first-mate-todo-pane-cli.ts --todo-runtime-fingerprint=${fingerprint}`;
 }
 
 async function runtimeStore() {
@@ -155,12 +162,7 @@ test("controller idempotently reuses an existing running board pane", async () =
             result: {
               process_info: {
                 pane_id: "w1:p2",
-                foreground_processes: [
-                  {
-                    cmdline:
-                      "node --experimental-strip-types first-mate-todo-pane-cli.ts",
-                  },
-                ],
+                foreground_processes: [{ cmdline: boardProcess() }],
               },
             },
           }),
@@ -202,6 +204,234 @@ test("controller idempotently reuses an existing running board pane", async () =
   );
 });
 
+test("controller restarts an owned board when its runtime fingerprint changes", async () => {
+  const calls: string[][] = [];
+  let stopped = false;
+  const runtime = await runtimeStore();
+  await runtime.write({
+    version: 1,
+    paneId: "w1:p2",
+    parentPaneId: "w1:p1",
+    tabId: "w1:t1",
+    workspaceId: "w1",
+    startedAt: 1,
+    fingerprint: "older-source",
+  });
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "get")
+        return { code: 0, stderr: "", stdout: "{}" };
+      if (args[0] === "pane" && args[1] === "layout")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: layout([
+            { pane_id: "w1:p1", x: 0, width: 80 },
+            { pane_id: "w1:p2", x: 80, width: 20 },
+          ]),
+        };
+      if (args[0] === "pane" && args[1] === "process-info")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              process_info: {
+                pane_id: "w1:p2",
+                foreground_processes: [
+                  { cmdline: stopped ? "bash" : boardProcess("older-source") },
+                ],
+              },
+            },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "send-keys") stopped = true;
+      return { code: 0, stderr: "", stdout: "{}" };
+    },
+  };
+  const controller = new FirstMateTodoPaneController(
+    new HerdrClient(runner),
+    runtime,
+  );
+
+  const result = await controller.ensure({
+    workspaceId: "w1",
+    tabId: "w1:t1",
+    paneId: "w1:p1",
+    cwd: "/repo",
+  });
+
+  assert.deepEqual(result, {
+    paneId: "w1:p2",
+    created: false,
+    restarted: true,
+  });
+  assert.equal(
+    calls.filter(
+      (args) =>
+        args[0] === "pane" &&
+        args[1] === "send-keys" &&
+        args.includes("ctrl+c"),
+    ).length,
+    1,
+  );
+  assert.equal(
+    calls.filter((args) => args[0] === "pane" && args[1] === "run").length,
+    1,
+  );
+  assert.equal((await runtime.read()).paneId, "w1:p2");
+  assert.equal((await runtime.read()).fingerprint, TODO_RUNTIME_FINGERPRINT);
+});
+
+test("controller surfaces an owned board restart failure and restores focus", async () => {
+  const calls: string[][] = [];
+  let stopped = false;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "layout")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: layout([
+            { pane_id: "w1:p1", x: 0, width: 80 },
+            { pane_id: "w1:p2", x: 80, width: 20 },
+          ]),
+        };
+      if (args[0] === "pane" && args[1] === "process-info")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              process_info: {
+                pane_id: "w1:p2",
+                foreground_processes: [
+                  { cmdline: stopped ? "bash" : boardProcess("older-source") },
+                ],
+              },
+            },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "send-keys") stopped = true;
+      if (args[0] === "pane" && args[1] === "run")
+        return { code: 1, stderr: "restart failed", stdout: "" };
+      return { code: 0, stderr: "", stdout: "{}" };
+    },
+  };
+  const herdr = new FocusTrackingHerdrClient(runner, "w1:p1");
+  const controller = new FirstMateTodoPaneController(
+    herdr,
+    await runtimeStore(),
+  );
+
+  await assert.rejects(
+    controller.ensure({
+      workspaceId: "w1",
+      tabId: "w1:t1",
+      paneId: "w1:p1",
+      cwd: "/repo",
+    }),
+    /restart failed/,
+  );
+  assert.equal(herdr.currentFocus, "w1:p1");
+  assert.equal(
+    calls.filter((args) => args[0] === "pane" && args[1] === "close").length,
+    0,
+  );
+});
+
+test("controller never kills or replaces an unrelated process in a stale runtime pane", async () => {
+  const calls: string[][] = [];
+  let created = false;
+  const runtime = await runtimeStore();
+  await runtime.write({
+    version: 1,
+    paneId: "w1:p2",
+    parentPaneId: "w1:p1",
+    tabId: "w1:t1",
+    workspaceId: "w1",
+    startedAt: 1,
+    fingerprint: "older-source",
+  });
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "get")
+        return { code: 0, stderr: "", stdout: "{}" };
+      if (args[0] === "pane" && args[1] === "layout")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: created
+            ? layout([
+                { pane_id: "w1:p1", x: 0, width: 78 },
+                { pane_id: "w1:p2", x: 78, width: 11 },
+                { pane_id: "w1:p3", x: 89, width: 11 },
+              ])
+            : layout([
+                { pane_id: "w1:p1", x: 0, width: 80 },
+                { pane_id: "w1:p2", x: 80, width: 20 },
+              ]),
+        };
+      if (args[0] === "pane" && args[1] === "process-info") {
+        const paneId = String(args.at(-1));
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              process_info: {
+                pane_id: paneId,
+                foreground_processes: [
+                  {
+                    cmdline: paneId === "w1:p2" ? "vim important.txt" : "bash",
+                  },
+                ],
+              },
+            },
+          }),
+        };
+      }
+      if (args[0] === "pane" && args[1] === "split") {
+        created = true;
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({ result: { pane: { pane_id: "w1:p3" } } }),
+        };
+      }
+      return { code: 0, stderr: "", stdout: "{}" };
+    },
+  };
+  const controller = new FirstMateTodoPaneController(
+    new HerdrClient(runner),
+    runtime,
+  );
+
+  const result = await controller.ensure({
+    workspaceId: "w1",
+    tabId: "w1:t1",
+    paneId: "w1:p1",
+    cwd: "/repo",
+  });
+
+  assert.deepEqual(result, {
+    paneId: "w1:p3",
+    created: true,
+    restarted: true,
+  });
+  assert.equal(
+    calls.some(
+      (args) =>
+        (args[0] === "pane" && args[1] === "send-keys") ||
+        (args[0] === "pane" && args[1] === "close" && args[2] === "w1:p2"),
+    ),
+    false,
+  );
+});
+
 test("controller shrinks an oversized reused board once and keeps reuse idempotent", async () => {
   const calls: string[][] = [];
   let boardWidth = 78;
@@ -225,12 +455,7 @@ test("controller shrinks an oversized reused board once and keeps reuse idempote
             result: {
               process_info: {
                 pane_id: "w1:p2",
-                foreground_processes: [
-                  {
-                    cmdline:
-                      "node --experimental-strip-types first-mate-todo-pane-cli.ts",
-                  },
-                ],
+                foreground_processes: [{ cmdline: boardProcess() }],
               },
             },
           }),
@@ -318,10 +543,7 @@ test("controller reclaims a board on the same workspace without duplicates", asy
                 pane_id: args.at(-1),
                 foreground_processes: [
                   {
-                    cmdline:
-                      args.at(-1) === "w1:p2"
-                        ? "node first-mate-todo-pane-cli.ts"
-                        : "bash",
+                    cmdline: args.at(-1) === "w1:p2" ? boardProcess() : "bash",
                   },
                 ],
               },
@@ -389,10 +611,7 @@ test("controller reuses and moves a discovered board to the far right", async ()
                 pane_id: args.at(-1),
                 foreground_processes: [
                   {
-                    cmdline:
-                      args.at(-1) === "w1:p2"
-                        ? "node first-mate-todo-pane-cli.ts"
-                        : "bash",
+                    cmdline: args.at(-1) === "w1:p2" ? boardProcess() : "bash",
                   },
                 ],
               },
@@ -527,9 +746,7 @@ test("repeated task-assignment-like reconciliation restores the exact first-mate
             result: {
               process_info: {
                 pane_id: "w1:p2",
-                foreground_processes: [
-                  { cmdline: "node first-mate-todo-pane-cli.ts" },
-                ],
+                foreground_processes: [{ cmdline: boardProcess() }],
               },
             },
           }),
@@ -579,9 +796,7 @@ test("resize correction restores intentional focus on the existing to-do pane", 
             result: {
               process_info: {
                 pane_id: "w1:p2",
-                foreground_processes: [
-                  { cmdline: "node first-mate-todo-pane-cli.ts" },
-                ],
+                foreground_processes: [{ cmdline: boardProcess() }],
               },
             },
           }),

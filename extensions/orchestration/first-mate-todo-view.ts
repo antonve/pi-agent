@@ -49,6 +49,7 @@ export interface TodoUiState {
   selectedId?: string;
   prompt?: PromptState;
   showHelp: boolean;
+  showHistory?: boolean;
   status?: string;
 }
 
@@ -84,7 +85,7 @@ function kindTag(item: TodoItem) {
 
 function primaryAction(item: TodoItem) {
   if (item.prUrl) return "open";
-  if (item.workspaceId) return "focus";
+  if (item.paneId) return "focus";
   return undefined;
 }
 
@@ -149,6 +150,10 @@ function applyPromptEdit(prompt: PromptState, data: string) {
   return prompt;
 }
 
+function displayedView(view: TodoBoardView, state: TodoUiState) {
+  return state.showHistory ? { ...view, items: view.historyItems ?? [] } : view;
+}
+
 function selectedItem(view: TodoBoardView, state: TodoUiState) {
   return (
     view.items.find((item) => item.id === state.selectedId) ?? view.items[0]
@@ -156,13 +161,14 @@ function selectedItem(view: TodoBoardView, state: TodoUiState) {
 }
 
 export function normalizeUiState(view: TodoBoardView, state: TodoUiState) {
-  if (view.items.length === 0) return { ...state, selectedId: undefined };
+  const displayed = displayedView(view, state);
+  if (displayed.items.length === 0) return { ...state, selectedId: undefined };
   if (
     state.selectedId &&
-    view.items.some((item) => item.id === state.selectedId)
+    displayed.items.some((item) => item.id === state.selectedId)
   )
     return state;
-  return { ...state, selectedId: view.items[0]!.id };
+  return { ...state, selectedId: displayed.items[0]!.id };
 }
 
 export function handleTodoKey(
@@ -172,6 +178,7 @@ export function handleTodoKey(
   now = Date.now(),
 ): { state: TodoUiState; command: TodoUiCommand } {
   const normalized = normalizeUiState(view, state);
+  const displayed = displayedView(view, normalized);
   if (normalized.prompt) {
     if (matchesKey(data, Key.escape))
       return {
@@ -229,7 +236,7 @@ export function handleTodoKey(
     return {
       state: {
         ...normalized,
-        selectedId: moveSelection(view, normalized.selectedId, -1),
+        selectedId: moveSelection(displayed, normalized.selectedId, -1),
       },
       command: { type: "none" },
     };
@@ -237,13 +244,23 @@ export function handleTodoKey(
     return {
       state: {
         ...normalized,
-        selectedId: moveSelection(view, normalized.selectedId, 1),
+        selectedId: moveSelection(displayed, normalized.selectedId, 1),
       },
       command: { type: "none" },
     };
   if (data === "?")
     return {
       state: { ...normalized, showHelp: !normalized.showHelp },
+      command: { type: "none" },
+    };
+  if (data === "h")
+    return {
+      state: {
+        ...normalized,
+        showHistory: !normalized.showHistory,
+        selectedId: undefined,
+        status: undefined,
+      },
       command: { type: "none" },
     };
   if (data === "r")
@@ -261,10 +278,19 @@ export function handleTodoKey(
       command: { type: "none" },
     };
 
-  const item = selectedItem(view, normalized);
+  const item = selectedItem(displayed, normalized);
   if (!item)
     return {
       state: normalized,
+      command: { type: "none" },
+    };
+
+  if (
+    normalized.showHistory &&
+    (data === "d" || data === "x" || data === "z" || data === "e")
+  )
+    return {
+      state: { ...normalized, status: "History items are read-only." },
       command: { type: "none" },
     };
 
@@ -312,7 +338,7 @@ export function handleTodoKey(
       },
       command: { type: "none" },
     };
-  if (data === "f" && item.workspaceId)
+  if (data === "f" && item.paneId)
     return {
       state: {
         ...normalized,
@@ -400,9 +426,15 @@ export function renderTodoPane(
   height: number,
 ) {
   const normalized = normalizeUiState(view, state);
+  const displayed = displayedView(view, normalized);
+  const mode = normalized.showHistory ? "History" : "Active";
   const header: string[] = [
     truncateToWidth(
-      `${ansi.bold("First-mate to-do")} ${ansi.dim(`${view.items.length} visible · ${view.hiddenCount} hidden`)}`,
+      `${ansi.bold(`First-mate to-do · ${mode}`)} ${ansi.dim(
+        normalized.showHistory
+          ? `${displayed.items.length} archived`
+          : `${displayed.items.length} visible · ${view.hiddenCount} hidden`,
+      )}`,
       width,
     ),
   ];
@@ -410,7 +442,7 @@ export function renderTodoPane(
     header.push(
       truncateToWidth(ansi.dim(sanitizeTodoText(normalized.status)), width),
     );
-  else if (view.snoozedCount > 0)
+  else if (!normalized.showHistory && view.snoozedCount > 0)
     header.push(
       truncateToWidth(
         ansi.dim(
@@ -429,6 +461,7 @@ export function renderTodoPane(
       "o open PR",
       "d done · x dismiss · z snooze",
       "a add · e edit manual",
+      "h Active/History",
       "r refresh · ? help",
     ];
     for (const line of help)
@@ -440,7 +473,7 @@ export function renderTodoPane(
   let selectedStart = 0;
   let selectedEnd = 0;
   const appendItems = (source: TodoItem["source"], heading: string) => {
-    const items = view.items.filter((item) => item.source === source);
+    const items = displayed.items.filter((item) => item.source === source);
     if (items.length === 0) return;
     body.push(truncateToWidth(ansi.bold(heading), width));
     for (const item of items) {
@@ -456,18 +489,50 @@ export function renderTodoPane(
       body.push(...itemLines, "");
     }
   };
-  appendItems("generated", "Generated");
-  appendItems("manual", "Manual");
-  if (view.items.length === 0)
+  if (normalized.showHistory) {
+    if (displayed.items.length > 0) {
+      body.push(truncateToWidth(ansi.bold("History"), width));
+      for (const item of displayed.items) {
+        const itemLines = renderItem(
+          item,
+          item.id === normalized.selectedId,
+          width,
+        );
+        if (item.id === normalized.selectedId) {
+          selectedStart = body.length;
+          selectedEnd = body.length + itemLines.length - 1;
+        }
+        body.push(...itemLines, "");
+      }
+    }
+  } else {
+    appendItems("generated", "Generated");
+    appendItems("manual", "Manual");
+  }
+  if (displayed.items.length === 0)
     body.push(
-      truncateToWidth(ansi.dim("No items. Press a to add one."), width),
+      truncateToWidth(
+        ansi.dim(
+          normalized.showHistory
+            ? "No history yet. Press h for Active."
+            : "No items. Press a to add one.",
+        ),
+        width,
+      ),
     );
 
   const footer = [
     truncateToWidth("─".repeat(Math.max(0, width)), width),
     normalized.prompt
       ? renderPrompt(normalized.prompt, width)
-      : truncateToWidth(ansi.dim("enter open/focus · ? help"), width),
+      : truncateToWidth(
+          ansi.dim(
+            normalized.showHistory
+              ? "h Active · enter open PR · ? help"
+              : "h History · enter open/focus · ? help",
+          ),
+          width,
+        ),
   ];
   const bodyHeight = Math.max(0, height - header.length - footer.length);
   const maxStart = Math.max(0, body.length - bodyHeight);
