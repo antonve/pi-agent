@@ -214,6 +214,10 @@ async function updateResolution(
       ...current.resolutions,
       [itemId]: { ...resolution, at: Date.now() },
     },
+    dismissedRiskIds:
+      itemId.startsWith("risk:") && resolution.state === "dismissed"
+        ? [...new Set([...(current.dismissedRiskIds ?? []), itemId])].sort()
+        : current.dismissedRiskIds,
   }));
 }
 

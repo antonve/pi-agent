@@ -168,10 +168,26 @@ function detailFromPayload(payload: Record<string, unknown>) {
   ].find((value) => value !== undefined);
 }
 
+function dismissedRiskIds(state: TodoBoardState) {
+  const ids = new Set(state.dismissedRiskIds ?? []);
+  for (const [id, resolution] of Object.entries(state.resolutions))
+    if (id.startsWith("risk:") && resolution.state === "dismissed") ids.add(id);
+  for (const item of state.historyItems ?? [])
+    if (
+      item.kind === "risk" &&
+      item.status === "dismissed" &&
+      item.id.startsWith("risk:")
+    )
+      ids.add(item.id);
+  return ids;
+}
+
 function hiddenByResolution(
   resolution: TodoResolution | undefined,
   now: number,
+  durablyDismissed: boolean,
 ) {
+  if (durablyDismissed) return { hidden: true, snoozed: false };
   if (!resolution) return { hidden: false, snoozed: false };
   if (resolution.state === "snoozed")
     return {
@@ -195,11 +211,16 @@ function manualItem(item: ManualTodoItem): TodoItem {
 function pushGeneratedItem(
   items: TodoItem[],
   resolutions: Record<string, TodoResolution>,
+  dismissedRisks: ReadonlySet<string>,
   hiddenCounts: { hidden: number; snoozed: number },
   now: number,
   item: TodoItem,
 ) {
-  const hidden = hiddenByResolution(resolutions[item.id], now);
+  const hidden = hiddenByResolution(
+    resolutions[item.id],
+    now,
+    dismissedRisks.has(item.id),
+  );
   if (hidden.hidden) {
     hiddenCounts.hidden++;
     if (hidden.snoozed) hiddenCounts.snoozed++;
@@ -581,6 +602,7 @@ export function buildTodoBoardView(options: {
   const hiddenCounts = { hidden: 0, snoozed: 0 };
   const generated: TodoItem[] = [];
   const manual: TodoItem[] = [];
+  const dismissedRisks = dismissedRiskIds(options.boardState);
   const trackedPrUrls = new Set<string>();
   const generatedCandidates = new Map<string, TodoItem>();
   const automaticHistoryItems = new Map<string, TodoHistoryItem>();
@@ -605,6 +627,7 @@ export function buildTodoBoardView(options: {
       pushGeneratedItem(
         generated,
         options.boardState.resolutions,
+        dismissedRisks,
         hiddenCounts,
         now,
         item,
@@ -618,6 +641,7 @@ export function buildTodoBoardView(options: {
     pushGeneratedItem(
       manual,
       options.boardState.resolutions,
+      dismissedRisks,
       hiddenCounts,
       now,
       item,
@@ -717,6 +741,7 @@ export function reconcileTodoBoardState(
   ];
   const archivedManualIds = new Set<string>();
   const archivedResolutionIds = new Set<string>();
+  const durableDismissedRiskIds = dismissedRiskIds(state);
 
   for (const item of state.manualItems) {
     const resolution = state.resolutions[item.id];
@@ -770,6 +795,7 @@ export function reconcileTodoBoardState(
       ),
     ),
     historyItems: cappedHistory(historyItems),
+    dismissedRiskIds: [...durableDismissedRiskIds].sort(),
   };
   return JSON.stringify(next) === JSON.stringify(state) ? state : next;
 }

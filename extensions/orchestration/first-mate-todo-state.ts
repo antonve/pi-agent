@@ -74,6 +74,7 @@ export interface TodoBoardState {
   resolutions: Record<string, TodoResolution>;
   pullRequests: Record<string, PullRequestSnapshot>;
   historyItems?: TodoHistoryItem[];
+  dismissedRiskIds?: string[];
 }
 
 export interface TodoPaneRuntimeState {
@@ -109,6 +110,7 @@ function emptyBoardState(): TodoBoardState {
     resolutions: {},
     pullRequests: {},
     historyItems: [],
+    dismissedRiskIds: [],
   };
 }
 
@@ -363,12 +365,31 @@ function normalizeBoardState(value: unknown): TodoBoardState {
         .map((item) => normalizeHistoryItem(item))
         .filter((item) => item !== undefined)
     : [];
+  const dismissedRiskIds = new Set(
+    Array.isArray(record.dismissedRiskIds)
+      ? record.dismissedRiskIds.filter(
+          (id): id is string =>
+            typeof id === "string" && id.startsWith("risk:"),
+        )
+      : [],
+  );
+  for (const [id, resolution] of Object.entries(resolutions))
+    if (id.startsWith("risk:") && resolution.state === "dismissed")
+      dismissedRiskIds.add(id);
+  for (const item of historyItems)
+    if (
+      item.kind === "risk" &&
+      item.status === "dismissed" &&
+      item.id.startsWith("risk:")
+    )
+      dismissedRiskIds.add(item.id);
   return {
     version: 1,
     manualItems,
     resolutions,
     pullRequests,
     historyItems,
+    dismissedRiskIds: [...dismissedRiskIds].sort(),
   };
 }
 

@@ -288,71 +288,89 @@ test("older, task-originated, pause, resume, and other-task messages do not ackn
   );
 });
 
-test("paused unresolved risks retain dismissal and its History trace", () => {
-  const paused = task("paused", "TASK-1");
-  const risk = message(paused.id, "MATERIAL_RISK", 1, {
+test("risk dismissal survives pause, inactivity, and resume without control acknowledgement", () => {
+  const active = task("active", "TASK-1");
+  const risk = message(active.id, "MATERIAL_RISK", 1, {
     summary: "Dismissed risk",
   });
-  const riskId = `risk:${paused.id}:${risk.id}`;
-  const state: TodoBoardState = {
+  const riskId = `risk:${active.id}:${risk.id}`;
+  const messages = [
+    risk,
+    controlMessage(active.id, "PAUSE", 2),
+    controlMessage(active.id, "RESUME", 3),
+  ];
+  const legacyState: TodoBoardState = {
     version: 1,
     manualItems: [],
     resolutions: { [riskId]: { state: "dismissed", at: 20 } },
     pullRequests: {},
     historyItems: [],
   };
+  const paused = { ...active, state: "paused" as const };
   const pausedView = buildTodoBoardView({
-    boardState: state,
+    boardState: legacyState,
     tasks: [paused],
-    messagesByTask: new Map([[paused.id, [risk]]]),
+    messagesByTask: new Map([[paused.id, messages]]),
   });
-  const reconciled = reconcileTodoBoardState(state, pausedView);
+  const migrated = reconcileTodoBoardState(legacyState, pausedView);
+  const inactiveView = buildTodoBoardView({
+    boardState: migrated,
+    tasks: [],
+    messagesByTask: new Map(),
+  });
+  const inactive = reconcileTodoBoardState(migrated, inactiveView);
   const resumedView = buildTodoBoardView({
-    boardState: reconciled,
-    tasks: [{ ...paused, state: "active" }],
-    messagesByTask: new Map([[paused.id, [risk]]]),
+    boardState: inactive,
+    tasks: [active],
+    messagesByTask: new Map([[active.id, messages]]),
   });
 
-  assert.deepEqual(reconciled.resolutions, state.resolutions);
-  assert.deepEqual(
-    reconciled.historyItems?.map((item) => [item.id, item.status]),
-    [[riskId, "dismissed"]],
-  );
+  assert.deepEqual(migrated.dismissedRiskIds, [riskId]);
+  assert.deepEqual(inactive.resolutions, {});
+  assert.deepEqual(inactive.dismissedRiskIds, [riskId]);
   assert.equal(
     resumedView.items.some((item) => item.kind === "risk"),
     false,
   );
+  assert.equal(
+    resumedView.automaticHistoryItems?.some((item) => item.id === riskId),
+    false,
+  );
 });
 
-test("a newer risk reappears while acknowledged risks on other tasks stay hidden", () => {
+test("a dismissed risk does not hide a newer risk or another task's risk", () => {
   const first = task("active", "TASK-1");
   const second = task("active", "TASK-2");
+  const dismissed = message(first.id, "MATERIAL_RISK", 1, {
+    summary: "Dismissed risk",
+  });
+  const newer = message(first.id, "MATERIAL_RISK", 4, {
+    summary: "New risk",
+  });
+  const other = message(second.id, "MATERIAL_RISK", 1, {
+    summary: "Other task risk",
+  });
+  const dismissedId = `risk:${first.id}:${dismissed.id}`;
   const view = buildTodoBoardView({
     boardState: {
       version: 1,
       manualItems: [],
       resolutions: {},
       pullRequests: {},
+      dismissedRiskIds: [dismissedId],
     },
     tasks: [first, second],
     messagesByTask: new Map([
       [
         first.id,
         [
-          message(first.id, "MATERIAL_RISK", 1, { summary: "Old risk" }),
-          controlMessage(first.id, "DECISION_RESPONSE", 2),
-          message(first.id, "MATERIAL_RISK", 3, { summary: "New risk" }),
+          dismissed,
+          controlMessage(first.id, "PAUSE", 2),
+          controlMessage(first.id, "RESUME", 3),
+          newer,
         ],
       ],
-      [
-        second.id,
-        [
-          message(second.id, "MATERIAL_RISK", 1, {
-            summary: "Acknowledged risk",
-          }),
-          controlMessage(second.id, "PRIORITY_UPDATE", 2),
-        ],
-      ],
+      [second.id, [other]],
     ]),
   });
 
@@ -360,17 +378,18 @@ test("a newer risk reappears while acknowledged risks on other tasks stay hidden
     view.items
       .filter((item) => item.kind === "risk")
       .map((item) => [item.taskId, item.detail]),
-    [[first.id, "New risk"]],
+    [
+      [first.id, "New risk"],
+      [second.id, "Other task risk"],
+    ],
   );
-  const rendered = renderTodoPane(view, { showHelp: false }, 80, 12)
-    .map(stripTerminalSequences)
-    .join("\n");
-  assert.match(rendered, /R\s+Review risk for TASK-1/);
-  assert.match(rendered, /New risk/);
-  assert.doesNotMatch(rendered, /Acknowledged risk/);
+  assert.equal(
+    view.items.some((item) => item.id === dismissedId),
+    false,
+  );
 });
 
-test("acknowledged historical risks stay cleared after fleet and board restart", async () => {
+test("legacy risk dismissal survives inactive reconciliation and process restart", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-todo-risk-restart-"));
   const fleetPath = join(directory, "fleet.json");
   const boardPath = join(directory, "board.json");
@@ -384,33 +403,46 @@ test("acknowledged historical risks stay cleared after fleet and board restart",
     ownerSessionId: "first-mate",
     mateSessionId: "mate",
   });
-  await fleet.enqueue({
+  const risk = await fleet.enqueue({
     taskId: "TASK-1",
     type: "MATERIAL_RISK",
     fromSessionId: "mate",
     toSessionId: "first-mate",
-    payload: { summary: "Historical risk" },
+    payload: { summary: "Dismissed before restart" },
   });
-  await fleet.enqueue({
-    taskId: "TASK-1",
-    type: "SCOPE_UPDATE",
-    fromSessionId: "first-mate",
-    toSessionId: "mate",
-    toTaskMate: true,
-    payload: { message: "Proceed with the narrowed scope" },
-  });
-  await new TodoBoardStateStore(boardPath).write({
-    version: 1,
-    manualItems: [],
-    resolutions: {},
-    pullRequests: {},
-  });
+  const riskId = `risk:TASK-1:${risk.id}`;
+  await writeFile(
+    boardPath,
+    JSON.stringify({
+      version: 1,
+      manualItems: [],
+      resolutions: {
+        [riskId]: { state: "dismissed", at: 20 },
+      },
+      pullRequests: {},
+    }),
+  );
+
+  const legacyBoard = new TodoBoardStateStore(boardPath);
+  const migrated = await legacyBoard.read();
+  assert.deepEqual(migrated.dismissedRiskIds, [riskId]);
+  const inactive = reconcileTodoBoardState(
+    migrated,
+    buildTodoBoardView({
+      boardState: migrated,
+      tasks: [],
+      messagesByTask: new Map(),
+    }),
+  );
+  await legacyBoard.write(inactive);
+  assert.deepEqual(inactive.resolutions, {});
 
   const restartedFleet = new FleetStore(fleetPath);
   const restartedBoard = new TodoBoardStateStore(boardPath);
   const persistedTask = (await restartedFleet.listTasks())[0]!;
+  const persistedState = await restartedBoard.read();
   const view = buildTodoBoardView({
-    boardState: await restartedBoard.read(),
+    boardState: persistedState,
     tasks: [persistedTask],
     messagesByTask: new Map([
       [
@@ -420,6 +452,7 @@ test("acknowledged historical risks stay cleared after fleet and board restart",
     ]),
   });
 
+  assert.deepEqual(persistedState.dismissedRiskIds, [riskId]);
   assert.equal(
     view.items.some((item) => item.kind === "risk"),
     false,
