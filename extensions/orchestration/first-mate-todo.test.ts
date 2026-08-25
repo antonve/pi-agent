@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -459,7 +459,7 @@ test("legacy risk dismissal survives inactive reconciliation and process restart
   );
 });
 
-test("the queue omits terminal outcomes but keeps unresolved failures and open PR actions safe", () => {
+test("the queue omits terminal outcomes but keeps unresolved failures and remote PR reviews safe", () => {
   const prUrl = "https://github.com/antonve/pi-agent/pull/123";
   const cleaned = {
     ...task("completed", "TASK-CLEANED"),
@@ -537,7 +537,12 @@ test("the queue omits terminal outcomes but keeps unresolved failures and open P
   assert.deepEqual(
     handleTodoKey(view, { showHelp: false, selectedId: reviewItem.id }, "\r")
       .command,
-    { type: "open", item: reviewItem },
+    { type: "none" },
+  );
+  assert.deepEqual(
+    handleTodoKey(view, { showHelp: false, selectedId: reviewItem.id }, "o")
+      .command,
+    { type: "none" },
   );
 });
 
@@ -888,7 +893,7 @@ test("history pruning is deterministic, newest-first, deduplicated, and capped",
   );
 });
 
-test("h toggles Active and History with safe selection, scrolling, and PR opening", () => {
+test("h toggles Active and History with safe selection and scrolling", () => {
   const historyItems = Array.from({ length: 8 }, (_, index) => ({
     id: `history:${index}`,
     kind: "review" as const,
@@ -929,8 +934,7 @@ test("h toggles Active and History with safe selection, scrolling, and PR openin
   assert.equal(toggled.state.showHistory, true);
   assert.equal(selectedHistory.selectedId, "history:0");
   assert.deepEqual(handleTodoKey(view, selectedHistory, "\r").command, {
-    type: "open",
-    item: historyItems[0],
+    type: "none",
   });
   assert.deepEqual(handleTodoKey(view, selectedHistory, "f").command, {
     type: "none",
@@ -949,6 +953,10 @@ test("h toggles Active and History with safe selection, scrolling, and PR openin
   assert.ok(plain.some((line) => line.includes("to-do · History")));
   assert.ok(plain.some((line) => line.includes("Archived review 7")));
   assert.ok(plain.some((line) => line.startsWith("h Active")));
+  assert.equal(
+    plain.some((line) => line.includes("open PR")),
+    false,
+  );
   assert.ok(lines.every((line) => visibleWidth(line) <= 32));
 });
 
@@ -1067,6 +1075,76 @@ test("long generated and manual items wrap with Unicode display widths and align
   assert.ok(manual.slice(1).every((line) => /^ {5}\S/u.test(line)));
 });
 
+test("PR review URLs render in full directly beneath their item and wrap safely", () => {
+  const prUrl =
+    "https://github.com/antonve/pi-agent/pull/1234567890?review=remote-session";
+  const view: TodoBoardView = {
+    items: [
+      {
+        id: "review:remote",
+        kind: "review",
+        title: "Review the remote-safe pull request",
+        detail: "open · review_required",
+        source: "generated",
+        prUrl,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+    historyItems: [
+      {
+        id: "review:history",
+        kind: "review",
+        title: "Archived remote-safe pull request",
+        source: "generated",
+        prUrl,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+    generatedCount: 1,
+    manualCount: 0,
+    snoozedCount: 0,
+    hiddenCount: 0,
+    trackedPrUrls: [prUrl],
+  };
+  const renderedItemRows = (showHistory: boolean) => {
+    const lines = renderTodoPane(
+      view,
+      { showHelp: false, showHistory },
+      24,
+      40,
+    );
+    const plain = lines.map(stripTerminalSequences);
+    const heading = showHistory ? "History" : "Generated";
+    const start = plain.indexOf(heading) + 1;
+    const rows = plain.slice(start, plain.indexOf("", start));
+    const urlStart = rows.findIndex((line) => line.includes("https://"));
+    assert.ok(urlStart > 0);
+    assert.ok(lines.every((line) => visibleWidth(line) <= 24));
+    assert.equal(
+      rows
+        .slice(urlStart)
+        .map((line) => line.slice(2))
+        .join(""),
+      prUrl,
+    );
+  };
+
+  renderedItemRows(false);
+  renderedItemRows(true);
+});
+
+test("remote PR controls have no browser-opening command or gh --web path", async () => {
+  const cliSource = await readFile(
+    new URL("./first-mate-todo-pane-cli.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.equal(cliSource.includes('"--web"'), false);
+  assert.doesNotMatch(cliSource, /case "open"/u);
+});
+
 test("item text reflows on resize and keeps every narrow-pane line bounded", () => {
   const title = "Resize this manual item across several words through omega";
   const view: TodoBoardView = {
@@ -1148,7 +1226,7 @@ test("viewport scrolling keeps every wrapped line of the selected item visible",
   assert.ok(lines.every((line) => visibleWidth(line) <= 18));
 });
 
-test("generated item controls emit refresh, resolution, focus, and open commands", () => {
+test("generated item controls emit refresh, resolution, and explicit focus commands", () => {
   const item = {
     id: "review:TASK-1:message:pr",
     kind: "review" as const,
@@ -1188,12 +1266,10 @@ test("generated item controls emit refresh, resolution, focus, and open commands
     item,
   });
   assert.deepEqual(handleTodoKey(view, state, "o").command, {
-    type: "open",
-    item,
+    type: "none",
   });
   assert.deepEqual(handleTodoKey(view, state, "\r").command, {
-    type: "open",
-    item,
+    type: "none",
   });
 });
 
