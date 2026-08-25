@@ -339,7 +339,7 @@ test("slash-command firstmate claim makes later turns explicitly supervisory", a
             params: {
               target_pane_id: "w-owner:p1",
               direction: "right",
-              ratio: 0.78,
+              ratio: 0.75,
               cwd: "/repo",
               focus: false,
             },
@@ -446,7 +446,7 @@ test("tool first_mate_claim renames and reorders the claimed workspace", async (
             params: {
               target_pane_id: "w-owner:p1",
               direction: "right",
-              ratio: 0.78,
+              ratio: 0.75,
               cwd: "/repo",
               focus: false,
             },
