@@ -29,9 +29,29 @@ async function runtimeStore() {
   return new TodoPaneRuntimeStore(join(directory, "runtime.json"));
 }
 
-test("controller creates a narrow right-hand pane without stealing focus", async () => {
+class FocusTrackingHerdrClient extends HerdrClient {
+  currentFocus: string | undefined;
+  readonly focusCalls: string[] = [];
+
+  constructor(runner: CliRunner, focusedPane: string) {
+    super(runner);
+    this.currentFocus = focusedPane;
+  }
+
+  override async focusedPaneId() {
+    return this.currentFocus;
+  }
+
+  override async focusPane(paneId: string) {
+    this.focusCalls.push(paneId);
+    this.currentFocus = paneId;
+  }
+}
+
+test("controller creates a narrow right-hand pane and restores the exact focused pane", async () => {
   const calls: string[][] = [];
   let created = false;
+  let herdr!: FocusTrackingHerdrClient;
   const runner: CliRunner = {
     async run(_command, args) {
       calls.push([...args]);
@@ -48,6 +68,7 @@ test("controller creates a narrow right-hand pane without stealing focus", async
         };
       if (args[0] === "pane" && args[1] === "split") {
         created = true;
+        herdr.currentFocus = "w1:p2";
         return {
           code: 0,
           stderr: "",
@@ -70,8 +91,9 @@ test("controller creates a narrow right-hand pane without stealing focus", async
       return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
     },
   };
+  herdr = new FocusTrackingHerdrClient(runner, "w1:p1");
   const controller = new FirstMateTodoPaneController(
-    new HerdrClient(runner),
+    herdr,
     await runtimeStore(),
   );
 
@@ -107,6 +129,8 @@ test("controller creates a narrow right-hand pane without stealing focus", async
     calls.some((args) => args[0] === "tab" && args[1] === "focus"),
     false,
   );
+  assert.equal(herdr.currentFocus, "w1:p1");
+  assert.deepEqual(herdr.focusCalls, ["w1:p1"]);
 });
 
 test("controller idempotently reuses an existing running board pane", async () => {
@@ -479,4 +503,110 @@ test("controller restarts the pane after the board process exits", async () => {
     calls.some((args) => args[0] === "pane" && args[1] === "split"),
     false,
   );
+});
+
+test("repeated task-assignment-like reconciliation restores the exact first-mate pane", async () => {
+  let herdr!: FocusTrackingHerdrClient;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "pane" && args[1] === "layout")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: layout([
+            { pane_id: "w1:p1", x: 0, width: 80 },
+            { pane_id: "w1:p2", x: 80, width: 20 },
+          ]),
+        };
+      if (args[0] === "pane" && args[1] === "process-info") {
+        herdr.currentFocus = "w1:p2";
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              process_info: {
+                pane_id: "w1:p2",
+                foreground_processes: [
+                  { cmdline: "node first-mate-todo-pane-cli.ts" },
+                ],
+              },
+            },
+          }),
+        };
+      }
+      return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+    },
+  };
+  herdr = new FocusTrackingHerdrClient(runner, "w1:p1");
+  const controller = new FirstMateTodoPaneController(
+    herdr,
+    await runtimeStore(),
+  );
+  const location = {
+    workspaceId: "w1",
+    tabId: "w1:t1",
+    paneId: "w1:p1",
+    cwd: "/repo",
+  };
+
+  for (let reconciliation = 0; reconciliation < 3; reconciliation++) {
+    await controller.ensure(location);
+    assert.equal(herdr.currentFocus, "w1:p1");
+  }
+  assert.deepEqual(herdr.focusCalls, ["w1:p1", "w1:p1", "w1:p1"]);
+});
+
+test("resize correction restores intentional focus on the existing to-do pane", async () => {
+  let boardWidth = 50;
+  let herdr!: FocusTrackingHerdrClient;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "pane" && args[1] === "layout")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: layout([
+            { pane_id: "w1:p1", x: 0, width: 100 - boardWidth },
+            { pane_id: "w1:p2", x: 100 - boardWidth, width: boardWidth },
+          ]),
+        };
+      if (args[0] === "pane" && args[1] === "process-info")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              process_info: {
+                pane_id: "w1:p2",
+                foreground_processes: [
+                  { cmdline: "node first-mate-todo-pane-cli.ts" },
+                ],
+              },
+            },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "resize") {
+        boardWidth -= Number(args[args.indexOf("--amount") + 1]) * 100;
+        herdr.currentFocus = "w1:p1";
+      }
+      return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+    },
+  };
+  herdr = new FocusTrackingHerdrClient(runner, "w1:p2");
+  const controller = new FirstMateTodoPaneController(
+    herdr,
+    await runtimeStore(),
+  );
+
+  await controller.ensure({
+    workspaceId: "w1",
+    tabId: "w1:t1",
+    paneId: "w1:p1",
+    cwd: "/repo",
+  });
+
+  assert.ok(boardWidth / 100 <= 0.25);
+  assert.equal(herdr.currentFocus, "w1:p2");
+  assert.deepEqual(herdr.focusCalls, ["w1:p2"]);
 });

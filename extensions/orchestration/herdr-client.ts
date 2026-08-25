@@ -537,6 +537,10 @@ export class HerdrClient {
     return { workspaceId, paneId: String(pane.pane_id) };
   }
 
+  async focusedPaneId() {
+    return (await this.focusedPane())?.paneId;
+  }
+
   async closeWorkspace(workspaceId: string) {
     const focused = await this.focusedPane().catch(() => undefined);
     try {

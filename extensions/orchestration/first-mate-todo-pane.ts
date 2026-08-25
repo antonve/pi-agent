@@ -58,10 +58,27 @@ export class FirstMateTodoPaneController {
 
   async ensure(location: FirstMateTodoPaneLocation) {
     if (this.pending) return this.pending;
-    this.pending = this.ensureUnlocked(location).finally(() => {
+    this.pending = this.ensurePreservingFocus(location).finally(() => {
       this.pending = undefined;
     });
     return this.pending;
+  }
+
+  private async ensurePreservingFocus(location: FirstMateTodoPaneLocation) {
+    const focusedPaneId = await this.herdr
+      .focusedPaneId()
+      .catch(() => undefined);
+    try {
+      return await this.ensureUnlocked(location);
+    } finally {
+      if (focusedPaneId) {
+        const currentPaneId = await this.herdr
+          .focusedPaneId()
+          .catch(() => undefined);
+        if (currentPaneId !== focusedPaneId)
+          await this.herdr.focusPane(focusedPaneId);
+      }
+    }
   }
 
   private async ensureUnlocked(location: FirstMateTodoPaneLocation) {
