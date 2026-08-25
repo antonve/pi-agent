@@ -55,7 +55,7 @@ class FocusTrackingHerdrClient extends HerdrClient {
   }
 }
 
-test("controller creates a narrow right-hand pane and restores the exact focused pane", async () => {
+test("controller creates a 25% right-hand pane and restores the exact focused pane", async () => {
   const calls: string[][] = [];
   let created = false;
   let herdr!: FocusTrackingHerdrClient;
@@ -68,8 +68,8 @@ test("controller creates a narrow right-hand pane and restores the exact focused
           stderr: "",
           stdout: created
             ? layout([
-                { pane_id: "w1:p1", x: 0, width: 78 },
-                { pane_id: "w1:p2", x: 78, width: 22 },
+                { pane_id: "w1:p1", x: 0, width: 75 },
+                { pane_id: "w1:p2", x: 75, width: 25 },
               ])
             : layout([{ pane_id: "w1:p1", x: 0, width: 100 }]),
         };
@@ -119,7 +119,7 @@ test("controller creates a narrow right-hand pane and restores the exact focused
         args.includes("--direction") &&
         args.includes("right") &&
         args.includes("--ratio") &&
-        args.includes("0.78") &&
+        args.includes("0.75") &&
         args.includes("--no-focus"),
     ),
   );
@@ -432,9 +432,9 @@ test("controller never kills or replaces an unrelated process in a stale runtime
   );
 });
 
-test("controller shrinks an oversized reused board once and keeps reuse idempotent", async () => {
+test("controller preserves manual widening and narrowing across reconciliation", async () => {
   const calls: string[][] = [];
-  let boardWidth = 78;
+  let boardWidth = 60;
   const runner: CliRunner = {
     async run(_command, args) {
       calls.push([...args]);
@@ -460,10 +460,6 @@ test("controller shrinks an oversized reused board once and keeps reuse idempote
             },
           }),
         };
-      if (args[0] === "pane" && args[1] === "resize") {
-        const amount = Number(args[args.indexOf("--amount") + 1]);
-        boardWidth -= Math.min(amount, 0.5) * 100;
-      }
       return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
     },
   };
@@ -478,23 +474,21 @@ test("controller shrinks an oversized reused board once and keeps reuse idempote
     cwd: "/repo",
   };
 
-  const first = await controller.ensure(location);
-  const resizeCount = calls.filter(
-    (args) => args[0] === "pane" && args[1] === "resize",
-  ).length;
-  const second = await controller.ensure(location);
+  const widened = await controller.ensure(location);
+  assert.equal(boardWidth, 60);
+  boardWidth = 10;
+  const narrowed = await controller.ensure(location);
 
-  assert.deepEqual(first, {
+  assert.deepEqual(widened, {
     paneId: "w1:p2",
     created: false,
     restarted: false,
   });
-  assert.deepEqual(second, first);
-  assert.ok(boardWidth / 100 <= 0.25);
-  assert.equal(resizeCount, 2);
+  assert.deepEqual(narrowed, widened);
+  assert.equal(boardWidth, 10);
   assert.equal(
-    calls.filter((args) => args[0] === "pane" && args[1] === "resize").length,
-    resizeCount,
+    calls.some((args) => args[0] === "pane" && args[1] === "resize"),
+    false,
   );
   assert.equal(
     calls.some(
@@ -583,6 +577,15 @@ test("controller reclaims a board on the same workspace without duplicates", asy
   assert.equal(
     calls.filter((args) => args[0] === "pane" && args[1] === "split").length,
     1,
+  );
+  assert.ok(
+    calls.some(
+      (args) =>
+        args[0] === "pane" &&
+        args[1] === "split" &&
+        args.includes("--ratio") &&
+        args.includes("0.75"),
+    ),
   );
 });
 
@@ -774,11 +777,14 @@ test("repeated task-assignment-like reconciliation restores the exact first-mate
   assert.deepEqual(herdr.focusCalls, ["w1:p1", "w1:p1", "w1:p1"]);
 });
 
-test("resize correction restores intentional focus on the existing to-do pane", async () => {
-  let boardWidth = 50;
+test("reload restart preserves manual width and restores intentional focus", async () => {
+  const calls: string[][] = [];
+  const boardWidth = 50;
+  let stopped = false;
   let herdr!: FocusTrackingHerdrClient;
   const runner: CliRunner = {
     async run(_command, args) {
+      calls.push([...args]);
       if (args[0] === "pane" && args[1] === "layout")
         return {
           code: 0,
@@ -796,15 +802,15 @@ test("resize correction restores intentional focus on the existing to-do pane", 
             result: {
               process_info: {
                 pane_id: "w1:p2",
-                foreground_processes: [{ cmdline: boardProcess() }],
+                foreground_processes: [
+                  { cmdline: stopped ? "bash" : boardProcess("older-source") },
+                ],
               },
             },
           }),
         };
-      if (args[0] === "pane" && args[1] === "resize") {
-        boardWidth -= Number(args[args.indexOf("--amount") + 1]) * 100;
-        herdr.currentFocus = "w1:p1";
-      }
+      if (args[0] === "pane" && args[1] === "send-keys") stopped = true;
+      if (args[0] === "pane" && args[1] === "run") herdr.currentFocus = "w1:p1";
       return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
     },
   };
@@ -814,14 +820,23 @@ test("resize correction restores intentional focus on the existing to-do pane", 
     await runtimeStore(),
   );
 
-  await controller.ensure({
+  const result = await controller.ensure({
     workspaceId: "w1",
     tabId: "w1:t1",
     paneId: "w1:p1",
     cwd: "/repo",
   });
 
-  assert.ok(boardWidth / 100 <= 0.25);
+  assert.deepEqual(result, {
+    paneId: "w1:p2",
+    created: false,
+    restarted: true,
+  });
+  assert.equal(boardWidth, 50);
+  assert.equal(
+    calls.some((args) => args[0] === "pane" && args[1] === "resize"),
+    false,
+  );
   assert.equal(herdr.currentFocus, "w1:p2");
   assert.deepEqual(herdr.focusCalls, ["w1:p2"]);
 });

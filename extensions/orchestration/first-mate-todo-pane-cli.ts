@@ -297,20 +297,6 @@ async function applyCommand(
         await refresh();
       }
       return;
-    case "open":
-      if (!command.item.prUrl) return;
-      try {
-        await execFileAsync("gh", ["pr", "view", command.item.prUrl, "--web"], {
-          timeout: 10_000,
-          env: process.env,
-        });
-        setStatus(`Opened ${command.item.prUrl}`);
-      } catch (error) {
-        setStatus(
-          `Could not open browser; use ${command.item.prUrl} externally. ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      return;
   }
 }
 

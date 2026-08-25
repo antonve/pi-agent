@@ -61,8 +61,7 @@ export type TodoUiCommand =
   | { type: "snooze"; itemId: string; value: string }
   | { type: "add-manual"; title: string }
   | { type: "edit-manual"; itemId: string; title: string }
-  | { type: "focus"; item: TodoItem }
-  | { type: "open"; item: TodoItem };
+  | { type: "focus"; item: TodoItem };
 
 function kindTag(item: TodoItem) {
   switch (item.kind) {
@@ -84,8 +83,7 @@ function kindTag(item: TodoItem) {
 }
 
 function primaryAction(item: TodoItem) {
-  if (item.prUrl) return "open";
-  if (item.paneId) return "focus";
+  if (!item.prUrl && item.paneId) return "focus";
   return undefined;
 }
 
@@ -346,27 +344,14 @@ export function handleTodoKey(
       },
       command: { type: "focus", item },
     };
-  if (data === "o" && item.prUrl)
+  if (matchesKey(data, Key.enter) && primaryAction(item) === "focus")
     return {
-      state: { ...normalized, status: `Opening ${item.prUrl}...` },
-      command: { type: "open", item },
+      state: {
+        ...normalized,
+        status: `Focusing ${item.taskId ?? item.title}...`,
+      },
+      command: { type: "focus", item },
     };
-  if (matchesKey(data, Key.enter)) {
-    const action = primaryAction(item);
-    if (action === "focus")
-      return {
-        state: {
-          ...normalized,
-          status: `Focusing ${item.taskId ?? item.title}...`,
-        },
-        command: { type: "focus", item },
-      };
-    if (action === "open")
-      return {
-        state: { ...normalized, status: `Opening ${item.prUrl}...` },
-        command: { type: "open", item },
-      };
-  }
   return { state: normalized, command: { type: "none" } };
 }
 
@@ -416,6 +401,8 @@ function renderItem(item: TodoItem, selected: boolean, width: number) {
     lines.push(
       ...wrapWithPrefix("  ", sanitizeTodoText(item.detail), width, ansi.dim),
     );
+  if (item.kind === "review" && item.prUrl)
+    lines.push(...wrapWithPrefix("  ", sanitizeTodoText(item.prUrl), width));
   return lines;
 }
 
@@ -456,9 +443,9 @@ export function renderTodoPane(
   if (normalized.showHelp) {
     const help = [
       "j/k or arrows move",
-      "enter primary action",
+      "enter focus task",
       "f focus task",
-      "o open PR",
+      "select/copy PR URL",
       "d done · x dismiss · z snooze",
       "a add · e edit manual",
       "h Active/History",
@@ -528,8 +515,8 @@ export function renderTodoPane(
       : truncateToWidth(
           ansi.dim(
             normalized.showHistory
-              ? "h Active · enter open PR · ? help"
-              : "h History · enter open/focus · ? help",
+              ? "h Active · ? help"
+              : "h History · enter focus · ? help",
           ),
           width,
         ),
