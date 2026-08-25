@@ -569,6 +569,23 @@ export class HerdrClient {
     ]);
   }
 
+  async resizePane(
+    paneId: string,
+    direction: "left" | "right" | "up" | "down",
+    amount: number,
+  ) {
+    return this.json([
+      "pane",
+      "resize",
+      "--pane",
+      paneId,
+      "--direction",
+      direction,
+      "--amount",
+      String(amount),
+    ]);
+  }
+
   async splitPane(
     paneId: string,
     cwd: string,

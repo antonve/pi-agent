@@ -7,7 +7,9 @@ import {
 } from "./first-mate-todo-state.ts";
 
 const BOARD_PROCESS_MARKER = "first-mate-todo-pane-cli.ts";
-const BOARD_RATIO = 0.22;
+const BOARD_WIDTH_RATIO = 0.22;
+const BOARD_MAX_WIDTH_RATIO = 0.25;
+const BOARD_RESIZE_ATTEMPTS = 8;
 
 export interface FirstMateTodoPaneLocation {
   workspaceId: string;
@@ -75,18 +77,21 @@ export class FirstMateTodoPaneController {
     if (paneId) {
       const restarted = await this.ensureProcess(paneId);
       await this.ensureFarRight(location, paneId);
+      await this.ensureWidth(location, paneId);
       await this.saveRuntime(location, paneId);
       return { paneId, created: false, restarted };
     }
 
     const created = await this.herdr.splitPane(location.paneId, location.cwd, {
       direction: "right",
-      ratio: BOARD_RATIO,
+      // Herdr applies the split ratio to the original (left) pane.
+      ratio: 1 - BOARD_WIDTH_RATIO,
       noFocus: true,
     });
     await this.herdr.renamePane(created.paneId, "firstmate-todo");
     await this.ensureProcess(created.paneId);
     await this.ensureFarRight(location, created.paneId);
+    await this.ensureWidth(location, created.paneId);
     await this.saveRuntime(location, created.paneId);
     return { paneId: created.paneId, created: true, restarted: true };
   }
@@ -161,6 +166,35 @@ export class FirstMateTodoPaneController {
     )
       return;
     await this.herdr.swapPanes(paneId, rightmost.paneId);
+  }
+
+  private async ensureWidth(
+    location: FirstMateTodoPaneLocation,
+    paneId: string,
+  ) {
+    for (let attempt = 0; attempt <= BOARD_RESIZE_ATTEMPTS; attempt++) {
+      const layout = await this.herdr.layout(location.paneId);
+      const board = layout.panes.find((pane) => pane.paneId === paneId);
+      if (!board)
+        throw new Error(
+          `First-mate to-do pane ${paneId} is missing from its tab.`,
+        );
+      const left = Math.min(...layout.panes.map((pane) => pane.rect.x));
+      const right = Math.max(
+        ...layout.panes.map((pane) => pane.rect.x + pane.rect.width),
+      );
+      const tabWidth = right - left;
+      if (tabWidth <= 0) return;
+      const widthRatio = board.rect.width / tabWidth;
+      if (widthRatio <= BOARD_MAX_WIDTH_RATIO) return;
+      if (attempt === BOARD_RESIZE_ATTEMPTS) break;
+      await this.herdr.resizePane(
+        paneId,
+        "right",
+        Math.min(0.5, widthRatio - BOARD_WIDTH_RATIO),
+      );
+    }
+    throw new Error(`Unable to cap first-mate to-do pane ${paneId} width.`);
   }
 
   private async ensureProcess(paneId: string) {
