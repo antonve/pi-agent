@@ -1,4 +1,10 @@
-import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+  Key,
+  matchesKey,
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import type { TodoBoardView, TodoItem } from "./first-mate-todo-model.ts";
 
 // Remove terminal controls from fleet, GitHub, and persisted user text before
@@ -16,7 +22,8 @@ export function sanitizeTodoText(text: string) {
     .replace(OSC_PATTERN, "")
     .replace(CSI_PATTERN, "")
     .replace(ESCAPE_PATTERN, "")
-    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+    .replace(/[\t\r\n]+/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
 }
 
 const ansi = {
@@ -356,13 +363,32 @@ function renderPrompt(prompt: PromptState, width: number) {
   );
 }
 
+function wrapWithPrefix(
+  prefix: string,
+  text: string,
+  width: number,
+  style: (value: string) => string = (value) => value,
+) {
+  const prefixWidth = visibleWidth(prefix);
+  if (width <= prefixWidth)
+    return wrapTextWithAnsi(`${prefix}${style(text)}`, Math.max(1, width));
+  const indent = " ".repeat(prefixWidth);
+  return wrapTextWithAnsi(text, width - prefixWidth).map((line, index) =>
+    truncateToWidth(`${index === 0 ? prefix : indent}${style(line)}`, width),
+  );
+}
+
 function renderItem(item: TodoItem, selected: boolean, width: number) {
-  const prefix = selected ? ansi.inverse(">") : " ";
-  const title = `${prefix} ${ansi.bold(kindTag(item))} ${sanitizeTodoText(item.title)}`;
-  const lines = [truncateToWidth(title, width)];
+  const marker = selected ? ansi.inverse(">") : " ";
+  const titlePrefix = `${marker} ${ansi.bold(kindTag(item))} `;
+  const lines = wrapWithPrefix(
+    titlePrefix,
+    sanitizeTodoText(item.title),
+    width,
+  );
   if (item.detail)
     lines.push(
-      truncateToWidth(`  ${ansi.dim(sanitizeTodoText(item.detail))}`, width),
+      ...wrapWithPrefix("  ", sanitizeTodoText(item.detail), width, ansi.dim),
     );
   return lines;
 }
@@ -411,17 +437,23 @@ export function renderTodoPane(
   }
 
   const body: string[] = [];
-  let selectedLine = 0;
+  let selectedStart = 0;
+  let selectedEnd = 0;
   const appendItems = (source: TodoItem["source"], heading: string) => {
     const items = view.items.filter((item) => item.source === source);
     if (items.length === 0) return;
     body.push(truncateToWidth(ansi.bold(heading), width));
     for (const item of items) {
-      if (item.id === normalized.selectedId) selectedLine = body.length;
-      body.push(
-        ...renderItem(item, item.id === normalized.selectedId, width),
-        "",
+      const itemLines = renderItem(
+        item,
+        item.id === normalized.selectedId,
+        width,
       );
+      if (item.id === normalized.selectedId) {
+        selectedStart = body.length;
+        selectedEnd = body.length + itemLines.length - 1;
+      }
+      body.push(...itemLines, "");
     }
   };
   appendItems("generated", "Generated");
@@ -439,10 +471,17 @@ export function renderTodoPane(
   ];
   const bodyHeight = Math.max(0, height - header.length - footer.length);
   const maxStart = Math.max(0, body.length - bodyHeight);
-  const bodyStart = Math.min(
+  const selectedHeight = selectedEnd - selectedStart + 1;
+  let bodyStart = Math.min(
     maxStart,
-    Math.max(0, selectedLine - Math.floor(bodyHeight / 2)),
+    Math.max(
+      0,
+      selectedStart - Math.floor(Math.max(0, bodyHeight - selectedHeight) / 2),
+    ),
   );
+  if (selectedEnd >= bodyStart + bodyHeight)
+    bodyStart = Math.min(maxStart, selectedEnd - bodyHeight + 1);
+  if (selectedStart < bodyStart) bodyStart = selectedStart;
   const visibleBody = body.slice(bodyStart, bodyStart + bodyHeight);
   while (visibleBody.length < bodyHeight) visibleBody.push("");
   return [...header, ...visibleBody, ...footer].slice(0, Math.max(0, height));

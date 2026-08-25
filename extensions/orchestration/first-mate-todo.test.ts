@@ -3,7 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { FleetMessage, FleetTask } from "./fleet.ts";
 import {
   buildTodoBoardView,
@@ -242,10 +242,157 @@ test("rendering stays within width and input flow supports add/edit/snooze", () 
     view,
     { showHelp: true, selectedId: "manual:1" },
     28,
-    14,
+    18,
   );
   assert.ok(lines.every((line) => visibleWidth(line) <= 28));
-  assert.ok(lines.some((line) => line.includes("Manual")));
+  assert.ok(lines.some((line) => line.includes("Very long manual")));
+});
+
+test("long generated and manual items wrap with Unicode display widths and aligned continuations", () => {
+  const generatedTitle =
+    "Generated review 界🙂 with Unicode and a final generated word";
+  const manualTitle =
+    "Manual follow-up é with a long unbroken-token-abcdefghijklmnop";
+  const view: TodoBoardView = {
+    items: [
+      {
+        id: "generated:1",
+        kind: "review",
+        title: generatedTitle,
+        source: "generated",
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      {
+        id: "manual:1",
+        kind: "manual",
+        title: manualTitle,
+        source: "manual",
+        createdAt: 2,
+        updatedAt: 2,
+      },
+    ],
+    generatedCount: 1,
+    manualCount: 1,
+    snoozedCount: 0,
+    hiddenCount: 0,
+    trackedPrUrls: [],
+  };
+  const lines = renderTodoPane(
+    view,
+    { showHelp: false, selectedId: "generated:1" },
+    16,
+    30,
+  );
+  const plain = lines.map(stripTerminalSequences);
+  const wrappedItem = (heading: string) => {
+    const start = plain.indexOf(heading) + 1;
+    const end = plain.indexOf("", start);
+    return plain.slice(start, end);
+  };
+  const generated = wrappedItem("Generated");
+  const manual = wrappedItem("Manual");
+
+  assert.ok(lines.every((line) => visibleWidth(line) <= 16));
+  assert.ok(generated.length > 1);
+  assert.ok(manual.length > 1);
+  assert.equal(
+    generated
+      .map((line) => line.slice(5))
+      .join("")
+      .replace(/\s/gu, ""),
+    generatedTitle.replace(/\s/gu, ""),
+  );
+  assert.equal(
+    manual
+      .map((line) => line.slice(5))
+      .join("")
+      .replace(/\s/gu, ""),
+    manualTitle.replace(/\s/gu, ""),
+  );
+  assert.ok(generated.slice(1).every((line) => /^ {5}\S/u.test(line)));
+  assert.ok(manual.slice(1).every((line) => /^ {5}\S/u.test(line)));
+});
+
+test("item text reflows on resize and keeps every narrow-pane line bounded", () => {
+  const title = "Resize this manual item across several words through omega";
+  const view: TodoBoardView = {
+    items: [
+      {
+        id: "manual:resize",
+        kind: "manual",
+        title,
+        detail: "Detail text also wraps through its final detail word",
+        source: "manual",
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+    generatedCount: 0,
+    manualCount: 1,
+    snoozedCount: 0,
+    hiddenCount: 0,
+    trackedPrUrls: [],
+  };
+  const wide = renderTodoPane(
+    view,
+    { showHelp: false, selectedId: "manual:resize" },
+    30,
+    30,
+  );
+  const narrow = renderTodoPane(
+    view,
+    { showHelp: false, selectedId: "manual:resize" },
+    12,
+    30,
+  );
+  const itemRows = (lines: string[]) => {
+    const plain = lines.map(stripTerminalSequences);
+    const start = plain.indexOf("Manual") + 1;
+    return plain.slice(start, plain.indexOf("", start));
+  };
+  const wideRows = itemRows(wide);
+  const narrowRows = itemRows(narrow);
+
+  assert.ok(narrowRows.length > wideRows.length);
+  assert.ok(narrow.every((line) => visibleWidth(line) <= 12));
+  assert.ok(narrowRows.slice(1).some((line) => /^ {5}\S/u.test(line)));
+  assert.ok(narrowRows.some((line) => /^ {2}Detail/u.test(line)));
+  assert.ok(narrowRows.some((line) => line.includes("word")));
+});
+
+test("viewport scrolling keeps every wrapped line of the selected item visible", () => {
+  const items = Array.from({ length: 5 }, (_, index) => ({
+    id: `manual:${index}`,
+    kind: "manual" as const,
+    title:
+      index === 4
+        ? "Selected alpha beta gamma delta omega"
+        : `Earlier item ${index} with extra text`,
+    source: "manual" as const,
+    createdAt: index,
+    updatedAt: index,
+  }));
+  const view: TodoBoardView = {
+    items,
+    generatedCount: 0,
+    manualCount: items.length,
+    snoozedCount: 0,
+    hiddenCount: 0,
+    trackedPrUrls: [],
+  };
+  const lines = renderTodoPane(
+    view,
+    { showHelp: false, selectedId: "manual:4" },
+    18,
+    9,
+  );
+  const plain = lines.map(stripTerminalSequences);
+
+  assert.ok(plain.some((line) => line.startsWith("> M  Selected")));
+  assert.ok(plain.some((line) => line.trimEnd().endsWith("omega")));
+  assert.ok(plain.some((line) => line.startsWith("enter open")));
+  assert.ok(lines.every((line) => visibleWidth(line) <= 18));
 });
 
 test("generated item controls emit refresh, resolution, focus, and open commands", () => {
@@ -352,6 +499,10 @@ test("fleet and persisted text cannot inject terminal controls", () => {
   const malicious =
     "before\u001b]52;c;Y2xpcGJvYXJk\u0007after\u001b[31mred\u001b[0m\u0001";
   assert.equal(sanitizeTodoText(malicious), "beforeafterred");
+  assert.equal(
+    sanitizeTodoText("line one\n\tline two\u0001"),
+    "line one line two",
+  );
   const view: TodoBoardView = {
     items: [
       {
