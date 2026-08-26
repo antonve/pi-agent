@@ -63,7 +63,7 @@ class FocusTrackingHerdrClient extends HerdrClient {
   }
 }
 
-test("controller creates a 25% right-hand pane and restores the exact focused pane", async () => {
+test("controller creates a 25% right-hand pane through no-focus APIs", async () => {
   const calls: string[][] = [];
   let created = false;
   let herdr!: FocusTrackingHerdrClient;
@@ -83,7 +83,6 @@ test("controller creates a 25% right-hand pane and restores the exact focused pa
         };
       if (args[0] === "pane" && args[1] === "split") {
         created = true;
-        herdr.currentFocus = "w1:p2";
         return {
           code: 0,
           stderr: "",
@@ -145,7 +144,7 @@ test("controller creates a 25% right-hand pane and restores the exact focused pa
     false,
   );
   assert.equal(herdr.currentFocus, "w1:p1");
-  assert.deepEqual(herdr.focusCalls, ["w1:p1"]);
+  assert.deepEqual(herdr.focusCalls, []);
 });
 
 test("controller idempotently reuses an existing running board pane", async () => {
@@ -597,7 +596,7 @@ test("controller reclaims a board on the same workspace without duplicates", asy
   );
 });
 
-test("controller preserves a wider manual width when moving a discovered board to the far right", async () => {
+test("controller preserves a wider manual width without changing focus when moving the board", async () => {
   const calls: string[][] = [];
   let boardAtRight = false;
   let boardWidth = 40;
@@ -645,7 +644,6 @@ test("controller preserves a wider manual width when moving a discovered board t
       if (args[0] === "pane" && args[1] === "swap") {
         boardAtRight = true;
         boardWidth = 20;
-        herdr.currentFocus = "w1:p2";
       }
       if (args[0] === "pane" && args[1] === "resize") {
         const amount = Number(args[args.indexOf("--amount") + 1]);
@@ -687,10 +685,10 @@ test("controller preserves a wider manual width when moving a discovered board t
     ),
   );
   assert.equal(herdr.currentFocus, "w1:p1");
-  assert.deepEqual(herdr.focusCalls, ["w1:p1"]);
+  assert.deepEqual(herdr.focusCalls, []);
 });
 
-test("post-swap layout failure keeps a wider board moved, saved, and focus restored", async () => {
+test("post-swap layout failure keeps a wider board moved, saved, and exact focus", async () => {
   const calls: string[][] = [];
   let swapCompleted = false;
   let herdr!: FocusTrackingHerdrClient;
@@ -736,7 +734,6 @@ test("post-swap layout failure keeps a wider board moved, saved, and focus resto
             };
       if (args[0] === "pane" && args[1] === "swap") {
         swapCompleted = true;
-        herdr.currentFocus = "w1:p2";
       }
       return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
     },
@@ -771,10 +768,10 @@ test("post-swap layout failure keeps a wider board moved, saved, and focus resto
   assert.equal(saved.fingerprint, TODO_RUNTIME_FINGERPRINT);
   assert.ok(saved.startedAt && saved.startedAt > 1);
   assert.equal(herdr.currentFocus, "w1:p1");
-  assert.deepEqual(herdr.focusCalls, ["w1:p1"]);
+  assert.deepEqual(herdr.focusCalls, []);
 });
 
-test("post-swap resize failure keeps a narrower board moved, saved, and focus restored", async () => {
+test("post-swap resize failure keeps a narrower board moved, saved, and exact focus", async () => {
   let boardAtRight = false;
   let boardWidth = 11;
   let resizeArgs: string[] | undefined;
@@ -825,7 +822,6 @@ test("post-swap resize failure keeps a narrower board moved, saved, and focus re
       if (args[0] === "pane" && args[1] === "swap") {
         boardAtRight = true;
         boardWidth = 38;
-        herdr.currentFocus = "w1:p2";
       }
       if (args[0] === "pane" && args[1] === "resize") {
         resizeArgs = [...args];
@@ -863,7 +859,7 @@ test("post-swap resize failure keeps a narrower board moved, saved, and focus re
   assert.equal(saved.fingerprint, TODO_RUNTIME_FINGERPRINT);
   assert.ok(saved.startedAt && saved.startedAt > 1);
   assert.equal(herdr.currentFocus, "w1:p1");
-  assert.deepEqual(herdr.focusCalls, ["w1:p1"]);
+  assert.deepEqual(herdr.focusCalls, []);
 });
 
 test("controller restarts the pane after the board process exits", async () => {
@@ -935,7 +931,7 @@ test("controller restarts the pane after the board process exits", async () => {
   );
 });
 
-test("repeated reconciliation preserves a narrower manual width after an unequal swap", async () => {
+test("repeated reconciliation preserves a narrower width without changing focus", async () => {
   const calls: string[][] = [];
   let boardAtRight = false;
   let boardWidth = 10;
@@ -964,7 +960,6 @@ test("repeated reconciliation preserves a narrower manual width after an unequal
               ]),
         };
       if (args[0] === "pane" && args[1] === "process-info") {
-        herdr.currentFocus = "w1:p2";
         return {
           code: 0,
           stderr: "",
@@ -1021,10 +1016,10 @@ test("repeated reconciliation preserves a narrower manual width after an unequal
         "pane resize --pane w1:p2 --direction right --amount 0.25",
     ),
   );
-  assert.deepEqual(herdr.focusCalls, ["w1:p1", "w1:p1", "w1:p1"]);
+  assert.deepEqual(herdr.focusCalls, []);
 });
 
-test("controller reload and process restart preserve manual width through an unequal swap", async () => {
+test("reload and process restart preserve manual width and intentional focus", async () => {
   const calls: string[][] = [];
   let boardAtRight = false;
   let boardWidth = 40;
@@ -1090,7 +1085,6 @@ test("controller reload and process restart preserve manual width through an une
         };
       }
       if (args[0] === "pane" && args[1] === "send-keys") stopped = true;
-      if (args[0] === "pane" && args[1] === "run") herdr.currentFocus = "w1:p1";
       if (args[0] === "pane" && args[1] === "swap") {
         boardAtRight = true;
         boardWidth = 20;
@@ -1098,7 +1092,6 @@ test("controller reload and process restart preserve manual width through an une
       if (args[0] === "pane" && args[1] === "resize") {
         const amount = Number(args[args.indexOf("--amount") + 1]);
         boardWidth += args.includes("left") ? amount * 100 : -amount * 100;
-        herdr.currentFocus = "w1:p1";
       }
       return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
     },
@@ -1137,5 +1130,5 @@ test("controller reload and process restart preserve manual width through an une
     ),
   );
   assert.equal(herdr.currentFocus, "w1:p2");
-  assert.deepEqual(herdr.focusCalls, ["w1:p2"]);
+  assert.deepEqual(herdr.focusCalls, []);
 });
