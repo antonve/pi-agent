@@ -75,6 +75,13 @@ export class HerdrCommandError extends Error {
   }
 }
 
+class HerdrSocketConnectionError extends Error {
+  constructor(socketPath: string, cause: unknown) {
+    super(`Could not connect to the Herdr socket at ${socketPath}.`, { cause });
+    this.name = "HerdrSocketConnectionError";
+  }
+}
+
 const RETRYABLE_AGENT_CODES = new Set([
   "agent_not_found",
   "agent_not_ready",
@@ -249,20 +256,48 @@ export class HerdrClient {
   private readonly runner: CliRunner;
   private readonly timing: HerdrTiming;
 
-  private async socketJson<T>(
+  private async discoverSocketPath(signal?: AbortSignal) {
+    const args = ["session", "list", "--json"];
+    const result = await this.runner.run("herdr", args, {
+      signal,
+      timeoutMs: 5_000,
+    });
+    if (result.code !== 0)
+      throw commandError(args, result.stderr || result.stdout);
+    const sessions = findObjects(
+      decodeJson(result.stdout, "herdr session list --json"),
+      (candidate) =>
+        typeof candidate.name === "string" &&
+        typeof candidate.default === "boolean" &&
+        typeof candidate.running === "boolean" &&
+        typeof candidate.socket_path === "string",
+    );
+    const requestedSession = process.env.HERDR_SESSION?.trim();
+    const session = sessions.find(
+      (candidate) =>
+        candidate.running === true &&
+        (requestedSession && requestedSession !== "default"
+          ? candidate.name === requestedSession
+          : candidate.default === true),
+    );
+    if (!session)
+      throw new Error(
+        `Herdr reported no running ${requestedSession && requestedSession !== "default" ? `session named ${requestedSession}` : "default session"}.`,
+      );
+    return String(session.socket_path);
+  }
+
+  private socketJsonAt<T>(
+    socketPath: string,
     method: string,
     params: Record<string, unknown>,
     signal?: AbortSignal,
     timeoutMs = 10_000,
   ): Promise<T> {
-    const socketPath = process.env.HERDR_SOCKET_PATH;
-    if (!socketPath)
-      throw new Error(
-        `HERDR_SOCKET_PATH is unset; Herdr socket API ${method} is unavailable.`,
-      );
     return new Promise<T>((resolve, reject) => {
       const requestId = randomUUID();
       const socket = createConnection(socketPath);
+      let connected = false;
       let settled = false;
       let buffer = "";
       const complete = (error?: unknown, value?: T) => {
@@ -285,8 +320,13 @@ export class HerdrClient {
       };
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) return abort();
-      socket.on("error", (error) => complete(error));
+      socket.on("error", (error) =>
+        complete(
+          connected ? error : new HerdrSocketConnectionError(socketPath, error),
+        ),
+      );
       socket.on("connect", () => {
+        connected = true;
         socket.write(`${JSON.stringify({ id: requestId, method, params })}\n`);
       });
       socket.on("data", (chunk) => {
@@ -324,6 +364,45 @@ export class HerdrClient {
         }
       });
     });
+  }
+
+  private async socketJson<T>(
+    method: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    timeoutMs = 10_000,
+  ): Promise<T> {
+    const configuredPath = process.env.HERDR_SOCKET_PATH?.trim();
+    if (!configuredPath) {
+      const discoveredPath = await this.discoverSocketPath(signal);
+      return this.socketJsonAt(
+        discoveredPath,
+        method,
+        params,
+        signal,
+        timeoutMs,
+      );
+    }
+    try {
+      return await this.socketJsonAt(
+        configuredPath,
+        method,
+        params,
+        signal,
+        timeoutMs,
+      );
+    } catch (error) {
+      if (!(error instanceof HerdrSocketConnectionError)) throw error;
+      const discoveredPath = await this.discoverSocketPath(signal);
+      if (discoveredPath === configuredPath) throw error;
+      return this.socketJsonAt(
+        discoveredPath,
+        method,
+        params,
+        signal,
+        timeoutMs,
+      );
+    }
   }
 
   constructor(runner: CliRunner, timing: Partial<HerdrTiming> = {}) {

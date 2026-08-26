@@ -26,6 +26,7 @@ function success(result: unknown = {}) {
 class DirectRunner implements CliRunner {
   readonly calls: string[][] = [];
   location: Location;
+  discoveredSocketPath?: string;
 
   constructor(location: Location) {
     this.location = location;
@@ -35,6 +36,26 @@ class DirectRunner implements CliRunner {
     assert.equal(command, "herdr");
     this.calls.push([...args]);
     if (args[0] === "pane" && args[1] === "get") return success({});
+    if (
+      args[0] === "session" &&
+      args[1] === "list" &&
+      args[2] === "--json" &&
+      this.discoveredSocketPath
+    )
+      return {
+        code: 0,
+        stderr: "",
+        stdout: JSON.stringify({
+          sessions: [
+            {
+              name: "default",
+              default: true,
+              running: true,
+              socket_path: this.discoveredSocketPath,
+            },
+          ],
+        }),
+      };
     throw new Error(
       `background command unexpectedly used CLI: ${args.join(" ")}`,
     );
@@ -48,6 +69,7 @@ async function withNativeSocket<T>(
     method: string,
     params: Record<string, unknown>,
   ) => SocketResponse = () => ({ result: {} }),
+  socketEnvironment: "valid" | "absent" | "stale" = "valid",
 ) {
   const directory = await mkdtemp(join(tmpdir(), "pi-focus-guard-"));
   const socketPath = join(directory, "herdr.sock");
@@ -87,7 +109,13 @@ async function withNativeSocket<T>(
   });
   const previousSocket = process.env.HERDR_SOCKET_PATH;
   const previousRun = nodeCliRunner.run;
-  process.env.HERDR_SOCKET_PATH = socketPath;
+  runner.discoveredSocketPath = socketPath;
+  if (socketEnvironment === "absent") delete process.env.HERDR_SOCKET_PATH;
+  else
+    process.env.HERDR_SOCKET_PATH =
+      socketEnvironment === "stale"
+        ? join(directory, "stale.sock")
+        : socketPath;
   nodeCliRunner.run = runner.run.bind(runner);
   try {
     return await run(requests);
@@ -211,6 +239,50 @@ test("completion closes a direct target without issuing pane.focus", async () =>
       ["tab.close"],
     );
   });
+});
+
+test("janitor cleanup discovers the default socket when the environment is absent", async () => {
+  const runner = new DirectRunner(owner);
+  await withNativeSocket(
+    runner,
+    async (requests) => {
+      await new HerdrClient(nodeCliRunner).closeWorkspace(target.workspaceId);
+      assert.deepEqual(runner.location, owner);
+      assert.deepEqual(runner.calls, [["session", "list", "--json"]]);
+      assert.deepEqual(
+        requests.map((request) => ({
+          method: request.method,
+          params: request.params,
+        })),
+        [
+          {
+            method: "workspace.close",
+            params: { workspace_id: target.workspaceId },
+          },
+        ],
+      );
+    },
+    undefined,
+    "absent",
+  );
+});
+
+test("janitor cleanup recovers from a stale socket without transferring focus", async () => {
+  const runner = new DirectRunner(owner);
+  await withNativeSocket(
+    runner,
+    async (requests) => {
+      await new HerdrClient(nodeCliRunner).closeWorkspace(target.workspaceId);
+      assert.deepEqual(runner.location, owner);
+      assert.deepEqual(runner.calls, [["session", "list", "--json"]]);
+      assert.deepEqual(
+        requests.map((request) => request.method),
+        ["workspace.close"],
+      );
+    },
+    undefined,
+    "stale",
+  );
 });
 
 test("same-identity focus events are tolerated as non-transfers", async () => {
