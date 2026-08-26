@@ -36,6 +36,14 @@ async function runtimeStore() {
   return new TodoPaneRuntimeStore(join(directory, "runtime.json"));
 }
 
+function assertApproximately(actual: number, expected: number) {
+  const tolerance = 1e-9;
+  assert.ok(
+    Math.abs(actual - expected) <= tolerance,
+    `Expected ${actual} to be within ${tolerance} of ${expected}`,
+  );
+}
+
 class FocusTrackingHerdrClient extends HerdrClient {
   currentFocus: string | undefined;
   readonly focusCalls: string[] = [];
@@ -664,7 +672,7 @@ test("controller preserves a wider manual width when moving a discovered board t
     created: false,
     restarted: false,
   });
-  assert.equal(boardWidth, 40);
+  assertApproximately(boardWidth, 40);
   assert.ok(
     calls.some(
       (args) =>
@@ -678,6 +686,182 @@ test("controller preserves a wider manual width when moving a discovered board t
         "pane resize --pane w1:p2 --direction left --amount 0.2",
     ),
   );
+  assert.equal(herdr.currentFocus, "w1:p1");
+  assert.deepEqual(herdr.focusCalls, ["w1:p1"]);
+});
+
+test("post-swap layout failure keeps a wider board moved, saved, and focus restored", async () => {
+  const calls: string[][] = [];
+  let swapCompleted = false;
+  let herdr!: FocusTrackingHerdrClient;
+  const runtime = await runtimeStore();
+  await runtime.write({
+    version: 1,
+    paneId: "w1:p2",
+    parentPaneId: "old-parent",
+    tabId: "w1:t1",
+    workspaceId: "w1",
+    startedAt: 1,
+    fingerprint: TODO_RUNTIME_FINGERPRINT,
+  });
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "get")
+        return { code: 0, stderr: "", stdout: "{}" };
+      if (args[0] === "pane" && args[1] === "process-info")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              process_info: {
+                pane_id: "w1:p2",
+                foreground_processes: [{ cmdline: boardProcess() }],
+              },
+            },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "layout")
+        return swapCompleted
+          ? { code: 1, stderr: "injected layout failure", stdout: "" }
+          : {
+              code: 0,
+              stderr: "",
+              stdout: layout([
+                { pane_id: "w1:p2", x: 0, width: 41 },
+                { pane_id: "w1:p1", x: 41, width: 57 },
+                { pane_id: "w1:p3", x: 98, width: 22 },
+              ]),
+            };
+      if (args[0] === "pane" && args[1] === "swap") {
+        swapCompleted = true;
+        herdr.currentFocus = "w1:p2";
+      }
+      return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+    },
+  };
+  herdr = new FocusTrackingHerdrClient(runner, "w1:p1");
+  const controller = new FirstMateTodoPaneController(herdr, runtime);
+
+  const result = await controller.ensure({
+    workspaceId: "w1",
+    tabId: "w1:t1",
+    paneId: "w1:p1",
+    cwd: "/repo",
+  });
+
+  assert.deepEqual(result, {
+    paneId: "w1:p2",
+    created: false,
+    restarted: false,
+  });
+  assert.equal(swapCompleted, true);
+  assert.equal(
+    calls.filter((args) => args[0] === "pane" && args[1] === "swap").length,
+    1,
+  );
+  assert.equal(
+    calls.filter((args) => args[0] === "pane" && args[1] === "resize").length,
+    0,
+  );
+  const saved = await runtime.read();
+  assert.equal(saved.paneId, "w1:p2");
+  assert.equal(saved.parentPaneId, "w1:p1");
+  assert.equal(saved.fingerprint, TODO_RUNTIME_FINGERPRINT);
+  assert.ok(saved.startedAt && saved.startedAt > 1);
+  assert.equal(herdr.currentFocus, "w1:p1");
+  assert.deepEqual(herdr.focusCalls, ["w1:p1"]);
+});
+
+test("post-swap resize failure keeps a narrower board moved, saved, and focus restored", async () => {
+  let boardAtRight = false;
+  let boardWidth = 11;
+  let resizeArgs: string[] | undefined;
+  let herdr!: FocusTrackingHerdrClient;
+  const runtime = await runtimeStore();
+  await runtime.write({
+    version: 1,
+    paneId: "w1:p2",
+    parentPaneId: "old-parent",
+    tabId: "w1:t1",
+    workspaceId: "w1",
+    startedAt: 1,
+    fingerprint: TODO_RUNTIME_FINGERPRINT,
+  });
+  const runner: CliRunner = {
+    async run(_command, args) {
+      if (args[0] === "pane" && args[1] === "get")
+        return { code: 0, stderr: "", stdout: "{}" };
+      if (args[0] === "pane" && args[1] === "process-info")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              process_info: {
+                pane_id: "w1:p2",
+                foreground_processes: [{ cmdline: boardProcess() }],
+              },
+            },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "layout")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: boardAtRight
+            ? layout([
+                { pane_id: "w1:p3", x: 0, width: 11 },
+                { pane_id: "w1:p1", x: 11, width: 71 },
+                { pane_id: "w1:p2", x: 82, width: boardWidth },
+              ])
+            : layout([
+                { pane_id: "w1:p2", x: 0, width: 11 },
+                { pane_id: "w1:p1", x: 11, width: 71 },
+                { pane_id: "w1:p3", x: 82, width: 38 },
+              ]),
+        };
+      if (args[0] === "pane" && args[1] === "swap") {
+        boardAtRight = true;
+        boardWidth = 38;
+        herdr.currentFocus = "w1:p2";
+      }
+      if (args[0] === "pane" && args[1] === "resize") {
+        resizeArgs = [...args];
+        return { code: 1, stderr: "injected resize failure", stdout: "" };
+      }
+      return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
+    },
+  };
+  herdr = new FocusTrackingHerdrClient(runner, "w1:p1");
+  const controller = new FirstMateTodoPaneController(herdr, runtime);
+
+  const result = await controller.ensure({
+    workspaceId: "w1",
+    tabId: "w1:t1",
+    paneId: "w1:p1",
+    cwd: "/repo",
+  });
+
+  assert.deepEqual(result, {
+    paneId: "w1:p2",
+    created: false,
+    restarted: false,
+  });
+  assert.equal(boardAtRight, true);
+  assertApproximately(boardWidth, 38);
+  assert.ok(resizeArgs);
+  assert.equal(resizeArgs[resizeArgs.indexOf("--direction") + 1], "right");
+  assertApproximately(
+    Number(resizeArgs[resizeArgs.indexOf("--amount") + 1]),
+    27 / 120,
+  );
+  const saved = await runtime.read();
+  assert.equal(saved.paneId, "w1:p2");
+  assert.equal(saved.parentPaneId, "w1:p1");
+  assert.equal(saved.fingerprint, TODO_RUNTIME_FINGERPRINT);
+  assert.ok(saved.startedAt && saved.startedAt > 1);
   assert.equal(herdr.currentFocus, "w1:p1");
   assert.deepEqual(herdr.focusCalls, ["w1:p1"]);
 });
@@ -823,7 +1007,7 @@ test("repeated reconciliation preserves a narrower manual width after an unequal
 
   for (let reconciliation = 0; reconciliation < 3; reconciliation++) {
     await controller.ensure(location);
-    assert.equal(boardWidth, 10);
+    assertApproximately(boardWidth, 10);
     assert.equal(herdr.currentFocus, "w1:p1");
   }
   assert.equal(
@@ -935,7 +1119,7 @@ test("controller reload and process restart preserve manual width through an une
     created: false,
     restarted: true,
   });
-  assert.equal(boardWidth, 40);
+  assertApproximately(boardWidth, 40);
   assert.equal(
     calls.filter((args) => args[0] === "pane" && args[1] === "send-keys")
       .length,

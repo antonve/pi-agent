@@ -239,7 +239,10 @@ export class FirstMateTodoPaneController {
     const boardWidth = board.rect.width;
     await this.herdr.swapPanes(paneId, rightmost.paneId);
 
-    const movedLayout = await this.herdr.layout(location.paneId);
+    const movedLayout = await this.herdr
+      .layout(location.paneId)
+      .catch(() => undefined);
+    if (!movedLayout) return;
     const movedBoard = movedLayout.panes.find((pane) => pane.paneId === paneId);
     if (!movedBoard || movedBoard.rect.width === boardWidth) return;
     const left = Math.min(...movedLayout.panes.map((pane) => pane.rect.x));
@@ -249,11 +252,13 @@ export class FirstMateTodoPaneController {
     const tabWidth = right - left;
     if (tabWidth <= 0) return;
     const widthDelta = boardWidth - movedBoard.rect.width;
-    await this.herdr.resizePane(
-      paneId,
-      widthDelta > 0 ? "left" : "right",
-      Math.abs(widthDelta) / tabWidth,
-    );
+    await this.herdr
+      .resizePane(
+        paneId,
+        widthDelta > 0 ? "left" : "right",
+        Math.abs(widthDelta) / tabWidth,
+      )
+      .catch(() => undefined);
   }
 
   private async ensureProcess(paneId: string) {
