@@ -311,24 +311,6 @@ test("slash-command firstmate claim makes later turns explicitly supervisory", a
         calls.some(
           (args) =>
             args[0] === "workspace" &&
-            args[1] === "rename" &&
-            args[2] === "w-owner" &&
-            args[3] === "firstmate",
-        ),
-      );
-      assert.ok(
-        calls.some(
-          (args) =>
-            args[0] === "tab" &&
-            args[1] === "rename" &&
-            args[2] === "w-owner:t1" &&
-            args[3] === "firstmate",
-        ),
-      );
-      assert.ok(
-        calls.some(
-          (args) =>
-            args[0] === "workspace" &&
             args[1] === "report-metadata" &&
             args[2] === "w-owner" &&
             args.includes("repo=repo"),
@@ -341,8 +323,26 @@ test("slash-command firstmate claim makes later turns explicitly supervisory", a
         })),
         [
           {
+            method: "workspace.rename",
+            params: { workspace_id: "w-owner", label: "firstmate" },
+          },
+          {
+            method: "tab.rename",
+            params: { tab_id: "w-owner:t1", label: "firstmate" },
+          },
+          {
             method: "workspace.move",
             params: { workspace_id: "w-owner", insert_index: 0 },
+          },
+          {
+            method: "pane.split",
+            params: {
+              target_pane_id: "w-owner:p1",
+              direction: "right",
+              ratio: 0.75,
+              cwd: "/repo",
+              focus: false,
+            },
           },
         ],
       );
@@ -423,24 +423,6 @@ test("tool first_mate_claim renames and reorders the claimed workspace", async (
         result.content[0]?.type === "text" ? result.content[0].text : "",
         /Claimed the machine first-mate role/,
       );
-      assert.ok(
-        calls.some(
-          (args) =>
-            args[0] === "workspace" &&
-            args[1] === "rename" &&
-            args[2] === "w-owner" &&
-            args[3] === "firstmate",
-        ),
-      );
-      assert.ok(
-        calls.some(
-          (args) =>
-            args[0] === "tab" &&
-            args[1] === "rename" &&
-            args[2] === "w-owner:t1" &&
-            args[3] === "firstmate",
-        ),
-      );
       assert.deepEqual(
         requests.map((request) => ({
           method: request.method,
@@ -448,8 +430,26 @@ test("tool first_mate_claim renames and reorders the claimed workspace", async (
         })),
         [
           {
+            method: "workspace.rename",
+            params: { workspace_id: "w-owner", label: "firstmate" },
+          },
+          {
+            method: "tab.rename",
+            params: { tab_id: "w-owner:t1", label: "firstmate" },
+          },
+          {
             method: "workspace.move",
             params: { workspace_id: "w-owner", insert_index: 0 },
+          },
+          {
+            method: "pane.split",
+            params: {
+              target_pane_id: "w-owner:p1",
+              direction: "right",
+              ratio: 0.75,
+              cwd: "/repo",
+              focus: false,
+            },
           },
         ],
       );

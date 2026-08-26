@@ -55,7 +55,7 @@ class FocusTrackingHerdrClient extends HerdrClient {
   }
 }
 
-test("controller creates a 25% right-hand pane and restores the exact focused pane", async () => {
+test("controller creates a 25% right-hand pane through no-focus APIs", async () => {
   const calls: string[][] = [];
   let created = false;
   let herdr!: FocusTrackingHerdrClient;
@@ -75,7 +75,6 @@ test("controller creates a 25% right-hand pane and restores the exact focused pa
         };
       if (args[0] === "pane" && args[1] === "split") {
         created = true;
-        herdr.currentFocus = "w1:p2";
         return {
           code: 0,
           stderr: "",
@@ -137,7 +136,7 @@ test("controller creates a 25% right-hand pane and restores the exact focused pa
     false,
   );
   assert.equal(herdr.currentFocus, "w1:p1");
-  assert.deepEqual(herdr.focusCalls, ["w1:p1"]);
+  assert.deepEqual(herdr.focusCalls, []);
 });
 
 test("controller idempotently reuses an existing running board pane", async () => {
@@ -727,7 +726,7 @@ test("controller restarts the pane after the board process exits", async () => {
   );
 });
 
-test("repeated task-assignment-like reconciliation restores the exact first-mate pane", async () => {
+test("repeated task-assignment-like reconciliation never focuses the board", async () => {
   let herdr!: FocusTrackingHerdrClient;
   const runner: CliRunner = {
     async run(_command, args) {
@@ -741,7 +740,6 @@ test("repeated task-assignment-like reconciliation restores the exact first-mate
           ]),
         };
       if (args[0] === "pane" && args[1] === "process-info") {
-        herdr.currentFocus = "w1:p2";
         return {
           code: 0,
           stderr: "",
@@ -774,10 +772,10 @@ test("repeated task-assignment-like reconciliation restores the exact first-mate
     await controller.ensure(location);
     assert.equal(herdr.currentFocus, "w1:p1");
   }
-  assert.deepEqual(herdr.focusCalls, ["w1:p1", "w1:p1", "w1:p1"]);
+  assert.deepEqual(herdr.focusCalls, []);
 });
 
-test("reload restart preserves manual width and restores intentional focus", async () => {
+test("reload restart preserves manual width and intentional focus", async () => {
   const calls: string[][] = [];
   const boardWidth = 50;
   let stopped = false;
@@ -810,7 +808,6 @@ test("reload restart preserves manual width and restores intentional focus", asy
           }),
         };
       if (args[0] === "pane" && args[1] === "send-keys") stopped = true;
-      if (args[0] === "pane" && args[1] === "run") herdr.currentFocus = "w1:p1";
       return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
     },
   };
@@ -838,5 +835,5 @@ test("reload restart preserves manual width and restores intentional focus", asy
     false,
   );
   assert.equal(herdr.currentFocus, "w1:p2");
-  assert.deepEqual(herdr.focusCalls, ["w1:p2"]);
+  assert.deepEqual(herdr.focusCalls, []);
 });

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
-import type { CliRunner } from "./cli.ts";
+import { nodeCliRunner, type CliRunner } from "./cli.ts";
 import { decodeJson, findNumber, findObjects, findString } from "./cli.ts";
 import type {
   CreatedResource,
@@ -133,6 +133,50 @@ function commandError(args: readonly string[], output: string) {
   );
 }
 
+function argumentAfter(args: readonly string[], flag: string) {
+  const index = args.indexOf(flag);
+  return index >= 0 ? args[index + 1] : undefined;
+}
+
+function argumentsAfter(args: readonly string[], flag: string) {
+  const values: string[] = [];
+  for (let index = 0; index < args.length - 1; index++)
+    if (args[index] === flag && args[index + 1]) values.push(args[index + 1]!);
+  return values;
+}
+
+function environmentArguments(args: readonly string[]) {
+  return Object.fromEntries(
+    argumentsAfter(args, "--env").map((entry) => {
+      const separator = entry.indexOf("=");
+      return separator < 0
+        ? [entry, ""]
+        : [entry.slice(0, separator), entry.slice(separator + 1)];
+    }),
+  );
+}
+
+function isBackgroundCommand(args: readonly string[]) {
+  const [kind, action] = args;
+  if (!kind || !action || action === "focus" || action === "attach")
+    return false;
+  if (kind === "workspace")
+    return ["create", "close", "rename"].includes(action);
+  if (kind === "tab") return ["create", "close", "rename"].includes(action);
+  if (kind === "pane")
+    return [
+      "split",
+      "swap",
+      "resize",
+      "close",
+      "rename",
+      "run",
+      "send-text",
+      "send-keys",
+    ].includes(action);
+  return kind === "agent" && ["start", "prompt", "rename"].includes(action);
+}
+
 function isRetryableAgentError(error: unknown) {
   return (
     error instanceof HerdrCommandError &&
@@ -209,6 +253,7 @@ export class HerdrClient {
     method: string,
     params: Record<string, unknown>,
     signal?: AbortSignal,
+    timeoutMs = 10_000,
   ): Promise<T> {
     const socketPath = process.env.HERDR_SOCKET_PATH;
     if (!socketPath)
@@ -232,7 +277,7 @@ export class HerdrClient {
         complete(
           new Error(`Timed out waiting for Herdr socket API ${method}.`),
         );
-      }, 10_000);
+      }, timeoutMs);
       const abort = () => complete(signal?.reason ?? new Error("cancelled"));
       const cleanup = () => {
         clearTimeout(timeout);
@@ -286,11 +331,150 @@ export class HerdrClient {
     this.timing = { ...DEFAULT_TIMING, ...timing };
   }
 
+  private async nativeBackgroundCommand(
+    args: string[],
+    options: { signal?: AbortSignal; timeoutMs?: number },
+  ) {
+    const [kind, action] = args;
+    let method: string;
+    let params: Record<string, unknown>;
+    if (kind === "workspace" && action === "create") {
+      method = "workspace.create";
+      params = {
+        cwd: argumentAfter(args, "--cwd"),
+        label: argumentAfter(args, "--label"),
+        env: environmentArguments(args),
+        focus: false,
+      };
+    } else if (kind === "workspace" && action === "rename") {
+      method = "workspace.rename";
+      params = { workspace_id: args[2], label: args[3] };
+    } else if (kind === "workspace" && action === "close") {
+      method = "workspace.close";
+      params = { workspace_id: args[2] };
+    } else if (kind === "tab" && action === "create") {
+      method = "tab.create";
+      params = {
+        workspace_id: argumentAfter(args, "--workspace"),
+        cwd: argumentAfter(args, "--cwd"),
+        label: argumentAfter(args, "--label"),
+        env: environmentArguments(args),
+        focus: false,
+      };
+    } else if (kind === "tab" && action === "rename") {
+      method = "tab.rename";
+      params = { tab_id: args[2], label: args[3] };
+    } else if (kind === "tab" && action === "close") {
+      method = "tab.close";
+      params = { tab_id: args[2] };
+    } else if (kind === "pane" && action === "split") {
+      method = "pane.split";
+      params = {
+        target_pane_id: argumentAfter(args, "--pane"),
+        direction: argumentAfter(args, "--direction"),
+        ratio: Number(argumentAfter(args, "--ratio")),
+        cwd: argumentAfter(args, "--cwd"),
+        focus: false,
+      };
+    } else if (kind === "pane" && action === "swap") {
+      method = "pane.swap";
+      params = {
+        source_pane_id: argumentAfter(args, "--source-pane"),
+        target_pane_id: argumentAfter(args, "--target-pane"),
+      };
+    } else if (kind === "pane" && action === "resize") {
+      method = "pane.resize";
+      params = {
+        pane_id: argumentAfter(args, "--pane"),
+        direction: argumentAfter(args, "--direction"),
+        amount: Number(argumentAfter(args, "--amount")),
+      };
+    } else if (kind === "pane" && action === "rename") {
+      method = "pane.rename";
+      params = { pane_id: args[2], label: args[3] };
+    } else if (kind === "pane" && action === "close") {
+      method = "pane.close";
+      params = { pane_id: args[2] };
+    } else if (kind === "pane" && action === "run") {
+      method = "pane.send_input";
+      params = { pane_id: args[2], text: args[3], keys: ["enter"] };
+    } else if (kind === "pane" && action === "send-text") {
+      method = "pane.send_text";
+      params = { pane_id: args[2], text: args[3] };
+    } else if (kind === "pane" && action === "send-keys") {
+      method = "pane.send_keys";
+      params = { pane_id: args[2], keys: args.slice(3) };
+    } else if (kind === "agent" && action === "start") {
+      const separator = args.indexOf("--");
+      method = "agent.start";
+      params = {
+        name: args[2],
+        kind: argumentAfter(args, "--kind"),
+        pane_id: argumentAfter(args, "--pane"),
+        timeout_ms: Number(argumentAfter(args, "--timeout")),
+        args: separator < 0 ? [] : args.slice(separator + 1),
+      };
+    } else if (kind === "agent" && action === "prompt") {
+      const waits = args.includes("--wait");
+      method = "agent.prompt";
+      params = {
+        target: args[2],
+        text: args[3],
+        ...(waits
+          ? {
+              wait: {
+                until: argumentsAfter(args, "--until"),
+                timeout_ms: Number(argumentAfter(args, "--timeout")),
+              },
+            }
+          : {}),
+      };
+    } else if (kind === "agent" && action === "rename") {
+      method = "agent.rename";
+      params = { target: args[2], name: args[3] };
+    } else return this.runner.run("herdr", args, options);
+
+    try {
+      const result = await this.socketJson<unknown>(
+        method,
+        params,
+        options.signal,
+        options.timeoutMs,
+      );
+      return {
+        code: 0,
+        stderr: "",
+        stdout: JSON.stringify({ result }),
+      };
+    } catch (error) {
+      const code = error instanceof HerdrCommandError ? error.code : undefined;
+      return {
+        code: 1,
+        stdout: "",
+        stderr: JSON.stringify({
+          error: {
+            code,
+            message: error instanceof Error ? error.message : String(error),
+          },
+        }),
+      };
+    }
+  }
+
+  private runHerdr(
+    args: string[],
+    options: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ) {
+    if (this.runner === nodeCliRunner && isBackgroundCommand(args))
+      return this.nativeBackgroundCommand(args, options);
+    return this.runner.run("herdr", args, options);
+  }
+
   private async json(
     args: string[],
     options: { signal?: AbortSignal; timeoutMs?: number } = {},
   ) {
-    const result = await this.runner.run("herdr", args, options);
+    const result = await this.runHerdr(args, options);
     if (result.code !== 0)
       throw commandError(args, result.stderr || result.stdout);
     return decodeJson(result.stdout, `herdr ${commandLabel(args)}`);
@@ -300,7 +484,7 @@ export class HerdrClient {
     args: string[],
     options: { signal?: AbortSignal; timeoutMs?: number } = {},
   ) {
-    const result = await this.runner.run("herdr", args, options);
+    const result = await this.runHerdr(args, options);
     if (result.code !== 0)
       throw commandError(args, result.stderr || result.stdout);
     return result.stdout;
@@ -533,8 +717,12 @@ export class HerdrClient {
       (candidate) =>
         typeof candidate.pane_id === "string" && candidate.focused === true,
     )[0];
-    if (!pane) return undefined;
-    return { workspaceId, paneId: String(pane.pane_id) };
+    if (!pane || typeof pane.tab_id !== "string") return undefined;
+    return {
+      workspaceId,
+      tabId: pane.tab_id,
+      paneId: String(pane.pane_id),
+    };
   }
 
   async focusedPaneId() {
@@ -542,7 +730,6 @@ export class HerdrClient {
   }
 
   async closeWorkspace(workspaceId: string) {
-    const focused = await this.focusedPane().catch(() => undefined);
     try {
       await this.json(["workspace", "close", workspaceId]);
     } catch (error) {
@@ -552,13 +739,6 @@ export class HerdrClient {
       )
         return;
       throw error;
-    }
-    if (focused && focused.workspaceId !== workspaceId) {
-      const stillFocused = await this.workspaceIsFocused(
-        focused.workspaceId,
-      ).catch(() => false);
-      if (!stillFocused)
-        await this.focusPane(focused.paneId).catch(() => undefined);
     }
   }
 
@@ -815,7 +995,7 @@ export class HerdrClient {
       ...(args.length ? ["--", ...args] : []),
     ];
     for (let attempt = 0; ; attempt++) {
-      const result = await this.runner.run("herdr", commandArgs, {
+      const result = await this.runHerdr(commandArgs, {
         signal,
         timeoutMs: 70_000,
       });
