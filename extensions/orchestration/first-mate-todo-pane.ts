@@ -13,9 +13,6 @@ const BOARD_FINGERPRINT_ARGUMENT = "--todo-runtime-fingerprint";
 const BOARD_WIDTH_RATIO = 0.25;
 const BOARD_RESTART_ATTEMPTS = 20;
 const BOARD_RESTART_POLL_MS = 50;
-const BOARD_WIDTH_RESTORE_ATTEMPTS = 12;
-const MAX_PANE_RESIZE_AMOUNT = 0.5;
-const PANE_RESIZE_RETRY_SCALE = 1.5;
 
 // A Pi /reload evaluates this module again. Changing any long-lived board
 // source changes the marker, so the controller restarts only its owned CLI.
@@ -126,7 +123,6 @@ export class FirstMateTodoPaneController {
     const paneId = await this.findExistingPane(location, runtime);
     if (paneId) {
       const restarted = await this.ensureProcess(paneId);
-      await this.ensureFarRight(location, paneId);
       await this.saveRuntime(location, paneId);
       return { paneId, created: false, restarted };
     }
@@ -139,7 +135,6 @@ export class FirstMateTodoPaneController {
     });
     await this.herdr.renamePane(created.paneId, "firstmate-todo");
     await this.ensureProcess(created.paneId);
-    await this.ensureFarRight(location, created.paneId);
     await this.saveRuntime(location, created.paneId);
     return { paneId: created.paneId, created: true, restarted: true };
   }
@@ -201,81 +196,6 @@ export class FirstMateTodoPaneController {
         return candidate.paneId;
     }
     return undefined;
-  }
-
-  private async ensureFarRight(
-    location: FirstMateTodoPaneLocation,
-    paneId: string,
-  ) {
-    const layout = await this.herdr
-      .layout(location.paneId)
-      .catch(() => undefined);
-    const board = layout?.panes.find((pane) => pane.paneId === paneId);
-    const rightmost = layout?.panes.reduce((current, pane) =>
-      pane.rect.x + pane.rect.width > current.rect.x + current.rect.width
-        ? pane
-        : current,
-    );
-    if (
-      !board ||
-      !rightmost ||
-      board.rect.x + board.rect.width >= rightmost.rect.x + rightmost.rect.width
-    )
-      return;
-    const boardWidth = board.rect.width;
-    await this.herdr.swapPanes(paneId, rightmost.paneId);
-
-    let movedLayout = await this.herdr
-      .layout(location.paneId)
-      .catch(() => undefined);
-    let movedBoard = movedLayout?.panes.find((pane) => pane.paneId === paneId);
-    if (!movedLayout || !movedBoard || movedBoard.rect.width === boardWidth)
-      return;
-    const left = Math.min(...movedLayout.panes.map((pane) => pane.rect.x));
-    const right = Math.max(
-      ...movedLayout.panes.map((pane) => pane.rect.x + pane.rect.width),
-    );
-    const tabWidth = right - left;
-    if (tabWidth <= 0) return;
-
-    // Herdr applies the amount to the nearest split, whose span is not exposed
-    // by pane layout. Use observed cell changes to refine each bounded attempt.
-    let amount = Math.min(
-      Math.abs(boardWidth - movedBoard.rect.width) / tabWidth,
-      MAX_PANE_RESIZE_AMOUNT,
-    );
-    for (let attempt = 0; attempt < BOARD_WIDTH_RESTORE_ATTEMPTS; attempt++) {
-      const previousWidth = movedBoard.rect.width;
-      const widthDelta = boardWidth - previousWidth;
-      if (widthDelta === 0) return;
-      const resized = await this.herdr
-        .resizePane(paneId, widthDelta > 0 ? "left" : "right", amount)
-        .then(() => true)
-        .catch(() => false);
-      if (!resized) return;
-
-      movedLayout = await this.herdr
-        .layout(location.paneId)
-        .catch(() => undefined);
-      movedBoard = movedLayout?.panes.find((pane) => pane.paneId === paneId);
-      if (!movedLayout || !movedBoard) return;
-      if (movedBoard.rect.width === boardWidth) return;
-
-      const observedChange = Math.abs(movedBoard.rect.width - previousWidth);
-      if (observedChange === 0) {
-        if (amount >= MAX_PANE_RESIZE_AMOUNT) return;
-        amount = Math.min(
-          amount * PANE_RESIZE_RETRY_SCALE,
-          MAX_PANE_RESIZE_AMOUNT,
-        );
-        continue;
-      }
-      amount = Math.min(
-        (amount * Math.abs(boardWidth - movedBoard.rect.width)) /
-          observedChange,
-        MAX_PANE_RESIZE_AMOUNT,
-      );
-    }
   }
 
   private async ensureProcess(paneId: string) {
