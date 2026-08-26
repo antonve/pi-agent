@@ -653,7 +653,7 @@ test("ensure reuses a non-rightmost board without changing nested geometry or fo
   assert.deepEqual(herdr.focusCalls, []);
 });
 
-test("process restart leaves a non-rightmost board geometry and focus untouched", async () => {
+test("fresh controller after process restart leaves non-rightmost geometry and focus untouched", async () => {
   const calls: string[][] = [];
   let processExited = false;
   let herdr!: FocusTrackingHerdrClient;
@@ -711,7 +711,8 @@ test("process restart leaves a non-rightmost board geometry and focus untouched"
     restarted: false,
   });
   processExited = true;
-  assert.deepEqual(await controller.ensure(location), {
+  const freshController = new FirstMateTodoPaneController(herdr, runtime);
+  assert.deepEqual(await freshController.ensure(location), {
     paneId: "w1:p2",
     created: false,
     restarted: true,
