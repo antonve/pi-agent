@@ -123,7 +123,6 @@ export class FirstMateTodoPaneController {
     const paneId = await this.findExistingPane(location, runtime);
     if (paneId) {
       const restarted = await this.ensureProcess(paneId);
-      await this.ensureFarRight(location, paneId);
       await this.saveRuntime(location, paneId);
       return { paneId, created: false, restarted };
     }
@@ -136,7 +135,6 @@ export class FirstMateTodoPaneController {
     });
     await this.herdr.renamePane(created.paneId, "firstmate-todo");
     await this.ensureProcess(created.paneId);
-    await this.ensureFarRight(location, created.paneId);
     await this.saveRuntime(location, created.paneId);
     return { paneId: created.paneId, created: true, restarted: true };
   }
@@ -198,28 +196,6 @@ export class FirstMateTodoPaneController {
         return candidate.paneId;
     }
     return undefined;
-  }
-
-  private async ensureFarRight(
-    location: FirstMateTodoPaneLocation,
-    paneId: string,
-  ) {
-    const layout = await this.herdr
-      .layout(location.paneId)
-      .catch(() => undefined);
-    const board = layout?.panes.find((pane) => pane.paneId === paneId);
-    const rightmost = layout?.panes.reduce((current, pane) =>
-      pane.rect.x + pane.rect.width > current.rect.x + current.rect.width
-        ? pane
-        : current,
-    );
-    if (
-      !board ||
-      !rightmost ||
-      board.rect.x + board.rect.width >= rightmost.rect.x + rightmost.rect.width
-    )
-      return;
-    await this.herdr.swapPanes(paneId, rightmost.paneId);
   }
 
   private async ensureProcess(paneId: string) {

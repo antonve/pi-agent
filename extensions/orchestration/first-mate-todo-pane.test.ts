@@ -36,6 +36,20 @@ async function runtimeStore() {
   return new TodoPaneRuntimeStore(join(directory, "runtime.json"));
 }
 
+function assertNoPaneGeometryOrFocusMutations(calls: string[][]) {
+  assert.deepEqual(
+    calls.filter(
+      (args) =>
+        (args[0] === "pane" &&
+          (args[1] === "swap" ||
+            args[1] === "resize" ||
+            args[1] === "focus")) ||
+        ((args[0] === "tab" || args[0] === "workspace") && args[1] === "focus"),
+    ),
+    [],
+  );
+}
+
 class FocusTrackingHerdrClient extends HerdrClient {
   currentFocus: string | undefined;
   readonly focusCalls: string[] = [];
@@ -127,14 +141,7 @@ test("controller creates a 25% right-hand pane through no-focus APIs", async () 
       (args) => args[0] === "pane" && args[1] === "run" && args[2] === "w1:p2",
     ),
   );
-  assert.equal(
-    calls.some((args) => args[0] === "pane" && args[1] === "resize"),
-    false,
-  );
-  assert.equal(
-    calls.some((args) => args[0] === "tab" && args[1] === "focus"),
-    false,
-  );
+  assertNoPaneGeometryOrFocusMutations(calls);
   assert.equal(herdr.currentFocus, "w1:p1");
   assert.deepEqual(herdr.focusCalls, []);
 });
@@ -588,8 +595,9 @@ test("controller reclaims a board on the same workspace without duplicates", asy
   );
 });
 
-test("controller reuses and moves a discovered board to the far right", async () => {
+test("ensure reuses a non-rightmost board without changing nested geometry or focus", async () => {
   const calls: string[][] = [];
+  let herdr!: FocusTrackingHerdrClient;
   const runner: CliRunner = {
     async run(_command, args) {
       calls.push([...args]);
@@ -598,9 +606,9 @@ test("controller reuses and moves a discovered board to the far right", async ()
           code: 0,
           stderr: "",
           stdout: layout([
-            { pane_id: "w1:p2", x: 0, width: 20 },
-            { pane_id: "w1:p1", x: 20, width: 60 },
-            { pane_id: "w1:p3", x: 80, width: 20 },
+            { pane_id: "w1:p1", x: 0, width: 37 },
+            { pane_id: "w1:p2", x: 37, width: 18 },
+            { pane_id: "w1:p3", x: 55, width: 65 },
           ]),
         };
       if (args[0] === "pane" && args[1] === "process-info")
@@ -623,10 +631,9 @@ test("controller reuses and moves a discovered board to the far right", async ()
       return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
     },
   };
-  const controller = new FirstMateTodoPaneController(
-    new HerdrClient(runner),
-    await runtimeStore(),
-  );
+  herdr = new FocusTrackingHerdrClient(runner, "w1:p3");
+  const runtime = await runtimeStore();
+  const controller = new FirstMateTodoPaneController(herdr, runtime);
 
   const result = await controller.ensure({
     workspaceId: "w1",
@@ -640,34 +647,17 @@ test("controller reuses and moves a discovered board to the far right", async ()
     created: false,
     restarted: false,
   });
-  assert.ok(
-    calls.some(
-      (args) =>
-        args.join(" ") === "pane swap --source-pane w1:p2 --target-pane w1:p3",
-    ),
-  );
-  assert.equal(
-    calls.some(
-      (args) =>
-        (args[0] === "pane" && args[1] === "focus") ||
-        (args[0] === "tab" && args[1] === "focus") ||
-        (args[0] === "workspace" && args[1] === "focus"),
-    ),
-    false,
-  );
+  assert.equal((await runtime.read()).paneId, "w1:p2");
+  assertNoPaneGeometryOrFocusMutations(calls);
+  assert.equal(herdr.currentFocus, "w1:p3");
+  assert.deepEqual(herdr.focusCalls, []);
 });
 
-test("controller restarts the pane after the board process exits", async () => {
+test("fresh controller after process restart leaves non-rightmost geometry and focus untouched", async () => {
   const calls: string[][] = [];
+  let processExited = false;
+  let herdr!: FocusTrackingHerdrClient;
   const runtime = await runtimeStore();
-  await runtime.write({
-    version: 1,
-    paneId: "w1:p2",
-    parentPaneId: "w1:p1",
-    tabId: "w1:t1",
-    workspaceId: "w1",
-    startedAt: 1,
-  });
   const runner: CliRunner = {
     async run(_command, args) {
       calls.push([...args]);
@@ -678,8 +668,9 @@ test("controller restarts the pane after the board process exits", async () => {
           code: 0,
           stderr: "",
           stdout: layout([
-            { pane_id: "w1:p1", x: 0, width: 78 },
-            { pane_id: "w1:p2", x: 78, width: 22 },
+            { pane_id: "w1:p1", x: 0, width: 24 },
+            { pane_id: "w1:p2", x: 24, width: 51 },
+            { pane_id: "w1:p3", x: 75, width: 45 },
           ]),
         };
       if (args[0] === "pane" && args[1] === "process-info")
@@ -689,8 +680,15 @@ test("controller restarts the pane after the board process exits", async () => {
           stdout: JSON.stringify({
             result: {
               process_info: {
-                pane_id: "w1:p2",
-                foreground_processes: [{ cmdline: "bash" }],
+                pane_id: args.at(-1),
+                foreground_processes: [
+                  {
+                    cmdline:
+                      args.at(-1) === "w1:p2" && !processExited
+                        ? boardProcess()
+                        : "bash",
+                  },
+                ],
               },
             },
           }),
@@ -698,45 +696,56 @@ test("controller restarts the pane after the board process exits", async () => {
       return { code: 0, stderr: "", stdout: JSON.stringify({ result: {} }) };
     },
   };
-  const controller = new FirstMateTodoPaneController(
-    new HerdrClient(runner),
-    runtime,
-  );
-
-  const result = await controller.ensure({
+  herdr = new FocusTrackingHerdrClient(runner, "w1:p3");
+  const controller = new FirstMateTodoPaneController(herdr, runtime);
+  const location = {
     workspaceId: "w1",
     tabId: "w1:t1",
     paneId: "w1:p1",
     cwd: "/repo",
-  });
+  };
 
-  assert.deepEqual(result, {
+  assert.deepEqual(await controller.ensure(location), {
+    paneId: "w1:p2",
+    created: false,
+    restarted: false,
+  });
+  processExited = true;
+  const freshController = new FirstMateTodoPaneController(herdr, runtime);
+  assert.deepEqual(await freshController.ensure(location), {
     paneId: "w1:p2",
     created: false,
     restarted: true,
   });
-  assert.ok(
-    calls.some(
+  assert.equal(
+    calls.filter(
       (args) => args[0] === "pane" && args[1] === "run" && args[2] === "w1:p2",
-    ),
+    ).length,
+    1,
   );
   assert.equal(
     calls.some((args) => args[0] === "pane" && args[1] === "split"),
     false,
   );
+  assertNoPaneGeometryOrFocusMutations(calls);
+  assert.equal(herdr.currentFocus, "w1:p3");
+  assert.deepEqual(herdr.focusCalls, []);
 });
 
-test("repeated task-assignment-like reconciliation never focuses the board", async () => {
+test("repeated reconciliation leaves unequal nested geometry and focus untouched", async () => {
+  const calls: string[][] = [];
   let herdr!: FocusTrackingHerdrClient;
   const runner: CliRunner = {
     async run(_command, args) {
+      calls.push([...args]);
       if (args[0] === "pane" && args[1] === "layout")
         return {
           code: 0,
           stderr: "",
           stdout: layout([
-            { pane_id: "w1:p1", x: 0, width: 80 },
-            { pane_id: "w1:p2", x: 80, width: 20 },
+            { pane_id: "w1:p1", x: 0, width: 65 },
+            { pane_id: "w1:p2", x: 65, width: 10 },
+            { pane_id: "w1:p3", x: 75, width: 45 },
           ]),
         };
       if (args[0] === "pane" && args[1] === "process-info") {
@@ -746,8 +755,12 @@ test("repeated task-assignment-like reconciliation never focuses the board", asy
           stdout: JSON.stringify({
             result: {
               process_info: {
-                pane_id: "w1:p2",
-                foreground_processes: [{ cmdline: boardProcess() }],
+                pane_id: args.at(-1),
+                foreground_processes: [
+                  {
+                    cmdline: args.at(-1) === "w1:p2" ? boardProcess() : "bash",
+                  },
+                ],
               },
             },
           }),
@@ -772,12 +785,12 @@ test("repeated task-assignment-like reconciliation never focuses the board", asy
     await controller.ensure(location);
     assert.equal(herdr.currentFocus, "w1:p1");
   }
+  assertNoPaneGeometryOrFocusMutations(calls);
   assert.deepEqual(herdr.focusCalls, []);
 });
 
-test("reload restart preserves manual width and intentional focus", async () => {
+test("reload restart leaves a non-rightmost board and intentional focus untouched", async () => {
   const calls: string[][] = [];
-  const boardWidth = 50;
   let stopped = false;
   let herdr!: FocusTrackingHerdrClient;
   const runner: CliRunner = {
@@ -788,8 +801,9 @@ test("reload restart preserves manual width and intentional focus", async () => 
           code: 0,
           stderr: "",
           stdout: layout([
-            { pane_id: "w1:p1", x: 0, width: 100 - boardWidth },
-            { pane_id: "w1:p2", x: 100 - boardWidth, width: boardWidth },
+            { pane_id: "w1:p2", x: 0, width: 43 },
+            { pane_id: "w1:p1", x: 43, width: 31 },
+            { pane_id: "w1:p3", x: 74, width: 46 },
           ]),
         };
       if (args[0] === "pane" && args[1] === "process-info")
@@ -799,9 +813,16 @@ test("reload restart preserves manual width and intentional focus", async () => 
           stdout: JSON.stringify({
             result: {
               process_info: {
-                pane_id: "w1:p2",
+                pane_id: args.at(-1),
                 foreground_processes: [
-                  { cmdline: stopped ? "bash" : boardProcess("older-source") },
+                  {
+                    cmdline:
+                      args.at(-1) === "w1:p2"
+                        ? stopped
+                          ? "bash"
+                          : boardProcess("older-source")
+                        : "bash",
+                  },
                 ],
               },
             },
@@ -812,10 +833,8 @@ test("reload restart preserves manual width and intentional focus", async () => 
     },
   };
   herdr = new FocusTrackingHerdrClient(runner, "w1:p2");
-  const controller = new FirstMateTodoPaneController(
-    herdr,
-    await runtimeStore(),
-  );
+  const runtime = await runtimeStore();
+  const controller = new FirstMateTodoPaneController(herdr, runtime);
 
   const result = await controller.ensure({
     workspaceId: "w1",
@@ -829,11 +848,8 @@ test("reload restart preserves manual width and intentional focus", async () => 
     created: false,
     restarted: true,
   });
-  assert.equal(boardWidth, 50);
-  assert.equal(
-    calls.some((args) => args[0] === "pane" && args[1] === "resize"),
-    false,
-  );
+  assert.equal((await runtime.read()).paneId, "w1:p2");
+  assertNoPaneGeometryOrFocusMutations(calls);
   assert.equal(herdr.currentFocus, "w1:p2");
   assert.deepEqual(herdr.focusCalls, []);
 });
