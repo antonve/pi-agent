@@ -233,6 +233,44 @@ test("slash-command firstmate claim makes later turns explicitly supervisory", a
             },
           }),
         };
+      if (args[0] === "pane" && args[1] === "layout")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              layout: {
+                workspace_id: "w-owner",
+                tab_id: "w-owner:t1",
+                panes: [
+                  {
+                    pane_id: "w-owner:p1",
+                    focused: true,
+                    rect: { x: 0, y: 0, width: 100, height: 20 },
+                  },
+                ],
+              },
+            },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "list")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              panes: [
+                {
+                  workspace_id: "w-owner",
+                  tab_id: "w-owner:t1",
+                  pane_id: "w-owner:p1",
+                  label: "",
+                  focused: true,
+                },
+              ],
+            },
+          }),
+        };
       return {
         code: 0,
         stderr: "",
@@ -398,6 +436,44 @@ test("tool first_mate_claim renames and reorders the claimed workspace", async (
           stdout: JSON.stringify({
             result: {
               workspace: { workspace_id: "w-owner", focused: true },
+            },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "layout")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              layout: {
+                workspace_id: "w-owner",
+                tab_id: "w-owner:t1",
+                panes: [
+                  {
+                    pane_id: "w-owner:p1",
+                    focused: true,
+                    rect: { x: 0, y: 0, width: 100, height: 20 },
+                  },
+                ],
+              },
+            },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "list")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              panes: [
+                {
+                  workspace_id: "w-owner",
+                  tab_id: "w-owner:t1",
+                  pane_id: "w-owner:p1",
+                  label: "",
+                  focused: true,
+                },
+              ],
             },
           }),
         };
