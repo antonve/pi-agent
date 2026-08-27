@@ -154,6 +154,7 @@ function buildLinearSyncPrompt(task: FleetTask) {
 
 Linear synchronization:
 - This task is linked to Linear issue ${task.linearIssue}.
+- Treat these as generic synchronization defaults that defer to task-specific constraints.
 - Before planning, read the issue with linear_get_issue.
 - When work begins, move the issue to the team’s started workflow state.
 - Preserve the issue description and any human-authored content.
@@ -162,7 +163,10 @@ Linear synchronization:
 - Add concise material decisions, blockers, and outcome context to that same managed comment.
 - Prefer linear_get_issue, linear_list_resources, linear_update_issue, and linear_add_comment; use linear_graphql only as the fallback for editing the managed comment.
 - Leave blocked or failed work open with an explanatory update.
-- Move the issue to completed only after verified success and immediately before complete_task.`;
+- Keep ${task.linearIssue} non-terminal by default.
+- Task completion, worker completion, verified success, and complete_task do not authorize a terminal Linear transition and must not cause an instruction to set the issue to Done or completed.
+- Move ${task.linearIssue} to a terminal workflow state only when the captain explicitly authorizes both this exact issue (${task.linearIssue}) and the specific terminal workflow state.
+- Authorization for a different or unspecified issue, or for a different or unspecified transition, does not qualify. Without exact authorization, leave ${task.linearIssue} non-terminal and record the verified outcome in the managed comment.`;
 }
 
 export function buildSecondMatePrompt(task: FleetTask) {
