@@ -277,7 +277,64 @@ test("second-mate prompts make Linear synchronization explicit", () => {
   assert.match(prompt, /use linear_graphql to edit that same comment/);
   assert.match(
     prompt,
+    /generic synchronization defaults that defer to task-specific constraints/,
+  );
+});
+
+test("linked Linear task completion does not authorize a terminal issue transition", () => {
+  const prompt = buildSecondMatePrompt({
+    id: "pi-agent-linear-complete",
+    title: "Complete implementation without closing Linear",
+    brief: "Implement and verify the requested change.",
+    linearIssue: "ENG-123",
+    cwd: "/repo",
+    state: "assigned",
+    ownerSessionId: "first-mate-session",
+    createdAt: 0,
+    updatedAt: 0,
+    version: 1,
+    nextSequence: 1,
+  });
+  assert.match(prompt, /Keep ENG-123 non-terminal by default/);
+  assert.match(
+    prompt,
+    /Task completion, worker completion, verified success, and complete_task do not authorize a terminal Linear transition/,
+  );
+  assert.match(
+    prompt,
+    /must not cause an instruction to set the issue to Done or completed/,
+  );
+  assert.doesNotMatch(
+    prompt,
     /Move the issue to completed only after verified success/,
+  );
+});
+
+test("linked Linear terminal transitions require exact captain authorization", () => {
+  const prompt = buildSecondMatePrompt({
+    id: "pi-agent-linear-authority",
+    title: "Require exact terminal authority",
+    brief: "Synchronize the linked issue while completing the task.",
+    linearIssue: "ENG-456",
+    cwd: "/repo",
+    state: "assigned",
+    ownerSessionId: "first-mate-session",
+    createdAt: 0,
+    updatedAt: 0,
+    version: 1,
+    nextSequence: 1,
+  });
+  assert.match(
+    prompt,
+    /only when the captain explicitly authorizes both this exact issue \(ENG-456\) and the specific terminal workflow state/,
+  );
+  assert.match(
+    prompt,
+    /Authorization for a different or unspecified issue, or for a different or unspecified transition, does not qualify/,
+  );
+  assert.match(
+    prompt,
+    /Without exact authorization, leave ENG-456 non-terminal/,
   );
 });
 
