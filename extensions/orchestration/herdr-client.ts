@@ -75,9 +75,23 @@ export class HerdrCommandError extends Error {
   }
 }
 
-class HerdrSocketConnectionError extends Error {
+export class HerdrPromptAcknowledgementError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "HerdrPromptAcknowledgementError";
+  }
+}
+
+class HerdrTransportError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "HerdrTransportError";
+  }
+}
+
+class HerdrSocketConnectionError extends HerdrTransportError {
   constructor(socketPath: string, cause: unknown) {
-    super(`Could not connect to the Herdr socket at ${socketPath}.`, { cause });
+    super(`Could not connect to the Herdr socket at ${socketPath}.`, cause);
     this.name = "HerdrSocketConnectionError";
   }
 }
@@ -310,7 +324,9 @@ export class HerdrClient {
       };
       const timeout = setTimeout(() => {
         complete(
-          new Error(`Timed out waiting for Herdr socket API ${method}.`),
+          new HerdrTransportError(
+            `Timed out waiting for Herdr socket API ${method}.`,
+          ),
         );
       }, timeoutMs);
       const abort = () => complete(signal?.reason ?? new Error("cancelled"));
@@ -322,7 +338,12 @@ export class HerdrClient {
       if (signal?.aborted) return abort();
       socket.on("error", (error) =>
         complete(
-          connected ? error : new HerdrSocketConnectionError(socketPath, error),
+          connected
+            ? new HerdrTransportError(
+                `Herdr socket API ${method} connection failed.`,
+                error,
+              )
+            : new HerdrSocketConnectionError(socketPath, error),
         ),
       );
       socket.on("connect", () => {
@@ -346,7 +367,12 @@ export class HerdrClient {
               `Herdr socket API ${method}`,
             ) as typeof value;
           } catch (error) {
-            return complete(error);
+            return complete(
+              new HerdrTransportError(
+                `Herdr socket API ${method} returned an invalid JSON response.`,
+                error,
+              ),
+            );
           }
           if (value.id !== requestId) continue;
           if (value.error)
@@ -358,7 +384,9 @@ export class HerdrClient {
             );
           if (value.result === undefined)
             return complete(
-              new Error(`Herdr socket API ${method} returned no result.`),
+              new HerdrTransportError(
+                `Herdr socket API ${method} returned no result.`,
+              ),
             );
           return complete(undefined, value.result);
         }
@@ -526,7 +554,12 @@ export class HerdrClient {
         stdout: JSON.stringify({ result }),
       };
     } catch (error) {
-      const code = error instanceof HerdrCommandError ? error.code : undefined;
+      const code =
+        error instanceof HerdrCommandError
+          ? error.code
+          : error instanceof HerdrTransportError
+            ? "herdr_transport"
+            : undefined;
       return {
         code: 1,
         stdout: "",
@@ -1279,8 +1312,9 @@ export class HerdrClient {
     }
     const detail =
       lastError instanceof Error ? lastError.message : String(lastError);
-    throw new Error(
+    throw new HerdrPromptAcknowledgementError(
       `Initial prompt delivery to ${options.harness} agent ${options.name} in pane ${options.paneId} was not acknowledged after ${this.timing.promptDeliveryAttempts} attempts: ${detail}`,
+      lastError,
     );
   }
 

@@ -507,7 +507,16 @@ function generatedItemsForTask(
       automaticHistoryItems.push(
         historyItem(candidate, "acknowledged", acknowledgement.createdAt),
       );
-    else if (task.state === "failed") addActive(candidate);
+    else if (
+      task.state === "failed" &&
+      task.failureReason !== undefined &&
+      (!failed || failed.fromSessionId === "pi-first-mate-janitor")
+    ) {
+      generatedCandidates.push(candidate);
+      automaticHistoryItems.push(
+        historyItem(candidate, "suppressed", task.updatedAt),
+      );
+    } else if (task.state === "failed") addActive(candidate);
     else if (failed)
       automaticHistoryItems.push(
         historyItem(

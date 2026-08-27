@@ -50,6 +50,7 @@ export type TodoHistoryStatus =
   | "done"
   | "dismissed"
   | "acknowledged"
+  | "suppressed"
   | "completed"
   | "resolved"
   | "closed"
@@ -263,6 +264,7 @@ function normalizeHistoryItem(value: unknown): TodoHistoryItem | undefined {
     "done",
     "dismissed",
     "acknowledged",
+    "suppressed",
     "completed",
     "resolved",
     "closed",
