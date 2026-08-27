@@ -8,9 +8,14 @@ import {
   type FleetMessageType,
   FleetStore,
   type FleetTask,
+  type FleetTaskFailureReason,
   type FleetTaskState,
 } from "./fleet.ts";
-import { HerdrClient } from "./herdr-client.ts";
+import {
+  HerdrClient,
+  HerdrCommandError,
+  HerdrPromptAcknowledgementError,
+} from "./herdr-client.ts";
 import type { OrchestrationManager } from "./manager.ts";
 import { resolveSecondMatePolicy } from "../shared/model-policy.ts";
 
@@ -22,6 +27,42 @@ const TERMINAL_STATES = new Set<FleetTaskState>([
   "failed",
   "cancelled",
 ]);
+const PANE_DISAPPEARANCE_CODES = new Set([
+  "pane_not_found",
+  "pane_unavailable",
+  "tab_not_found",
+  "workspace_not_found",
+  "agent_pane_unavailable",
+]);
+const PROMPT_ACKNOWLEDGEMENT_CODES = new Set([
+  "agent_not_found",
+  "agent_not_ready",
+  "agent_not_running",
+  "agent_pane_busy",
+  "agent_launch_pending",
+  "agent_prompt_stalled",
+]);
+
+class MateCommunicationError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = "MateCommunicationError";
+  }
+}
+
+function assignmentFailureReason(
+  error: unknown,
+): FleetTaskFailureReason | undefined {
+  if (error instanceof MateCommunicationError) return "mate-communication";
+  if (error instanceof HerdrPromptAcknowledgementError)
+    return "prompt-unacknowledged";
+  if (!(error instanceof HerdrCommandError) || !error.code) return undefined;
+  if (error.code === "herdr_transport") return "herdr-transport";
+  if (PANE_DISAPPEARANCE_CODES.has(error.code)) return "pane-disappeared";
+  if (PROMPT_ACKNOWLEDGEMENT_CODES.has(error.code))
+    return "prompt-unacknowledged";
+  return undefined;
+}
 
 export const TASK_WORKSPACE_CLOSE_MS = 30_000;
 export const FIRST_MATE_HEARTBEAT_STALE_MS = 15_000;
@@ -282,18 +323,26 @@ export class FleetManager {
         mateAgentName: agentName,
       });
       await this.publishMetadata(task);
-      const assignment = await this.store.enqueue({
-        taskId: task.id,
-        type: "TASK_ASSIGNED",
-        fromSessionId: options.ownerSessionId,
-        toTaskMate: true,
-        payload: {
-          title: task.title,
-          brief: task.brief,
-          linearIssue: task.linearIssue,
-          cwd: task.cwd,
-        },
-      });
+      let assignment: FleetMessage;
+      try {
+        assignment = await this.store.enqueue({
+          taskId: task.id,
+          type: "TASK_ASSIGNED",
+          fromSessionId: options.ownerSessionId,
+          toTaskMate: true,
+          payload: {
+            title: task.title,
+            brief: task.brief,
+            linearIssue: task.linearIssue,
+            cwd: task.cwd,
+          },
+        });
+      } catch (error) {
+        throw new MateCommunicationError(
+          `Could not create the assignment control envelope for ${task.id}.`,
+          error,
+        );
+      }
       const args = [
         "--session-id",
         randomUUID(),
@@ -324,6 +373,7 @@ export class FleetManager {
       task = await this.store.updateTask(task.id, {
         state: "failed",
         error: error instanceof Error ? error.message : String(error),
+        failureReason: assignmentFailureReason(error),
       });
       if (workspaceId)
         await this.herdr.closeWorkspace(workspaceId).catch(() => undefined);
@@ -514,6 +564,7 @@ export class FleetManager {
               : "active";
     const updated = await this.store.updateTask(task.id, {
       state,
+      failureReason: undefined,
       ...(TERMINAL_STATES.has(state)
         ? { cleanupAt: Date.now() + TASK_WORKSPACE_CLOSE_MS }
         : {}),

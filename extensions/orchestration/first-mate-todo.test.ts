@@ -546,6 +546,98 @@ test("the queue omits terminal outcomes but keeps unresolved failures and remote
   );
 });
 
+test("typed orchestration failures leave Active for History without hiding task failures", () => {
+  const reasons = [
+    "pane-disappeared",
+    "herdr-transport",
+    "prompt-unacknowledged",
+    "mate-communication",
+  ] as const;
+  const noisy = reasons.map((failureReason, index) => ({
+    ...task("failed", `TASK-NOISE-${index}`),
+    error: `Orchestration failure ${failureReason}`,
+    failureReason,
+  }));
+  const actionable = {
+    ...task("failed", "TASK-ACTIONABLE"),
+    error: "Unit tests failed in the product code",
+  };
+  const mateReported = {
+    ...task("failed", "TASK-MATE-REPORTED"),
+    error: "Stale assignment error",
+    failureReason: "herdr-transport" as const,
+  };
+  const boardState: TodoBoardState = {
+    version: 1,
+    manualItems: [],
+    resolutions: {},
+    pullRequests: {},
+    historyItems: [],
+  };
+  const janitorFailure = {
+    ...message(noisy[0]!.id, "TASK_FAILED", 1, {
+      reason: "Second-mate Herdr pane disappeared",
+    }),
+    fromSessionId: "pi-first-mate-janitor",
+  };
+  const messagesByTask = new Map([
+    [noisy[0]!.id, [janitorFailure]],
+    [
+      mateReported.id,
+      [
+        message(mateReported.id, "TASK_FAILED", 1, {
+          error: "Product migration is blocked",
+        }),
+      ],
+    ],
+  ]);
+  const derived = buildTodoBoardView({
+    boardState,
+    tasks: [...noisy, actionable, mateReported],
+    messagesByTask,
+  });
+
+  assert.deepEqual(
+    derived.items
+      .filter((item) => item.kind === "failure")
+      .map((item) => item.taskId)
+      .sort(),
+    [actionable.id, mateReported.id].sort(),
+  );
+  assert.equal(
+    derived.items.find((item) => item.taskId === mateReported.id)?.detail,
+    "Product migration is blocked",
+  );
+  assert.deepEqual(
+    derived.automaticHistoryItems
+      ?.filter((item) => item.status === "suppressed")
+      .map((item) => item.taskId)
+      .sort(),
+    noisy.map((item) => item.id).sort(),
+  );
+
+  const reconciled = reconcileTodoBoardState(boardState, derived);
+  const restarted = buildTodoBoardView({
+    boardState: reconciled,
+    tasks: [...noisy, actionable, mateReported],
+    messagesByTask,
+  });
+  assert.deepEqual(
+    restarted.historyItems
+      ?.filter((item) => item.historyStatus === "suppressed")
+      .map((item) => item.taskId)
+      .sort(),
+    noisy.map((item) => item.id).sort(),
+  );
+  assert.ok(
+    restarted.historyItems?.every(
+      (item) =>
+        item.historyStatus !== "suppressed" ||
+        item.detail?.includes("Orchestration failure") === true,
+    ),
+  );
+});
+
 test("unknown PR state is tracked for refresh without advertising an action", () => {
   const prUrl = "https://github.com/antonve/pi-agent/pull/124";
   const completed = task("completed", "TASK-PR");
@@ -1009,17 +1101,18 @@ test("rendering stays within width and input flow supports add/edit/snooze", () 
   assert.ok(lines.some((line) => line.includes("Very long manual")));
 });
 
-test("long generated and manual items wrap with Unicode display widths and aligned continuations", () => {
-  const generatedTitle =
-    "Generated review 界🙂 with Unicode and a final generated word";
-  const manualTitle =
-    "Manual follow-up é with a long unbroken-token-abcdefghijklmnop";
+test("only the selected item expands while unfocused text stays compact", () => {
+  const generatedDetail =
+    "Generated detail 界🙂 keeps every word when selected, including the final generated explanation that must remain visible in full.";
+  const manualDetail =
+    "Manual detail é is intentionally a whole paragraph that continues beyond one hundred characters and ends with the unmistakable final manual explanation.";
   const view: TodoBoardView = {
     items: [
       {
         id: "generated:1",
-        kind: "review",
-        title: generatedTitle,
+        kind: "risk",
+        title: "Generated review with a concise title",
+        detail: generatedDetail,
         source: "generated",
         createdAt: 1,
         updatedAt: 1,
@@ -1027,7 +1120,8 @@ test("long generated and manual items wrap with Unicode display widths and align
       {
         id: "manual:1",
         kind: "manual",
-        title: manualTitle,
+        title: "Manual follow-up with a concise title",
+        detail: manualDetail,
         source: "manual",
         createdAt: 2,
         updatedAt: 2,
@@ -1039,40 +1133,54 @@ test("long generated and manual items wrap with Unicode display widths and align
     hiddenCount: 0,
     trackedPrUrls: [],
   };
-  const lines = renderTodoPane(
+  const itemRows = (lines: string[], heading: string) => {
+    const plain = lines.map(stripTerminalSequences);
+    const start = plain.indexOf(heading) + 1;
+    return plain.slice(start, plain.indexOf("", start));
+  };
+
+  const generatedSelected = renderTodoPane(
     view,
     { showHelp: false, selectedId: "generated:1" },
-    16,
-    30,
+    24,
+    40,
   );
-  const plain = lines.map(stripTerminalSequences);
-  const wrappedItem = (heading: string) => {
-    const start = plain.indexOf(heading) + 1;
-    const end = plain.indexOf("", start);
-    return plain.slice(start, end);
-  };
-  const generated = wrappedItem("Generated");
-  const manual = wrappedItem("Manual");
+  const expandedGenerated = itemRows(generatedSelected, "Generated");
+  const compactManual = itemRows(generatedSelected, "Manual");
+  assert.ok(
+    expandedGenerated
+      .join(" ")
+      .replace(/\s+/gu, " ")
+      .includes("remain visible in full"),
+  );
+  assert.ok(compactManual.length <= 3);
+  assert.equal(
+    compactManual.join(" ").includes("final manual explanation"),
+    false,
+  );
+  assert.ok(compactManual.at(-1)?.endsWith("…"));
 
-  assert.ok(lines.every((line) => visibleWidth(line) <= 16));
-  assert.ok(generated.length > 1);
-  assert.ok(manual.length > 1);
+  const moved = handleTodoKey(
+    view,
+    { showHelp: false, selectedId: "generated:1" },
+    "j",
+  ).state;
+  assert.equal(moved.selectedId, "manual:1");
+  const manualSelected = renderTodoPane(view, moved, 24, 40);
+  const compactGenerated = itemRows(manualSelected, "Generated");
+  const expandedManual = itemRows(manualSelected, "Manual");
+  assert.ok(compactGenerated.length <= 3);
   assert.equal(
-    generated
-      .map((line) => line.slice(5))
-      .join("")
-      .replace(/\s/gu, ""),
-    generatedTitle.replace(/\s/gu, ""),
+    compactGenerated.join(" ").includes("remain visible in full"),
+    false,
   );
-  assert.equal(
-    manual
-      .map((line) => line.slice(5))
-      .join("")
-      .replace(/\s/gu, ""),
-    manualTitle.replace(/\s/gu, ""),
+  assert.ok(
+    expandedManual
+      .join(" ")
+      .replace(/\s+/gu, " ")
+      .includes("final manual explanation"),
   );
-  assert.ok(generated.slice(1).every((line) => /^ {5}\S/u.test(line)));
-  assert.ok(manual.slice(1).every((line) => /^ {5}\S/u.test(line)));
+  assert.ok(manualSelected.every((line) => visibleWidth(line) <= 24));
 });
 
 test("PR review URLs render in full directly beneath their item and wrap safely", () => {
@@ -1083,12 +1191,21 @@ test("PR review URLs render in full directly beneath their item and wrap safely"
       {
         id: "review:remote",
         kind: "review",
-        title: "Review the remote-safe pull request",
-        detail: "open · review_required",
+        title:
+          "Review the remote-safe pull request with enough descriptive text to compact when it is not selected",
+        detail: "open · review_required · preserve the separate URL field",
         source: "generated",
         prUrl,
         createdAt: 1,
         updatedAt: 1,
+      },
+      {
+        id: "manual:selected",
+        kind: "manual",
+        title: "Selected manual item",
+        source: "manual",
+        createdAt: 2,
+        updatedAt: 2,
       },
     ],
     historyItems: [
@@ -1103,7 +1220,7 @@ test("PR review URLs render in full directly beneath their item and wrap safely"
       },
     ],
     generatedCount: 1,
-    manualCount: 0,
+    manualCount: 1,
     snoozedCount: 0,
     hiddenCount: 0,
     trackedPrUrls: [prUrl],
@@ -1111,7 +1228,11 @@ test("PR review URLs render in full directly beneath their item and wrap safely"
   const renderedItemRows = (showHistory: boolean) => {
     const lines = renderTodoPane(
       view,
-      { showHelp: false, showHistory },
+      {
+        showHelp: false,
+        showHistory,
+        selectedId: showHistory ? undefined : "manual:selected",
+      },
       24,
       40,
     );

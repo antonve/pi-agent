@@ -389,18 +389,66 @@ function wrapWithPrefix(
   );
 }
 
+export const TODO_COMPACT_CHARACTER_LIMIT = 100;
+export const TODO_COMPACT_LINE_LIMIT = 3;
+
+function truncateCharacters(text: string, limit: number) {
+  const characters = Array.from(text);
+  if (characters.length <= limit) return { text, truncated: false };
+  if (limit <= 0) return { text: "", truncated: true };
+  return {
+    text: characters
+      .slice(0, Math.max(0, limit - 1))
+      .join("")
+      .trimEnd(),
+    truncated: true,
+  };
+}
+
+function compactItemText(item: TodoItem) {
+  const title = sanitizeTodoText(item.title);
+  const detail = item.detail ? sanitizeTodoText(item.detail) : undefined;
+  const compactTitle = truncateCharacters(title, TODO_COMPACT_CHARACTER_LIMIT);
+  const remaining = Math.max(
+    0,
+    TODO_COMPACT_CHARACTER_LIMIT - Array.from(compactTitle.text).length - 1,
+  );
+  const compactDetail = detail
+    ? truncateCharacters(detail, remaining)
+    : undefined;
+  return {
+    title: compactTitle.text,
+    detail: compactDetail?.text || undefined,
+    truncated:
+      compactTitle.truncated ||
+      compactDetail?.truncated === true ||
+      (detail !== undefined && compactDetail?.text.length === 0),
+  };
+}
+
+function appendEllipsis(line: string, width: number) {
+  return truncateToWidth(`${line}${ansi.dim("…")}`, width, "…");
+}
+
 function renderItem(item: TodoItem, selected: boolean, width: number) {
   const marker = selected ? ansi.inverse(">") : " ";
   const titlePrefix = `${marker} ${ansi.bold(kindTag(item))} `;
-  const lines = wrapWithPrefix(
-    titlePrefix,
-    sanitizeTodoText(item.title),
-    width,
-  );
-  if (item.detail)
-    lines.push(
-      ...wrapWithPrefix("  ", sanitizeTodoText(item.detail), width, ansi.dim),
-    );
+  const text = selected
+    ? {
+        title: sanitizeTodoText(item.title),
+        detail: item.detail ? sanitizeTodoText(item.detail) : undefined,
+        truncated: false,
+      }
+    : compactItemText(item);
+  let lines = wrapWithPrefix(titlePrefix, text.title, width);
+  if (text.detail)
+    lines.push(...wrapWithPrefix("  ", text.detail, width, ansi.dim));
+  if (!selected) {
+    const overflowed = lines.length > TODO_COMPACT_LINE_LIMIT;
+    lines = lines.slice(0, TODO_COMPACT_LINE_LIMIT);
+    if ((text.truncated || overflowed) && lines.length > 0)
+      lines[lines.length - 1] = appendEllipsis(lines[lines.length - 1]!, width);
+  }
   if (item.kind === "review" && item.prUrl)
     lines.push(...wrapWithPrefix("  ", sanitizeTodoText(item.prUrl), width));
   return lines;

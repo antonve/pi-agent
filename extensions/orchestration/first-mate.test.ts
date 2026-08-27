@@ -1046,6 +1046,10 @@ test("task assignment failure closes the workspace without guessing focus", asyn
       /Initial prompt delivery/,
     );
     assert.equal(
+      (await fleet.store.getTask("TASK-FAIL"))?.failureReason,
+      "prompt-unacknowledged",
+    );
+    assert.equal(
       calls.some(
         (args) =>
           args[0] === "workspace" &&

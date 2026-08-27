@@ -54,6 +54,12 @@ export interface FirstMateLease {
   lostAt?: number;
 }
 
+export type FleetTaskFailureReason =
+  | "pane-disappeared"
+  | "herdr-transport"
+  | "prompt-unacknowledged"
+  | "mate-communication";
+
 export interface FleetTask {
   id: string;
   title: string;
@@ -77,6 +83,7 @@ export interface FleetTask {
   workspaceClosedAt?: number;
   pinned?: boolean;
   error?: string;
+  failureReason?: FleetTaskFailureReason;
 }
 
 export interface FleetMessage {

@@ -149,6 +149,7 @@ for (const original of await fleet.listTasks()) {
       task = await fleet.updateTask(task.id, {
         state: "failed",
         error: reason,
+        failureReason: "pane-disappeared",
         cleanupAt: now + AUTO_CLOSE_MS,
       });
       await interruptTaskResources(task.id, reason);
@@ -168,12 +169,14 @@ for (const original of await fleet.listTasks()) {
     continue;
 
   const messages = await fleet.messagesForTask(task.id);
-  const terminalMessage = [...messages].reverse().find(
-    (message) =>
-      message.type === "TASK_COMPLETED" ||
-      message.type === "TASK_FAILED" ||
-      message.type === "CANCEL",
-  );
+  const terminalMessage = [...messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.type === "TASK_COMPLETED" ||
+        message.type === "TASK_FAILED" ||
+        message.type === "CANCEL",
+    );
   const acknowledged = terminalMessage?.acknowledgedAt !== undefined;
   const forceCloseDue = now - task.cleanupAt >= 5 * 60_000;
   if (!acknowledged && !forceCloseDue) continue;
