@@ -389,7 +389,7 @@ function wrapWithPrefix(
   );
 }
 
-export const TODO_COMPACT_CHARACTER_LIMIT = 100;
+export const TODO_COMPACT_CHARACTER_LIMIT = 300;
 export const TODO_COMPACT_LINE_LIMIT = 3;
 
 function truncateCharacters(text: string, limit: number) {

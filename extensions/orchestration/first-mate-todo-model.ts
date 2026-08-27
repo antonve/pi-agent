@@ -10,7 +10,9 @@ import type {
 } from "./first-mate-todo-state.ts";
 
 const GITHUB_PULL_URL =
-  /https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?:\b|\/)/g;
+  /https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?:\b|\/)/gi;
+const GITHUB_PULL_URL_IDENTITY =
+  /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?:\b|\/)/i;
 const ESCALATION_ACKNOWLEDGEMENT_TYPES = new Set<FleetMessage["type"]>([
   "DECISION_RESPONSE",
   "SCOPE_UPDATE",
@@ -32,6 +34,7 @@ export interface TodoItem {
   paneId?: string;
   prUrl?: string;
   prSnapshot?: PullRequestSnapshot;
+  resolutionIds?: string[];
   historyStatus?: TodoHistoryStatus;
   createdAt: number;
   updatedAt: number;
@@ -244,11 +247,28 @@ function baseTaskItem(task: FleetTask, item: TodoItem, focusable: boolean) {
   };
 }
 
+function pullRequestSnapshot(
+  url: string,
+  pullRequests: Record<string, PullRequestSnapshot>,
+) {
+  const statePriority = { open: 0, closed: 1, merged: 2 } as const;
+  return Object.entries(pullRequests).reduce<PullRequestSnapshot | undefined>(
+    (latest, [candidateUrl, snapshot]) => {
+      if (canonicalGitHubPullRequestUrl(candidateUrl) !== url) return latest;
+      if (!latest || snapshot.fetchedAt > latest.fetchedAt) return snapshot;
+      if (snapshot.fetchedAt < latest.fetchedAt) return latest;
+      return statePriority[snapshot.state] > statePriority[latest.state]
+        ? snapshot
+        : latest;
+    },
+    undefined,
+  );
+}
+
 function reviewItems(
   task: FleetTask,
   completion: FleetMessage | undefined,
   pullRequests: Record<string, PullRequestSnapshot>,
-  resolutions: Record<string, TodoResolution>,
 ) {
   const items: TodoItem[] = [];
   const trackedPrUrls: string[] = [];
@@ -264,9 +284,14 @@ function reviewItems(
   const urls = extractGitHubPullRequestUrls(completion.payload);
   for (const url of urls) {
     const id = `review:${task.id}:${completion.id}:${url}`;
-    const snapshot = pullRequests[url];
-    const resolution = resolutions[id];
-    const detail = [snapshot?.title, snapshot?.reviewDecision, snapshot?.state]
+    const snapshot = pullRequestSnapshot(url, pullRequests);
+    const completionDetail = detailFromPayload(completion.payload);
+    const detail = [
+      snapshot?.title,
+      completionDetail === url ? undefined : completionDetail,
+      snapshot?.reviewDecision,
+      snapshot?.state,
+    ]
       .filter((value): value is string => Boolean(value && value.trim()))
       .join(" · ");
     const candidate = baseTaskItem(
@@ -280,7 +305,7 @@ function reviewItems(
         prUrl: url,
         prSnapshot: snapshot,
         createdAt: completion.createdAt,
-        updatedAt: completion.createdAt,
+        updatedAt: Math.max(completion.createdAt, snapshot?.fetchedAt ?? 0),
       },
       false,
     );
@@ -290,12 +315,7 @@ function reviewItems(
       automaticHistoryItems.push(
         historyItem(candidate, snapshot.state, snapshot.fetchedAt),
       );
-    if (
-      (!snapshot || snapshot.state === "open") &&
-      resolution?.state !== "done" &&
-      resolution?.state !== "dismissed"
-    )
-      trackedPrUrls.push(url);
+    if (!snapshot || snapshot.state === "open") trackedPrUrls.push(url);
     if (snapshot?.state === "open" && !snapshot.draft) items.push(candidate);
   }
   return {
@@ -310,7 +330,6 @@ function generatedItemsForTask(
   task: FleetTask,
   messages: readonly FleetMessage[],
   pullRequests: Record<string, PullRequestSnapshot>,
-  resolutions: Record<string, TodoResolution>,
   focusable: boolean,
 ) {
   const items: TodoItem[] = [];
@@ -548,7 +567,7 @@ function generatedItemsForTask(
     automaticHistoryItems.push(
       historyItem(outcome, "completed", completed?.createdAt ?? task.updatedAt),
     );
-    const reviews = reviewItems(task, completed, pullRequests, resolutions);
+    const reviews = reviewItems(task, completed, pullRequests);
     items.push(...reviews.items);
     trackedPrUrls.push(...reviews.trackedPrUrls);
     generatedCandidates.push(...reviews.generatedCandidates);
@@ -581,12 +600,19 @@ function priority(item: TodoItem) {
   }
 }
 
+export function canonicalGitHubPullRequestUrl(value: string) {
+  const match = value.match(GITHUB_PULL_URL_IDENTITY);
+  if (!match) return undefined;
+  const number = match[3]!.replace(/^0+(?=\d)/, "");
+  return `https://github.com/${match[1]!.toLowerCase()}/${match[2]!.toLowerCase()}/pull/${number}`;
+}
+
 export function extractGitHubPullRequestUrls(value: unknown) {
   const found = new Set<string>();
   const visit = (candidate: unknown) => {
     if (typeof candidate === "string") {
       for (const match of candidate.matchAll(GITHUB_PULL_URL))
-        found.add(match[0]);
+        found.add(canonicalGitHubPullRequestUrl(match[0])!);
       return;
     }
     if (Array.isArray(candidate)) {
@@ -600,6 +626,99 @@ export function extractGitHubPullRequestUrls(value: unknown) {
   return [...found];
 }
 
+function preferredResolution(
+  resolutions: readonly (TodoResolution | undefined)[],
+) {
+  return resolutions.reduce<TodoResolution | undefined>(
+    (preferred, current) => {
+      if (!current) return preferred;
+      if (!preferred) return current;
+      const currentDurable =
+        current.state === "done" || current.state === "dismissed";
+      const preferredDurable =
+        preferred.state === "done" || preferred.state === "dismissed";
+      if (currentDurable !== preferredDurable)
+        return currentDurable ? current : preferred;
+      if (current.at !== preferred.at)
+        return current.at > preferred.at ? current : preferred;
+      if (current.state === preferred.state) return preferred;
+      return current.state === "dismissed" ? current : preferred;
+    },
+    undefined,
+  );
+}
+
+function historicalReviewResolution(
+  historyItems: readonly TodoHistoryItem[],
+  url: string,
+) {
+  return preferredResolution(
+    historyItems.map((item) =>
+      item.kind === "review" &&
+      item.prUrl !== undefined &&
+      canonicalGitHubPullRequestUrl(item.prUrl) === url &&
+      (item.status === "done" || item.status === "dismissed")
+        ? { state: item.status, at: item.resolvedAt }
+        : undefined,
+    ),
+  );
+}
+
+function consolidateReviewCandidates(
+  candidates: readonly TodoItem[],
+  activeIds: ReadonlySet<string>,
+  resolutions: Record<string, TodoResolution>,
+  historyItems: readonly TodoHistoryItem[],
+) {
+  const groups = new Map<string, TodoItem[]>();
+  for (const candidate of candidates) {
+    if (!candidate.prUrl) continue;
+    const grouped = groups.get(candidate.prUrl) ?? [];
+    grouped.push(candidate);
+    groups.set(candidate.prUrl, grouped);
+  }
+
+  return [...groups.entries()].map(([url, sources]) => {
+    const winner = sources.reduce((preferred, candidate) => {
+      if (candidate.createdAt !== preferred.createdAt)
+        return candidate.createdAt > preferred.createdAt
+          ? candidate
+          : preferred;
+      return candidate.id.localeCompare(preferred.id) > 0
+        ? candidate
+        : preferred;
+    });
+    const id = `review:${url}`;
+    const resolutionIds = [
+      ...new Set([
+        ...sources.map((source) => source.id),
+        ...Object.keys(resolutions).filter(
+          (resolutionId) =>
+            resolutionId !== id &&
+            resolutionId.startsWith("review:") &&
+            extractGitHubPullRequestUrls(resolutionId).includes(url),
+        ),
+      ]),
+    ].sort();
+    const resolution = preferredResolution([
+      resolutions[id],
+      ...resolutionIds.map((sourceId) => resolutions[sourceId]),
+      historicalReviewResolution(historyItems, url),
+    ]);
+    return {
+      item: {
+        ...winner,
+        id,
+        prUrl: url,
+        resolutionIds,
+        createdAt: Math.min(...sources.map((source) => source.createdAt)),
+      },
+      active: sources.some((source) => activeIds.has(source.id)),
+      resolution,
+    };
+  });
+}
+
 export function buildTodoBoardView(options: {
   boardState: TodoBoardState;
   tasks: readonly FleetTask[];
@@ -610,6 +729,8 @@ export function buildTodoBoardView(options: {
   const now = options.now ?? Date.now();
   const hiddenCounts = { hidden: 0, snoozed: 0 };
   const generated: TodoItem[] = [];
+  const pendingGenerated: TodoItem[] = [];
+  const reviewCandidates: TodoItem[] = [];
   const manual: TodoItem[] = [];
   const dismissedRisks = dismissedRiskIds(options.boardState);
   const trackedPrUrls = new Set<string>();
@@ -621,27 +742,58 @@ export function buildTodoBoardView(options: {
       task,
       options.messagesByTask.get(task.id) ?? [],
       options.boardState.pullRequests,
-      options.boardState.resolutions,
       options.focusableTaskIds?.has(task.id) === true,
     );
-    taskItems.trackedPrUrls.forEach((url) => trackedPrUrls.add(url));
-    taskItems.generatedCandidates.forEach((item) =>
-      generatedCandidates.set(item.id, item),
-    );
+    taskItems.generatedCandidates.forEach((item) => {
+      if (item.kind === "review") reviewCandidates.push(item);
+      else generatedCandidates.set(item.id, item);
+    });
     taskItems.automaticHistoryItems.forEach((item) =>
       automaticHistoryItems.set(item.id, item),
     );
-    for (const item of taskItems.items) {
-      generatedCandidates.set(item.id, item);
-      pushGeneratedItem(
-        generated,
-        options.boardState.resolutions,
-        dismissedRisks,
-        hiddenCounts,
-        now,
-        item,
-      );
-    }
+    pendingGenerated.push(...taskItems.items);
+  }
+
+  for (const item of pendingGenerated.filter(
+    (candidate) => candidate.kind !== "review",
+  ))
+    pushGeneratedItem(
+      generated,
+      options.boardState.resolutions,
+      dismissedRisks,
+      hiddenCounts,
+      now,
+      item,
+    );
+
+  const activeReviewIds = new Set(
+    pendingGenerated
+      .filter((candidate) => candidate.kind === "review")
+      .map((candidate) => candidate.id),
+  );
+  for (const review of consolidateReviewCandidates(
+    reviewCandidates,
+    activeReviewIds,
+    options.boardState.resolutions,
+    options.boardState.historyItems ?? [],
+  )) {
+    generatedCandidates.set(review.item.id, review.item);
+    if (
+      review.resolution?.state !== "done" &&
+      review.resolution?.state !== "dismissed"
+    )
+      trackedPrUrls.add(review.item.prUrl!);
+    if (!review.active) continue;
+    pushGeneratedItem(
+      generated,
+      review.resolution
+        ? { [review.item.id]: review.resolution }
+        : options.boardState.resolutions,
+      dismissedRisks,
+      hiddenCounts,
+      now,
+      review.item,
+    );
   }
 
   for (const item of options.boardState.manualItems.map((candidate) =>
@@ -751,6 +903,22 @@ export function reconcileTodoBoardState(
   const archivedManualIds = new Set<string>();
   const archivedResolutionIds = new Set<string>();
   const durableDismissedRiskIds = dismissedRiskIds(state);
+  const resolutions = { ...state.resolutions };
+
+  for (const candidate of generatedCandidates.values()) {
+    if (candidate.kind !== "review" || !candidate.resolutionIds) continue;
+    const resolution = preferredResolution([
+      resolutions[candidate.id],
+      ...candidate.resolutionIds.map((id) => resolutions[id]),
+      candidate.prUrl
+        ? historicalReviewResolution(state.historyItems ?? [], candidate.prUrl)
+        : undefined,
+    ]);
+    if (!resolution) continue;
+    resolutions[candidate.id] = resolution;
+    for (const id of candidate.resolutionIds)
+      if (id !== candidate.id && resolutions[id]) archivedResolutionIds.add(id);
+  }
 
   for (const item of state.manualItems) {
     const resolution = state.resolutions[item.id];
@@ -768,7 +936,7 @@ export function reconcileTodoBoardState(
     archivedResolutionIds.add(item.id);
   }
 
-  for (const [id, resolution] of Object.entries(state.resolutions)) {
+  for (const [id, resolution] of Object.entries(resolutions)) {
     if (archivedResolutionIds.has(id)) continue;
     const candidate = generatedCandidates.get(id);
     if (
@@ -799,7 +967,7 @@ export function reconcileTodoBoardState(
       (item) => !archivedManualIds.has(item.id),
     ),
     resolutions: Object.fromEntries(
-      Object.entries(state.resolutions).filter(
+      Object.entries(resolutions).filter(
         ([id]) => !archivedResolutionIds.has(id),
       ),
     ),

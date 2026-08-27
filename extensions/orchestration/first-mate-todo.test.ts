@@ -7,6 +7,7 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { FleetStore, type FleetMessage, type FleetTask } from "./fleet.ts";
 import {
   buildTodoBoardView,
+  extractGitHubPullRequestUrls,
   parseSnoozeDuration,
   reconcileTodoBoardState,
   TODO_HISTORY_LIMIT,
@@ -141,6 +142,210 @@ test("board derivation combines generated and manual items with persisted resolu
   assert.equal(view.snoozedCount, 1);
   assert.deepEqual(view.trackedPrUrls, [prUrl]);
   assert.match(view.items[0]?.detail ?? "", /review_required/);
+});
+
+test("duplicate PR references share one stable active card updated from the newest source", () => {
+  const prUrl = "https://github.com/antonve/pi-agent/pull/693";
+  assert.deepEqual(
+    extractGitHubPullRequestUrls({
+      first: "HTTPS://GITHUB.COM/Antonve/PI-Agent/pull/0693/",
+      second: `${prUrl}?notification=duplicate`,
+    }),
+    [prUrl],
+  );
+
+  const olderTask = task("completed", "TASK-OLDER");
+  const newerTask = task("completed", "TASK-NEWER");
+  const olderCompletion = {
+    ...message(olderTask.id, "TASK_COMPLETED", 1, {
+      summary: "Initial review request",
+      artifacts: ["https://github.com/Antonve/PI-Agent/pull/693/"],
+    }),
+    createdAt: 100,
+  };
+  const newerCompletion = {
+    ...message(newerTask.id, "TASK_COMPLETED", 1, {
+      summary: "Review the corrected migration behavior",
+      artifacts: [`${prUrl}?source=follow-up`],
+    }),
+    createdAt: 200,
+  };
+  const boardState: TodoBoardState = {
+    version: 1,
+    manualItems: [],
+    resolutions: {},
+    pullRequests: {
+      [prUrl]: {
+        url: prUrl,
+        title: "Correct backend migration ordering",
+        state: "open",
+        draft: false,
+        reviewDecision: "changes_requested",
+        fetchedAt: 300,
+      },
+    },
+  };
+  const initial = buildTodoBoardView({
+    boardState,
+    tasks: [olderTask],
+    messagesByTask: new Map([[olderTask.id, [olderCompletion]]]),
+  });
+  const selectedId = initial.items[0]!.id;
+  const updated = buildTodoBoardView({
+    boardState,
+    tasks: [olderTask, newerTask],
+    messagesByTask: new Map([
+      [olderTask.id, [olderCompletion]],
+      [newerTask.id, [newerCompletion]],
+    ]),
+  });
+
+  assert.equal(updated.items.length, 1);
+  assert.equal(updated.items[0]?.id, `review:${prUrl}`);
+  assert.equal(updated.items[0]?.id, selectedId);
+  assert.equal(updated.items[0]?.title, `Review PR for ${newerTask.id}`);
+  assert.match(updated.items[0]?.detail ?? "", /corrected migration behavior/);
+  assert.match(updated.items[0]?.detail ?? "", /changes_requested/);
+  assert.deepEqual(updated.trackedPrUrls, [prUrl]);
+  assert.equal(
+    normalizeUiState(updated, { showHelp: false, selectedId }).selectedId,
+    selectedId,
+  );
+
+  const refreshed = buildTodoBoardView({
+    boardState: {
+      ...boardState,
+      pullRequests: {
+        [prUrl]: {
+          ...boardState.pullRequests[prUrl]!,
+          reviewDecision: "approved",
+          fetchedAt: 400,
+        },
+      },
+    },
+    tasks: [olderTask, newerTask],
+    messagesByTask: new Map([
+      [olderTask.id, [olderCompletion]],
+      [newerTask.id, [newerCompletion]],
+    ]),
+  });
+  assert.equal(refreshed.items[0]?.id, selectedId);
+  assert.match(refreshed.items[0]?.detail ?? "", /approved/);
+  assert.doesNotMatch(refreshed.items[0]?.detail ?? "", /changes_requested/);
+});
+
+test("durable PR resolution wins conflicts and survives source replacement", () => {
+  const prUrl = "https://github.com/antonve/pi-agent/pull/693";
+  const olderTask = task("completed", "TASK-OLDER");
+  const newerTask = task("completed", "TASK-NEWER");
+  const olderCompletion = message(olderTask.id, "TASK_COMPLETED", 1, {
+    artifacts: [prUrl],
+  });
+  const newerCompletion = message(newerTask.id, "TASK_COMPLETED", 1, {
+    artifacts: [prUrl],
+  });
+  const olderId = `review:${olderTask.id}:${olderCompletion.id}:${prUrl}`;
+  const newerId = `review:${newerTask.id}:${newerCompletion.id}:${prUrl}`;
+  const boardState: TodoBoardState = {
+    version: 1,
+    manualItems: [],
+    resolutions: {
+      [olderId]: { state: "dismissed", at: 10 },
+      [newerId]: { state: "snoozed", at: 20, until: 1_000_000 },
+    },
+    pullRequests: {
+      [prUrl]: {
+        url: prUrl,
+        state: "open",
+        draft: false,
+        fetchedAt: 30,
+      },
+    },
+    historyItems: [],
+  };
+  const messagesByTask = new Map([[newerTask.id, [newerCompletion]]]);
+  const derived = buildTodoBoardView({
+    boardState,
+    tasks: [newerTask],
+    messagesByTask,
+    now: 100,
+  });
+
+  assert.deepEqual(derived.items, []);
+  assert.deepEqual(derived.trackedPrUrls, []);
+  assert.equal(derived.hiddenCount, 1);
+
+  const reconciled = reconcileTodoBoardState(boardState, derived);
+  assert.deepEqual(reconciled.resolutions, {
+    [`review:${prUrl}`]: { state: "dismissed", at: 10 },
+  });
+  assert.equal(
+    reconciled.historyItems?.filter((item) => item.prUrl === prUrl).length,
+    1,
+  );
+
+  const afterSourceReplacement = buildTodoBoardView({
+    boardState: reconciled,
+    tasks: [newerTask],
+    messagesByTask: new Map([[newerTask.id, [newerCompletion]]]),
+    now: 100,
+  });
+  assert.deepEqual(afterSourceReplacement.items, []);
+  assert.deepEqual(afterSourceReplacement.trackedPrUrls, []);
+
+  const historyOnly = buildTodoBoardView({
+    boardState: { ...reconciled, resolutions: {} },
+    tasks: [newerTask],
+    messagesByTask: new Map([[newerTask.id, [newerCompletion]]]),
+    now: 100,
+  });
+  assert.deepEqual(historyOnly.items, []);
+  assert.deepEqual(historyOnly.trackedPrUrls, []);
+});
+
+test("closed duplicate PR sources remain distinct historical events", () => {
+  const prUrl = "https://github.com/antonve/pi-agent/pull/693";
+  const tasks = [task("completed", "TASK-ONE"), task("completed", "TASK-TWO")];
+  const messagesByTask = new Map(
+    tasks.map((candidate) => [
+      candidate.id,
+      [message(candidate.id, "TASK_COMPLETED", 1, { artifacts: [prUrl] })],
+    ]),
+  );
+  const boardState: TodoBoardState = {
+    version: 1,
+    manualItems: [],
+    resolutions: {},
+    pullRequests: {
+      [prUrl]: {
+        url: prUrl,
+        state: "open",
+        draft: false,
+        fetchedAt: 500,
+      },
+      "https://github.com/Antonve/PI-Agent/pull/693/": {
+        url: prUrl,
+        state: "merged",
+        draft: false,
+        fetchedAt: 500,
+      },
+    },
+    historyItems: [],
+  };
+  const derived = buildTodoBoardView({
+    boardState,
+    tasks,
+    messagesByTask,
+  });
+  const reconciled = reconcileTodoBoardState(boardState, derived);
+
+  assert.deepEqual(derived.items, []);
+  assert.equal(
+    reconciled.historyItems?.filter(
+      (item) => item.prUrl === prUrl && item.status === "merged",
+    ).length,
+    2,
+  );
 });
 
 test("draft and snoozed PRs stay tracked until permanently resolved", () => {
@@ -1181,6 +1386,57 @@ test("only the selected item expands while unfocused text stays compact", () => 
       .includes("final manual explanation"),
   );
   assert.ok(manualSelected.every((line) => visibleWidth(line) <= 24));
+});
+
+test("unfocused descriptions allow about 300 sanitized characters within three lines", () => {
+  const detail = `${"a".repeat(125)} middle-visible \u001b]0;injected-title\u0007 ${"b".repeat(190)} selected-tail`;
+  const view: TodoBoardView = {
+    items: [
+      {
+        id: "risk:long",
+        kind: "risk",
+        title: "Review the long description",
+        detail,
+        source: "generated",
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      {
+        id: "manual:selected",
+        kind: "manual",
+        title: "Selected item",
+        source: "manual",
+        createdAt: 2,
+        updatedAt: 2,
+      },
+    ],
+    generatedCount: 1,
+    manualCount: 1,
+    snoozedCount: 0,
+    hiddenCount: 0,
+    trackedPrUrls: [],
+  };
+  const rows = (selectedId: string) => {
+    const plain = renderTodoPane(
+      view,
+      { showHelp: false, selectedId },
+      80,
+      30,
+    ).map(stripTerminalSequences);
+    const start = plain.indexOf("Generated") + 1;
+    return plain.slice(start, plain.indexOf("", start));
+  };
+
+  const compact = rows("manual:selected");
+  assert.ok(compact.length <= 3);
+  assert.ok(compact.join("").includes("middle-visible"));
+  assert.equal(compact.join("").includes("injected-title"), false);
+  assert.equal(compact.join("").includes("selected-tail"), false);
+  assert.ok(compact.at(-1)?.endsWith("…"));
+
+  const expanded = rows("risk:long");
+  assert.ok(expanded.join("").includes("selected-tail"));
+  assert.equal(expanded.join("").includes("injected-title"), false);
 });
 
 test("PR review URLs render in full directly beneath their item and wrap safely", () => {
