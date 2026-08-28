@@ -442,6 +442,7 @@ export class TodoBoardStateStore {
 }
 
 export class TodoPaneRuntimeStore {
+  private ensureQueue: Promise<unknown> = Promise.resolve();
   private readonly store: LockedJsonStore<TodoPaneRuntimeState>;
 
   constructor(path = join(todoDirectory(), "runtime.json")) {
@@ -462,5 +463,46 @@ export class TodoPaneRuntimeStore {
 
   write(value: TodoPaneRuntimeState) {
     return this.store.write(value);
+  }
+
+  private async withEnsureFileLock<TValue>(operation: () => Promise<TValue>) {
+    await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+    const lockPath = `${this.path}.ensure.lock`;
+    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    while (true) {
+      try {
+        const handle = await open(lockPath, "wx", 0o600);
+        try {
+          await handle.writeFile(`${process.pid}\n`);
+          return await operation();
+        } finally {
+          await handle.close();
+          await unlink(lockPath).catch(() => undefined);
+        }
+      } catch (error) {
+        if (!isErrno(error, "EEXIST")) throw error;
+        try {
+          if (Date.now() - (await stat(lockPath)).mtimeMs > STALE_LOCK_MS) {
+            await unlink(lockPath).catch(() => undefined);
+            continue;
+          }
+        } catch (statError) {
+          if (isErrno(statError, "ENOENT")) continue;
+          throw statError;
+        }
+        if (Date.now() >= deadline)
+          throw new Error(
+            "Timed out acquiring first-mate to-do pane ensure lock.",
+          );
+        await delay(LOCK_RETRY_MS);
+      }
+    }
+  }
+
+  withEnsureLock<TValue>(operation: () => Promise<TValue>) {
+    const locked = () => this.withEnsureFileLock(operation);
+    const result = this.ensureQueue.then(locked, locked);
+    this.ensureQueue = result.catch(() => undefined);
+    return result;
   }
 }

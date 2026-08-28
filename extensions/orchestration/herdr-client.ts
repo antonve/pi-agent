@@ -60,6 +60,13 @@ export interface HerdrPaneLayout {
   }>;
 }
 
+export interface HerdrPaneInfo {
+  paneId: string;
+  tabId: string;
+  label?: string;
+  focused: boolean;
+}
+
 export interface HerdrPaneProcessInfo {
   paneId: string;
   foregroundCommandLine?: string;
@@ -777,6 +784,24 @@ export class HerdrClient {
     };
   }
 
+  async listPanes(workspaceId: string): Promise<HerdrPaneInfo[]> {
+    const value = await this.json(
+      ["pane", "list", "--workspace", workspaceId],
+      { timeoutMs: 5_000 },
+    );
+    return findObjects(
+      value,
+      (candidate) =>
+        typeof candidate.pane_id === "string" &&
+        typeof candidate.tab_id === "string",
+    ).map((pane) => ({
+      paneId: String(pane.pane_id),
+      tabId: String(pane.tab_id),
+      label: typeof pane.label === "string" ? pane.label : undefined,
+      focused: pane.focused === true,
+    }));
+  }
+
   async processInfo(
     paneId: string,
     signal?: AbortSignal,
@@ -820,20 +845,14 @@ export class HerdrClient {
     )[0];
     if (!workspace) return undefined;
     const workspaceId = String(workspace.workspace_id);
-    const panes = await this.json(
-      ["pane", "list", "--workspace", workspaceId],
-      { timeoutMs: 5_000 },
+    const pane = (await this.listPanes(workspaceId)).find(
+      (candidate) => candidate.focused,
     );
-    const pane = findObjects(
-      panes,
-      (candidate) =>
-        typeof candidate.pane_id === "string" && candidate.focused === true,
-    )[0];
-    if (!pane || typeof pane.tab_id !== "string") return undefined;
+    if (!pane) return undefined;
     return {
       workspaceId,
-      tabId: pane.tab_id,
-      paneId: String(pane.pane_id),
+      tabId: pane.tabId,
+      paneId: pane.paneId,
     };
   }
 
