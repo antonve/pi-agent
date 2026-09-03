@@ -1528,8 +1528,11 @@ export default function orchestration(pi: ExtensionAPI) {
     name: "subagent_send",
     label: "Send Herdr Subagent Follow-up",
     description:
-      "Send a follow-up prompt to a tracked child. Cancels pending successful auto-close.",
+      "Send a follow-up prompt to a tracked child. Cancels pending successful auto-close. Headless workers accept follow-ups only after the current turn settles; wait for the worker instead of sending mid-turn.",
     parameters: Type.Object({ id: Type.String(), prompt: Type.String() }),
+    // Follow-up admission is a check-then-start on shared worker state, so
+    // sibling sends in one assistant message must not run concurrently.
+    executionMode: "sequential",
     async execute(_call, params) {
       const task = await manager.send(params.id, params.prompt);
       return {

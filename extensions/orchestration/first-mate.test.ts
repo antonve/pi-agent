@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import type { CliRunner } from "./cli.ts";
+import type { TaskRecord } from "./domain.ts";
 import {
   buildManagedLinearPlanCommentMarker,
   buildSecondMatePrompt,
@@ -192,7 +193,20 @@ test("headless startup requires prompt-acceptance activity", async () => {
   assert.equal(await hasHeadlessActivity(run, "codex"), false);
   await writeFile(
     run.outputPath,
+    "codex could not parse the request\nunstructured diagnostic noise\n",
+  );
+  assert.equal(await hasHeadlessActivity(run, "codex"), false);
+  await writeFile(
+    run.outputPath,
     `${JSON.stringify({ type: "thread.started" })}\n${JSON.stringify({ type: "turn.started" })}\n`,
+  );
+  assert.equal(await hasHeadlessActivity(run, "codex"), true);
+  await writeFile(
+    run.outputPath,
+    JSON.stringify({
+      type: "item.started",
+      item: { type: "command_execution", command: "rg --files" },
+    }),
   );
   assert.equal(await hasHeadlessActivity(run, "codex"), true);
 });
@@ -1557,6 +1571,356 @@ test("manager starts leaves through the headless tab path without agent UI comma
       calls.some((args) => args[0] === "agent"),
       false,
       "leaf launch must not call Herdr's interactive agent surface",
+    );
+    manager.dispose();
+  } finally {
+    if (previousState === undefined) delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousState;
+    if (previousHerdr === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previousHerdr;
+  }
+});
+
+test("headless follow-ups are rejected while the active turn is still executing", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-headless-busy-"));
+  const previousState = process.env.PI_HERDR_STATE_DIR;
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.PI_HERDR_STATE_DIR = directory;
+  process.env.HERDR_ENV = "1";
+  const calls: string[][] = [];
+  let turns = 0;
+  let finishFirstTurn: (() => Promise<void>) | undefined;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "current")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              workspace_id: "w1",
+              tab_id: "w1:t1",
+              pane_id: "w1:p1",
+            },
+          }),
+        };
+      if (args[0] === "tab" && args[1] === "create")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: { tab_id: "w1:t2", pane_id: "w1:p2" },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "run") {
+        turns += 1;
+        const script = args[3]!.match(/'([^']+\/run\.mjs)'$/)?.[1];
+        assert.ok(script);
+        const runDirectory = join(script, "..");
+        const activity = `${JSON.stringify({ type: "turn.started" })}\n${JSON.stringify(
+          {
+            type: "item.started",
+            item: {
+              type: "command_execution",
+              command: "sed -n '1,80p' docs/extensions.md",
+            },
+          },
+        )}\n`;
+        const report = `PI_PARENT_REPORT_BEGIN\n${JSON.stringify({
+          status: "done",
+          summary: "ok",
+        })}\nPI_PARENT_REPORT_END`;
+        const finish = async () => {
+          await writeFile(
+            join(runDirectory, "output.jsonl"),
+            `${activity}${JSON.stringify({
+              type: "item.completed",
+              item: { type: "agent_message", text: report },
+            })}\n`,
+          );
+          await writeFile(join(runDirectory, "exit-status"), "0\n");
+        };
+        await writeFile(join(runDirectory, "output.jsonl"), activity);
+        if (turns === 1) finishFirstTurn = finish;
+        else await finish();
+        return { code: 0, stderr: "", stdout: "{}" };
+      }
+      return { code: 0, stderr: "", stdout: "{}" };
+    },
+  };
+  try {
+    const registry = new TaskRegistry(join(directory, "registry.json"));
+    const manager = new OrchestrationManager(
+      new HerdrClient(runner),
+      new TreehouseClient(runner),
+      registry,
+      { onComplete() {} },
+    );
+    const task = await manager.spawnLeaf({
+      prompt: "Implement the fix",
+      label: "busy-leaf",
+      harness: "codex",
+      cwd: "/repo",
+      isolation: "shared",
+      placement: "tab",
+    });
+    assert.equal(task.status, "running");
+    await assert.rejects(
+      manager.send(task.id, "Scope update from first mate"),
+      /still executing turn 1/,
+    );
+    const active = await registry.get(task.id);
+    assert.equal(active?.status, "running");
+    assert.equal(active?.turn, 1);
+    assert.equal(
+      calls.filter((args) => args[0] === "pane" && args[1] === "run").length,
+      1,
+      "a rejected follow-up must not launch a new turn",
+    );
+    assert.equal(
+      calls.some((args) => args[0] === "pane" && args[1] === "send-keys"),
+      false,
+      "a rejected follow-up must not interrupt the active worker",
+    );
+    await finishFirstTurn!();
+    const [settled] = await manager.wait([task.id]);
+    assert.equal(settled?.status, "done");
+    assert.equal(settled?.turn, 1);
+    const resumed = await manager.send(task.id, "Follow-up after settle");
+    assert.equal(resumed.status, "running");
+    const [followedUp] = await manager.wait([task.id]);
+    assert.equal(followedUp?.status, "done");
+    assert.equal(followedUp?.turn, 2);
+    manager.dispose();
+  } finally {
+    if (previousState === undefined) delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousState;
+    if (previousHerdr === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previousHerdr;
+  }
+});
+
+test("a follow-up accepted while the prior monitor is settling still gets monitored", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-headless-handoff-"));
+  const previousState = process.env.PI_HERDR_STATE_DIR;
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.PI_HERDR_STATE_DIR = directory;
+  process.env.HERDR_ENV = "1";
+  const calls: string[][] = [];
+  let notifications = 0;
+  let releaseFirstNotification!: () => void;
+  const firstNotificationGate = new Promise<void>((resolve) => {
+    releaseFirstNotification = resolve;
+  });
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "current")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              workspace_id: "w1",
+              tab_id: "w1:t1",
+              pane_id: "w1:p1",
+            },
+          }),
+        };
+      if (args[0] === "tab" && args[1] === "create")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: { tab_id: "w1:t2", pane_id: "w1:p2" },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "run") {
+        const script = args[3]!.match(/'([^']+\/run\.mjs)'$/)?.[1];
+        assert.ok(script);
+        const runDirectory = join(script, "..");
+        const report = `PI_PARENT_REPORT_BEGIN\n${JSON.stringify({
+          status: "done",
+          summary: "ok",
+        })}\nPI_PARENT_REPORT_END`;
+        await writeFile(
+          join(runDirectory, "output.jsonl"),
+          `${JSON.stringify({ type: "turn.started" })}\n${JSON.stringify({
+            type: "item.completed",
+            item: { type: "agent_message", text: report },
+          })}\n`,
+        );
+        await writeFile(join(runDirectory, "exit-status"), "0\n");
+        return { code: 0, stderr: "", stdout: "{}" };
+      }
+      // Hold turn 1's settle inside its completion notification so the
+      // follow-up below is admitted while turn 1's monitor still holds the
+      // task's monitor slot.
+      if (args[0] === "notification") {
+        notifications += 1;
+        if (notifications === 1) await firstNotificationGate;
+        return { code: 0, stderr: "", stdout: "{}" };
+      }
+      return { code: 0, stderr: "", stdout: "{}" };
+    },
+  };
+  try {
+    const registry = new TaskRegistry(join(directory, "registry.json"));
+    let followUp: Promise<TaskRecord> | undefined;
+    const manager: OrchestrationManager = new OrchestrationManager(
+      new HerdrClient(runner),
+      new TreehouseClient(runner),
+      registry,
+      {
+        onComplete(task) {
+          // Fires after settle() publishes terminal registry state but before
+          // turn 1's monitor releases its task-ID slot.
+          if (task.turn === 1 && task.status === "done" && !followUp)
+            followUp = manager.send(task.id, "Post-settle follow-up");
+        },
+      },
+    );
+    const task = await manager.spawnLeaf({
+      prompt: "Implement the fix",
+      label: "handoff-leaf",
+      harness: "codex",
+      cwd: "/repo",
+      isolation: "shared",
+      placement: "tab",
+    });
+    while (!followUp) await new Promise((resolve) => setTimeout(resolve, 20));
+    const resumed = await followUp;
+    assert.equal(resumed.status, "running");
+    assert.equal(resumed.turn, 2);
+    releaseFirstNotification();
+    const [settled] = await manager.wait(
+      [task.id],
+      AbortSignal.timeout(15_000),
+    );
+    assert.equal(settled?.status, "done");
+    assert.equal(settled?.turn, 2);
+    assert.equal(
+      calls.filter((args) => args[0] === "pane" && args[1] === "run").length,
+      2,
+      "the accepted follow-up must run exactly one new turn",
+    );
+    manager.dispose();
+  } finally {
+    releaseFirstNotification();
+    if (previousState === undefined) delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousState;
+    if (previousHerdr === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previousHerdr;
+  }
+});
+
+test("concurrent post-settle follow-ups admit exactly one next turn", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-headless-concurrent-"));
+  const previousState = process.env.PI_HERDR_STATE_DIR;
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.PI_HERDR_STATE_DIR = directory;
+  process.env.HERDR_ENV = "1";
+  const calls: string[][] = [];
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "current")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              workspace_id: "w1",
+              tab_id: "w1:t1",
+              pane_id: "w1:p1",
+            },
+          }),
+        };
+      if (args[0] === "tab" && args[1] === "create")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: { tab_id: "w1:t2", pane_id: "w1:p2" },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "run") {
+        const script = args[3]!.match(/'([^']+\/run\.mjs)'$/)?.[1];
+        assert.ok(script);
+        const runDirectory = join(script, "..");
+        const report = `PI_PARENT_REPORT_BEGIN\n${JSON.stringify({
+          status: "done",
+          summary: "ok",
+        })}\nPI_PARENT_REPORT_END`;
+        await writeFile(
+          join(runDirectory, "output.jsonl"),
+          `${JSON.stringify({ type: "turn.started" })}\n${JSON.stringify({
+            type: "item.completed",
+            item: { type: "agent_message", text: report },
+          })}\n`,
+        );
+        await writeFile(join(runDirectory, "exit-status"), "0\n");
+        return { code: 0, stderr: "", stdout: "{}" };
+      }
+      return { code: 0, stderr: "", stdout: "{}" };
+    },
+  };
+  try {
+    const registry = new TaskRegistry(join(directory, "registry.json"));
+    const manager = new OrchestrationManager(
+      new HerdrClient(runner),
+      new TreehouseClient(runner),
+      registry,
+      { onComplete() {} },
+    );
+    const task = await manager.spawnLeaf({
+      prompt: "Implement the fix",
+      label: "concurrent-leaf",
+      harness: "codex",
+      cwd: "/repo",
+      isolation: "shared",
+      placement: "tab",
+    });
+    const [settled] = await manager.wait([task.id]);
+    assert.equal(settled?.status, "done");
+    assert.equal(settled?.turn, 1);
+    const prompts = ["Concurrent follow-up A", "Concurrent follow-up B"];
+    const outcomes = await Promise.allSettled(
+      prompts.map((prompt) => manager.send(task.id, prompt)),
+    );
+    const admitted = outcomes.filter(
+      (outcome) => outcome.status === "fulfilled",
+    );
+    const rejected = outcomes.filter(
+      (outcome) => outcome.status === "rejected",
+    );
+    assert.equal(
+      admitted.length,
+      1,
+      "exactly one concurrent follow-up must claim the next turn",
+    );
+    assert.equal(rejected.length, 1);
+    assert.match(
+      String((rejected[0] as PromiseRejectedResult).reason),
+      /already accepted another follow-up prompt|is still executing turn/,
+    );
+    assert.equal(
+      calls.filter((args) => args[0] === "pane" && args[1] === "run").length,
+      2,
+      "the losing follow-up must not issue a second pane run",
+    );
+    const [followedUp] = await manager.wait([task.id]);
+    assert.equal(followedUp?.status, "done");
+    assert.equal(followedUp?.turn, 2);
+    const winner = prompts[outcomes.findIndex((o) => o.status === "fulfilled")];
+    assert.equal(
+      await readFile(
+        join(directory, "runs", task.id, "2", "prompt.txt"),
+        "utf8",
+      ),
+      winner,
+      "the executed turn must run the admitted prompt, not an overwrite",
     );
     manager.dispose();
   } finally {
