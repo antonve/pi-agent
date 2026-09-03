@@ -1126,6 +1126,14 @@ export class OrchestrationManager {
         throw new Error(
           `Headless worker ${task.id} has already closed; spawn a recovery worker instead.`,
         );
+      // Headless harnesses run one process per turn, so a follow-up can only
+      // start after the active turn's process exits. Launching a new turn into
+      // the busy pane would never run, and its startup watchdog would kill the
+      // actively working process and falsely fail the task.
+      if (task.status === "starting" || task.status === "running")
+        throw new Error(
+          `Headless worker ${task.id} is still executing turn ${task.turn ?? 1}; wait for it to settle before sending a follow-up prompt.`,
+        );
       return this.startHeadlessTurn(task, text);
     }
     if (task.agentName) {

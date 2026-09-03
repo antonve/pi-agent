@@ -192,7 +192,20 @@ test("headless startup requires prompt-acceptance activity", async () => {
   assert.equal(await hasHeadlessActivity(run, "codex"), false);
   await writeFile(
     run.outputPath,
+    "codex could not parse the request\nunstructured diagnostic noise\n",
+  );
+  assert.equal(await hasHeadlessActivity(run, "codex"), false);
+  await writeFile(
+    run.outputPath,
     `${JSON.stringify({ type: "thread.started" })}\n${JSON.stringify({ type: "turn.started" })}\n`,
+  );
+  assert.equal(await hasHeadlessActivity(run, "codex"), true);
+  await writeFile(
+    run.outputPath,
+    JSON.stringify({
+      type: "item.started",
+      item: { type: "command_execution", command: "rg --files" },
+    }),
   );
   assert.equal(await hasHeadlessActivity(run, "codex"), true);
 });
@@ -1558,6 +1571,126 @@ test("manager starts leaves through the headless tab path without agent UI comma
       false,
       "leaf launch must not call Herdr's interactive agent surface",
     );
+    manager.dispose();
+  } finally {
+    if (previousState === undefined) delete process.env.PI_HERDR_STATE_DIR;
+    else process.env.PI_HERDR_STATE_DIR = previousState;
+    if (previousHerdr === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previousHerdr;
+  }
+});
+
+test("headless follow-ups are rejected while the active turn is still executing", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-headless-busy-"));
+  const previousState = process.env.PI_HERDR_STATE_DIR;
+  const previousHerdr = process.env.HERDR_ENV;
+  process.env.PI_HERDR_STATE_DIR = directory;
+  process.env.HERDR_ENV = "1";
+  const calls: string[][] = [];
+  let turns = 0;
+  let finishFirstTurn: (() => Promise<void>) | undefined;
+  const runner: CliRunner = {
+    async run(_command, args) {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "current")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: {
+              workspace_id: "w1",
+              tab_id: "w1:t1",
+              pane_id: "w1:p1",
+            },
+          }),
+        };
+      if (args[0] === "tab" && args[1] === "create")
+        return {
+          code: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            result: { tab_id: "w1:t2", pane_id: "w1:p2" },
+          }),
+        };
+      if (args[0] === "pane" && args[1] === "run") {
+        turns += 1;
+        const script = args[3]!.match(/'([^']+\/run\.mjs)'$/)?.[1];
+        assert.ok(script);
+        const runDirectory = join(script, "..");
+        const activity = `${JSON.stringify({ type: "turn.started" })}\n${JSON.stringify(
+          {
+            type: "item.started",
+            item: {
+              type: "command_execution",
+              command: "sed -n '1,80p' docs/extensions.md",
+            },
+          },
+        )}\n`;
+        const report = `PI_PARENT_REPORT_BEGIN\n${JSON.stringify({
+          status: "done",
+          summary: "ok",
+        })}\nPI_PARENT_REPORT_END`;
+        const finish = async () => {
+          await writeFile(
+            join(runDirectory, "output.jsonl"),
+            `${activity}${JSON.stringify({
+              type: "item.completed",
+              item: { type: "agent_message", text: report },
+            })}\n`,
+          );
+          await writeFile(join(runDirectory, "exit-status"), "0\n");
+        };
+        await writeFile(join(runDirectory, "output.jsonl"), activity);
+        if (turns === 1) finishFirstTurn = finish;
+        else await finish();
+        return { code: 0, stderr: "", stdout: "{}" };
+      }
+      return { code: 0, stderr: "", stdout: "{}" };
+    },
+  };
+  try {
+    const registry = new TaskRegistry(join(directory, "registry.json"));
+    const manager = new OrchestrationManager(
+      new HerdrClient(runner),
+      new TreehouseClient(runner),
+      registry,
+      { onComplete() {} },
+    );
+    const task = await manager.spawnLeaf({
+      prompt: "Implement the fix",
+      label: "busy-leaf",
+      harness: "codex",
+      cwd: "/repo",
+      isolation: "shared",
+      placement: "tab",
+    });
+    assert.equal(task.status, "running");
+    await assert.rejects(
+      manager.send(task.id, "Scope update from first mate"),
+      /still executing turn 1/,
+    );
+    const active = await registry.get(task.id);
+    assert.equal(active?.status, "running");
+    assert.equal(active?.turn, 1);
+    assert.equal(
+      calls.filter((args) => args[0] === "pane" && args[1] === "run").length,
+      1,
+      "a rejected follow-up must not launch a new turn",
+    );
+    assert.equal(
+      calls.some((args) => args[0] === "pane" && args[1] === "send-keys"),
+      false,
+      "a rejected follow-up must not interrupt the active worker",
+    );
+    await finishFirstTurn!();
+    const [settled] = await manager.wait([task.id]);
+    assert.equal(settled?.status, "done");
+    assert.equal(settled?.turn, 1);
+    const resumed = await manager.send(task.id, "Follow-up after settle");
+    assert.equal(resumed.status, "running");
+    const [followedUp] = await manager.wait([task.id]);
+    assert.equal(followedUp?.status, "done");
+    assert.equal(followedUp?.turn, 2);
     manager.dispose();
   } finally {
     if (previousState === undefined) delete process.env.PI_HERDR_STATE_DIR;
