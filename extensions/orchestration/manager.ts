@@ -572,6 +572,54 @@ export class OrchestrationManager {
     if (!task.harness)
       throw new Error(`Headless task ${task.id} has no harness.`);
     const turn = (task.turn ?? 0) + 1;
+    // Claim the turn atomically before preparing artifacts: concurrent
+    // follow-ups on the same settled record would otherwise all pass the
+    // caller's status check, prepare the same turn directory, and race
+    // multiple harness processes in one pane. Clearing the artifact paths
+    // until the new turn's are prepared keeps readers off the prior turn's.
+    const claimed = await this.registry.transition(
+      task.id,
+      turn === 1
+        ? ["starting"]
+        : [
+            "done",
+            "failed",
+            "blocked",
+            "cancelled",
+            "interrupted",
+            "timed-out",
+          ],
+      {
+        executionMode: "headless",
+        status: "starting",
+        turn,
+        runDirectory: undefined,
+        promptPath: undefined,
+        outputPath: undefined,
+        exitStatusPath: undefined,
+        lastMessagePath: undefined,
+        settledAt: undefined,
+        autoCloseAt: undefined,
+        autoCloseCancelled: false,
+        resourceClosedAt: undefined,
+        completionResultPath: undefined,
+        completionReport: undefined,
+        error: undefined,
+        exitCode: undefined,
+      },
+    );
+    if (!claimed)
+      throw new Error(
+        `Headless worker ${task.id} already accepted another follow-up prompt; wait for that turn to settle before sending a new one.`,
+      );
+    // The previous turn's monitor may still be publishing its settle result
+    // and would otherwise hold the task's monitor slot, leaving this turn
+    // unmonitored. Claiming the turn transfers monitoring ownership.
+    const staleMonitor = this.monitors.get(task.id);
+    if (staleMonitor) {
+      staleMonitor.abort();
+      this.monitors.delete(task.id);
+    }
     const { artifacts } = await prepareHeadlessRun({
       taskId: task.id,
       turn,
@@ -585,22 +633,11 @@ export class OrchestrationManager {
       },
     });
     await this.registry.update(task.id, {
-      executionMode: "headless",
-      status: "starting",
-      turn,
       runDirectory: artifacts.directory,
       promptPath: artifacts.promptPath,
       outputPath: artifacts.outputPath,
       exitStatusPath: artifacts.exitStatusPath,
       lastMessagePath: artifacts.lastMessagePath,
-      settledAt: undefined,
-      autoCloseAt: undefined,
-      autoCloseCancelled: false,
-      resourceClosedAt: undefined,
-      completionResultPath: undefined,
-      completionReport: undefined,
-      error: undefined,
-      exitCode: undefined,
     });
     await this.herdr.runInPane(task.paneId, process.execPath, [
       artifacts.scriptPath,
@@ -1125,6 +1162,14 @@ export class OrchestrationManager {
       if (task.resourceClosedAt !== undefined)
         throw new Error(
           `Headless worker ${task.id} has already closed; spawn a recovery worker instead.`,
+        );
+      // Headless harnesses run one process per turn, so a follow-up can only
+      // start after the active turn's process exits. Launching a new turn into
+      // the busy pane would never run, and its startup watchdog would kill the
+      // actively working process and falsely fail the task.
+      if (task.status === "starting" || task.status === "running")
+        throw new Error(
+          `Headless worker ${task.id} is still executing turn ${task.turn ?? 1}; wait for it to settle before sending a follow-up prompt.`,
         );
       return this.startHeadlessTurn(task, text);
     }
