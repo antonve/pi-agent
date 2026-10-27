@@ -2,6 +2,14 @@
 
 This Pi package is consumed by the `agent-dotfiles` Home Manager configuration. It includes the upstream-inspired dashboard, ask-user, copy-all, system `fd`/`rg`, Git/model state, and Herdr/Treehouse orchestration. The run recap extension remains available for explicit opt-in use. Firecrawl is intentionally excluded.
 
+## Shared skills
+
+The machine's `agent-config` installation supplies personal skills, including
+`draft-review`, through `~/.agents/skills/`, which Pi discovers automatically.
+This package supplies only its Pi-specific skills. Consumers should install
+the shared library before updating from a version that bundled
+`draft-review-workflow`.
+
 ## Operations
 
 - `/clear` — start a new session; alias for `/new`.
