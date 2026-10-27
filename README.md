@@ -4,6 +4,14 @@ This minimal Pi package is consumed by the `agent-dotfiles` Home Manager
 configuration. It includes ask-user, copy-all, calm tool output, system `fd`/`rg`,
 Git/model display, Linear tools, and themes. Draft provides planning and review.
 
+## Shared skills
+
+The machine's `agent-config` installation supplies personal skills, including
+`draft-review`, through `~/.agents/skills/`, which Pi discovers automatically.
+This package supplies only its Pi-specific skills. Consumers should install
+the shared library before updating from a version that bundled
+`draft-review-workflow`.
+
 ## Operations
 
 - `/clear` starts a new session; alias for `/new`.
